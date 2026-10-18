@@ -34,6 +34,11 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.19.0" date="2026-10-18">
+      <description>
+        <p>Files panel: right-click → Open Location shows the file in the file manager</p>
+      </description>
+    </release>
     <release version="1.18.0" date="2026-10-18">
       <description>
         <p>Files panel: freeze a file so it stays in the list</p>

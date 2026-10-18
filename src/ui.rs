@@ -1220,7 +1220,7 @@ impl App {
             let s = state.clone();
             state.guard_unsaved(Box::new(move || s.open_path(&path)));
         });
-        // Right-click: "Remove from List". One popover, refilled per click —
+        // Right-click: "Open Location", "Remove from List". One popover, refilled per click —
         // unparenting a fresh one on `closed` can drop the action it fires.
         let files_menu = gio::Menu::new();
         let files_popover = gtk4::PopoverMenu::from_model(Some(&files_menu));
@@ -1239,6 +1239,12 @@ impl App {
                 return;
             };
             files_menu.remove_all();
+            let item = gio::MenuItem::new(Some("Open _Location"), None);
+            item.set_action_and_target_value(
+                Some("win.open-location"),
+                Some(&path.to_string_lossy().to_variant()),
+            );
+            files_menu.append_item(&item);
             let item = gio::MenuItem::new(Some("_Remove from List"), None);
             item.set_action_and_target_value(
                 Some("win.forget-recent"),
@@ -1306,6 +1312,30 @@ impl App {
             };
             let s = state.clone();
             state.guard_unsaved(Box::new(move || s.open_path(&path)));
+        });
+        self.window.add_action(&action);
+
+        // Show the file selected in the file manager (OpenURI portal, so it
+        // works under Flatpak). An unmounted share or a vanished folder fails
+        // here, asynchronously, rather than via a stat on the main loop.
+        let action = gio::SimpleAction::new("open-location", Some(glib::VariantTy::STRING));
+        let state = self.clone();
+        action.connect_activate(move |_, param| {
+            let Some(path) = param.and_then(|v| v.str()).map(PathBuf::from) else {
+                return;
+            };
+            let s = state.clone();
+            gtk4::FileLauncher::new(Some(&gio::File::for_path(&path))).open_containing_folder(
+                Some(&state.window),
+                gio::Cancellable::NONE,
+                move |res| {
+                    if let Err(e) = res {
+                        if !e.matches(gtk4::DialogError::Dismissed) {
+                            s.toast(&format!("Could not open the folder: {}", e.message()));
+                        }
+                    }
+                },
+            );
         });
         self.window.add_action(&action);
 
