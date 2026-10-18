@@ -1,0 +1,9 @@
+/target
+/repo
+/dist
+.wrangler/
+dev/xdg/cache/
+dev/xdg/mesa_shader_cache/
+dev/xdg/ccache/
+**/*.rs.bk
+*.pdb

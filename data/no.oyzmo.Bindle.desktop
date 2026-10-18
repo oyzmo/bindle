@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Bindle
+GenericName=Markdown Editor
+Comment=Simple Markdown editor for GNOME
+Exec=bindle %F
+Icon=no.oyzmo.Bindle
+Terminal=false
+Categories=GNOME;GTK;Utility;TextEditor;
+MimeType=text/markdown;text/x-markdown;text/plain;text/x-nfo;text/x-log;text/csv;text/tab-separated-values;application/json;application/toml;application/yaml;text/x-yaml;application/x-shellscript;text/x-shellscript;application/xml;text/xml;application/xslt+xml;application/vnd.oasis.opendocument.text;
+Keywords=markdown;editor;md;
+StartupNotify=true

@@ -1,0 +1,60 @@
+# Flatpak manifest. Local build (network allowed during build; a Flathub
+# submission would need generated cargo sources instead):
+#   flatpak-builder --user --install --force-clean build-dir no.oyzmo.Bindle.yml
+app-id: no.oyzmo.Bindle
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: bindle
+finish-args:
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  - --device=dri
+  # Remote images (consent-gated in-app) are fetched via gvfs http, and the
+  # Memos client talks to the user's own server.
+  - --share=network
+  # The Memos access token is stored in the login keyring rather than in
+  # settings.json — it is password-equivalent for that account.
+  - --talk-name=org.freedesktop.secrets
+  - --talk-name=org.gtk.vfs.*
+  - --filesystem=xdg-run/gvfsd
+  # Files on gvfs shares (smb://, sftp://, dav://…) only have a local path
+  # while the gvfs FUSE mount is visible. Without this, picking one in the
+  # Open dialog yields a GFile with no path and Bindle — path-based
+  # throughout — can't open it.
+  - --filesystem=xdg-run/gvfs
+  # Last-file restore and .textbundle folders are opened without a portal
+  # dialog, so the sandbox needs to see the user's files.
+  - --filesystem=home
+  # Kernel mounts (NFS/CIFS/sshfs/davfs) can live outside $HOME.
+  - --filesystem=/media
+  - --filesystem=/mnt
+  - --filesystem=/run/media
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/bindle/cargo
+modules:
+  - name: bindle
+    buildsystem: simple
+    build-options:
+      build-args:
+        - --share=network
+    build-commands:
+      - cargo build --release
+      - install -Dm755 target/release/bindle /app/bin/bindle
+      - install -Dm644 data/no.oyzmo.Bindle.desktop /app/share/applications/no.oyzmo.Bindle.desktop
+      - install -Dm644 data/no.oyzmo.Bindle.svg /app/share/icons/hicolor/scalable/apps/no.oyzmo.Bindle.svg
+      - install -Dm644 data/no.oyzmo.Bindle-symbolic.svg /app/share/icons/hicolor/symbolic/apps/no.oyzmo.Bindle-symbolic.svg
+      - install -Dm644 data/no.oyzmo.Bindle.metainfo.xml /app/share/metainfo/no.oyzmo.Bindle.metainfo.xml
+      # The GPL licence and the third-party attribution notices ship with the
+      # app: the GPL requires the licence to travel with every copy, and the
+      # crates compiled in require their own attribution.
+      - install -Dm644 LICENSE /app/share/licenses/$FLATPAK_ID/LICENSE
+      - install -Dm644 THIRD-PARTY.md /app/share/licenses/$FLATPAK_ID/THIRD-PARTY.md
+    sources:
+      - type: dir
+        path: .

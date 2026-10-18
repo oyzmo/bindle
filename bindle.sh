@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# Bindle helper menu: install build tools, compile, install, uninstall,
+# package a distribution, clean up build files.
+set -u
+
+APP_ID="no.oyzmo.Bindle"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Build outside the source tree (works around network/FUSE-mounted checkouts).
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/bindle/build}"
+
+BIN_DIR="$HOME/.local/bin"
+DESKTOP_DIR="$HOME/.local/share/applications"
+ICON_DIR="$HOME/.local/share/icons/hicolor/scalable/apps"
+SYMBOLIC_DIR="$HOME/.local/share/icons/hicolor/symbolic/apps"
+# Same layout the Flatpak uses (/app/share/licenses/$FLATPAK_ID): the GPL
+# licence and the third-party attribution notices must travel with the app.
+LICENSE_DIR="$HOME/.local/share/licenses/$APP_ID"
+
+bold() { printf '\033[1m%s\033[0m\n' "$*"; }
+ok()   { printf '\033[32m✔ %s\033[0m\n' "$*"; }
+err()  { printf '\033[31m✘ %s\033[0m\n' "$*"; }
+
+install_tools() {
+    bold "Installing build tools…"
+    if command -v dnf >/dev/null; then
+        sudo dnf install -y cargo rust gcc pkgconf-pkg-config gtk4-devel libadwaita-devel
+    elif command -v apt >/dev/null; then
+        sudo apt update && sudo apt install -y cargo rustc gcc pkg-config libgtk-4-dev libadwaita-1-dev
+    elif command -v pacman >/dev/null; then
+        sudo pacman -S --needed rust gcc pkgconf gtk4 libadwaita
+    elif command -v zypper >/dev/null; then
+        sudo zypper install -y cargo rust gcc pkg-config gtk4-devel libadwaita-devel
+    else
+        err "No supported package manager found (dnf/apt/pacman/zypper)."
+        err "Install manually: rust/cargo, gcc, pkg-config, GTK4 + Libadwaita dev headers."
+        return 1
+    fi
+    ok "Build tools installed."
+}
+
+compile_app() {
+    bold "Compiling Bindle (release)…"
+    if ! command -v cargo >/dev/null; then
+        err "cargo not found — run option 1 first."
+        return 1
+    fi
+    if (cd "$SCRIPT_DIR" && cargo build --release); then
+        ok "Built $CARGO_TARGET_DIR/release/bindle"
+    else
+        err "Build failed."
+        return 1
+    fi
+}
+
+install_app() {
+    local binary="$CARGO_TARGET_DIR/release/bindle"
+    # Always (re)compile so option 3 also updates an existing installation;
+    # cargo is incremental, so this is a no-op when nothing changed.
+    compile_app || return 1
+    bold "Installing to your GNOME desktop…"
+    mkdir -p "$BIN_DIR" "$DESKTOP_DIR" "$ICON_DIR" "$SYMBOLIC_DIR" "$LICENSE_DIR"
+    install -m 755 "$binary" "$BIN_DIR/bindle"
+    install -m 644 "$SCRIPT_DIR/LICENSE" "$LICENSE_DIR/LICENSE"
+    install -m 644 "$SCRIPT_DIR/THIRD-PARTY.md" "$LICENSE_DIR/THIRD-PARTY.md"
+    install -m 644 "$SCRIPT_DIR/data/$APP_ID.svg" "$ICON_DIR/$APP_ID.svg"
+    install -m 644 "$SCRIPT_DIR/data/$APP_ID-symbolic.svg" "$SYMBOLIC_DIR/$APP_ID-symbolic.svg"
+    # Use an absolute Exec path so it works even if ~/.local/bin is not in PATH.
+    sed "s|^Exec=bindle|Exec=$BIN_DIR/bindle|" \
+        "$SCRIPT_DIR/data/$APP_ID.desktop" > "$DESKTOP_DIR/$APP_ID.desktop"
+    chmod 644 "$DESKTOP_DIR/$APP_ID.desktop"
+    command -v update-desktop-database >/dev/null && update-desktop-database "$DESKTOP_DIR" 2>/dev/null
+    command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" 2>/dev/null
+    ok "Installed. Find “Bindle” in your app grid (log out/in if it does not appear)."
+    echo "  GPL licence and third-party notices: $LICENSE_DIR"
+}
+
+templates_dir() {
+    xdg-user-dir TEMPLATES 2>/dev/null || echo "$HOME/Templates"
+}
+
+install_template() {
+    local dir
+    dir="$(templates_dir)"
+    bold "Installing file-manager template…"
+    mkdir -p "$dir"
+    install -m 644 "$SCRIPT_DIR/data/Markdown file.md" "$dir/Markdown file.md"
+    ok "Right-click in Files → New Document → “Markdown file”."
+}
+
+remove_template() {
+    rm -f "$(templates_dir)/Markdown file.md"
+    ok "Template removed."
+}
+
+# Everything a release consists of, in one folder: the source zip (source.sh)
+# and the flatpak bundle (buildflatpak.sh). Both scripts honour BINDLE_OUT_DIR,
+# so they write straight into dist/ instead of littering the checkout root.
+make_distribution() {
+    local dist="$SCRIPT_DIR/dist"
+    local version failed=0
+    version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$SCRIPT_DIR/Cargo.toml" | head -1)"
+    bold "Making distribution for Bindle ${version:-unknown} → dist/"
+    mkdir -p "$dist" || return 1
+
+    if [ -x "$SCRIPT_DIR/source.sh" ]; then
+        BINDLE_OUT_DIR="$dist" "$SCRIPT_DIR/source.sh" || failed=1
+    else
+        err "source.sh not found — skipping the source zip."
+        failed=1
+    fi
+
+    # buildflatpak.sh is dev tooling and is not part of the source zip, so a
+    # checkout unpacked from a release simply has no flatpak step.
+    if [ -x "$SCRIPT_DIR/buildflatpak.sh" ]; then
+        BINDLE_OUT_DIR="$dist" "$SCRIPT_DIR/buildflatpak.sh" || failed=1
+    else
+        err "buildflatpak.sh not found — skipping the flatpak bundle."
+        failed=1
+    fi
+
+    echo
+    bold "dist/ now holds:"
+    ls -lh "$dist" | tail -n +2 | sed 's/^/  /'
+    if [ "$failed" = 0 ]; then
+        ok "Distribution ready in $dist"
+    else
+        err "Distribution incomplete (see above)."
+        return 1
+    fi
+}
+
+# Throw-away build output only. Nothing here is a release artifact: dist/, the
+# installed app and ~/.config/bindle are all left alone.
+cleanup_build() {
+    local targets=(
+        "$SCRIPT_DIR/build-dir"          # flatpak-builder work tree
+        "$SCRIPT_DIR/repo"               # local ostree repo the bundle is cut from
+        "$SCRIPT_DIR/.flatpak-builder"   # flatpak-builder download/ccache
+        "$SCRIPT_DIR/target"             # cargo, when built without CARGO_TARGET_DIR
+        "$CARGO_TARGET_DIR"              # cargo, the usual location on this machine
+        "$HOME/.cache/bindle/source"     # source.sh staging (left behind on failure)
+        "$HOME/.cache/bindle/gtkinit"    # cargo target dir used by GTK test runs
+    )
+    local present=() t
+    for t in "${targets[@]}"; do
+        [ -e "$t" ] && present+=("$t")
+    done
+    if [ "${#present[@]}" = 0 ]; then
+        ok "Nothing to clean."
+        return 0
+    fi
+
+    bold "These build directories will be deleted:"
+    for t in "${present[@]}"; do
+        printf '  %s  (%s)\n' "$t" "$(du -sh "$t" 2>/dev/null | cut -f1)"
+    done
+    echo "  (dist/, the installed app and ~/.config/bindle are not touched.)"
+    read -rp "Delete them? [y/N] " confirm
+    case "$confirm" in
+        y|Y)
+            for t in "${present[@]}"; do
+                rm -rf "$t" || err "could not remove $t"
+            done
+            ok "Build files removed. The next compile starts from scratch."
+            ;;
+        *) echo "Cancelled." ;;
+    esac
+}
+
+uninstall_app() {
+    bold "Uninstalling Bindle…"
+    rm -f "$BIN_DIR/bindle" "$DESKTOP_DIR/$APP_ID.desktop" "$ICON_DIR/$APP_ID.svg" \
+          "$SYMBOLIC_DIR/$APP_ID-symbolic.svg" \
+          "$LICENSE_DIR/LICENSE" "$LICENSE_DIR/THIRD-PARTY.md"
+    rmdir "$LICENSE_DIR" 2>/dev/null
+    command -v update-desktop-database >/dev/null && update-desktop-database "$DESKTOP_DIR" 2>/dev/null
+    ok "Removed binary, desktop entry and icon."
+    echo "  (Settings in ~/.config/bindle are kept; delete that folder to remove them.)"
+}
+
+while true; do
+    echo
+    bold "── Bindle ───────────────────────────────"
+    echo "  1) Install tools needed to compile"
+    echo "  2) Compile"
+    echo "  3) Install on this GNOME desktop"
+    echo "  4) Uninstall"
+    echo "  5) Install “New Document” template (Files right-click)"
+    echo "  6) Remove template"
+    echo "  7) Make distribution (source zip + flatpak → dist/)"
+    echo "  8) Cleanup (delete temporary build files)"
+    echo "  q) Quit"
+    read -rp "Choose: " choice
+    case "$choice" in
+        1) install_tools ;;
+        2) compile_app ;;
+        3) install_app ;;
+        4) uninstall_app ;;
+        5) install_template ;;
+        6) remove_template ;;
+        7) make_distribution ;;
+        8) cleanup_build ;;
+        q|Q) exit 0 ;;
+        *) err "Unknown choice." ;;
+    esac
+done
