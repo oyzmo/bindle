@@ -34,6 +34,11 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.18.0" date="2026-10-18">
+      <description>
+        <p>Files panel: freeze a file so it stays in the list</p>
+      </description>
+    </release>
     <release version="1.17.6" date="2026-10-17">
       <description>
         <p>Fix crash on start when the last document was open in view mode (GTK input-method race)</p>

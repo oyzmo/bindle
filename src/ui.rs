@@ -144,8 +144,11 @@ pub struct App {
     /// The Files panel's own order: `recent_files` as it stood at launch
     /// (newest first), then fixed for the session — a row that jumped to
     /// the top when clicked was a moving target. Files opened later join at
-    /// the bottom; removed ones drop out in place.
+    /// the bottom; removed ones drop out in place. Frozen files stay even
+    /// after they fall off the recent list.
     files_order: RefCell<Vec<PathBuf>>,
+    /// Files frozen in the Files panel (the pin toggle), persisted.
+    frozen_files: RefCell<Vec<PathBuf>>,
     top_panel: gtk4::Box,
     bottom_panel: gtk4::Box,
     bottom_label: gtk4::Label,
@@ -294,6 +297,10 @@ pub fn load_css() {
         textview.preview-view, textview.preview-view text {{ background: transparent; }}
         textview.preview-view border {{ background: transparent; }}
         .sidebar-panels {{ background-color: var(--sidebar-bg-color, alpha(currentColor, 0.04)); }}
+        .files-freeze {{ min-height: 0; min-width: 0; padding: 2px; }}
+        .files-freeze:not(:checked) {{ opacity: 0; }}
+        row:hover .files-freeze:not(:checked) {{ opacity: 0.55; }}
+        .files-freeze:checked {{ background: none; }}
         .preview-card {{ background-color: var(--view-bg-color, #ffffff); border-radius: 8px; }}
     ");
     let provider = gtk4::CssProvider::new();
@@ -763,6 +770,7 @@ impl App {
             doc_state: RefCell::new(settings.doc_state.clone()),
             recent_files: RefCell::new(settings.recent_files.clone()),
             files_order: RefCell::new(settings.recent_files.clone()),
+            frozen_files: RefCell::new(settings.frozen_files.clone()),
             open_seq: Cell::new(0),
             recent_menu,
             remember_folds: Cell::new(settings.remember_folds),
@@ -1308,6 +1316,7 @@ impl App {
                 return;
             };
             state.recent_files.borrow_mut().retain(|p| *p != path);
+            state.frozen_files.borrow_mut().retain(|p| *p != path);
             state.update_recent_menu();
             state.persist_settings();
         });
@@ -2527,9 +2536,10 @@ impl App {
     fn update_files_panel(&self) {
         {
             let recent = self.recent_files.borrow();
+            let frozen = self.frozen_files.borrow();
             let mut order = self.files_order.borrow_mut();
-            order.retain(|p| recent.contains(p));
-            for path in recent.iter().rev() {
+            order.retain(|p| recent.contains(p) || frozen.contains(p));
+            for path in recent.iter().rev().chain(frozen.iter()) {
                 if !order.contains(path) {
                     order.push(path.clone());
                 }
@@ -2545,6 +2555,7 @@ impl App {
         for (path, name) in recent.iter().zip(&names) {
             let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
             let label = gtk4::Label::new(Some(name));
+            label.set_hexpand(true);
             label.set_xalign(0.0);
             label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
             hbox.append(&label);
@@ -2558,8 +2569,12 @@ impl App {
                     suffix.add_css_class("dim-label");
                     suffix.set_ellipsize(gtk4::pango::EllipsizeMode::End);
                     hbox.append(&suffix);
+                    label.set_hexpand(false);
+                    suffix.set_hexpand(true);
+                    suffix.set_xalign(0.0);
                 }
             }
+            hbox.append(&self.freeze_button(path));
             let row = gtk4::ListBoxRow::new();
             row.set_child(Some(&hbox));
             row.set_tooltip_text(Some(&path.display().to_string()));
@@ -2567,6 +2582,41 @@ impl App {
         }
         drop(recent);
         self.mark_current_file();
+    }
+
+    /// The Files row's freeze pin: a frozen file stays in the panel when it
+    /// falls off the recent list. Shown dim on hover only until set.
+    fn freeze_button(&self, path: &Path) -> gtk4::ToggleButton {
+        let frozen = self.frozen_files.borrow().iter().any(|p| p == path);
+        let button = gtk4::ToggleButton::builder()
+            .icon_name("view-pin-symbolic")
+            .active(frozen)
+            .valign(gtk4::Align::Center)
+            .tooltip_text(if frozen { "Unfreeze" } else { "Freeze in List" })
+            .css_classes(["flat", "files-freeze"])
+            .build();
+        let path = path.to_path_buf();
+        // From the thread-local at click time: this also runs while `build`
+        // is still assembling the window, before there is an Rc to capture.
+        button.connect_toggled(move |button| {
+            let Some(state) = STATE.with(|s| s.borrow().clone()) else { return };
+            let on = button.is_active();
+            button.set_tooltip_text(Some(if on { "Unfreeze" } else { "Freeze in List" }));
+            {
+                let mut frozen = state.frozen_files.borrow_mut();
+                frozen.retain(|p| *p != path);
+                if on {
+                    frozen.push(path.clone());
+                }
+            }
+            state.persist_settings();
+            // An unfrozen file that is no longer recent leaves the list;
+            // rebuild after this handler, not under the button emitting it.
+            if !on && !state.recent_files.borrow().contains(&path) {
+                glib::idle_add_local_once(move || state.update_files_panel());
+            }
+        });
+        button
     }
 
     /// Select the open document's row in the Files panel, or none.
@@ -3173,8 +3223,12 @@ impl App {
                     }
                     state.persist_settings();
                 }
-                Ok((Err(_), true)) if state.recent_files.borrow().contains(&path) => {
+                Ok((Err(_), true))
+                    if state.recent_files.borrow().contains(&path)
+                        || state.frozen_files.borrow().contains(&path) =>
+                {
                     state.recent_files.borrow_mut().retain(|p| *p != path);
+                    state.frozen_files.borrow_mut().retain(|p| *p != path);
                     state.update_recent_menu();
                     state.persist_settings();
                     state.toast(&format!(
@@ -4923,6 +4977,7 @@ impl App {
             remember_folds: self.remember_folds.get(),
             doc_state: self.doc_state.borrow().clone(),
             recent_files: self.recent_files.borrow().clone(),
+            frozen_files: self.frozen_files.borrow().clone(),
             memos_url: self.memos_url.borrow().clone(),
             memo_docs: self.memo_docs.borrow().clone(),
             memos_insecure: self.memos_insecure.get(),

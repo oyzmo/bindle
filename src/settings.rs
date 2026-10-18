@@ -64,6 +64,9 @@ pub struct Settings {
     pub doc_state: Vec<DocState>,
     /// Recently opened documents, most recent first, capped at RECENT_MAX.
     pub recent_files: Vec<PathBuf>,
+    /// Files frozen in the Files panel: kept there whatever falls off
+    /// `recent_files`, until unfrozen, removed, or found to be gone.
+    pub frozen_files: Vec<PathBuf>,
     /// Base URL of the Memos server, normalized. Empty when unconfigured.
     /// The access token is deliberately not here — see `crate::secrets`.
     pub memos_url: String,
@@ -315,6 +318,7 @@ impl Default for Settings {
             remember_folds: true,
             doc_state: Vec::new(),
             recent_files: Vec::new(),
+            frozen_files: Vec::new(),
             memos_url: String::new(),
             memo_docs: Vec::new(),
             memos_insecure: false,
