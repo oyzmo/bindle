@@ -56,6 +56,9 @@ pub struct Settings {
     pub editor_font: String,
     /// Preview font size: "small", "normal", "large" or "xlarge".
     pub preview_font: String,
+    /// Shrink the preview's font (and images) so a full-width reading line
+    /// fits the panel — an overview of the whole document's look.
+    pub preview_fit: bool,
     /// Remember per-document state (collapsed sections, view mode) across
     /// sessions. JSON key kept from when it covered folds only.
     pub remember_folds: bool,
@@ -218,6 +221,10 @@ pub enum FontSize {
     XLarge,
 }
 
+/// Smallest preview font "Fit preview to width" shrinks to; below this the
+/// overview stops being legible as text at all.
+pub const FIT_MIN_PT: f64 = 5.0;
+
 impl FontSize {
     pub fn from_str(s: &str) -> FontSize {
         match s {
@@ -252,13 +259,27 @@ impl FontSize {
     /// CSS size for the preview, whose base is smaller than the editor's
     /// (preview headings scale up from it via the h* tags). Same fractional
     /// rule as `pt`.
-    pub fn preview_pt(self) -> &'static str {
+    pub fn preview_pt(self) -> f64 {
         match self {
-            FontSize::Small => "8.5pt",
-            FontSize::Normal => "9.5pt",
-            FontSize::Large => "11.5pt",
-            FontSize::XLarge => "13.75pt",
+            FontSize::Small => 8.5,
+            FontSize::Normal => 9.5,
+            FontSize::Large => 11.5,
+            FontSize::XLarge => 13.75,
         }
+    }
+
+    /// The preview size shrunk by `scale` for "Fit preview to width": never
+    /// below `FIT_MIN_PT`, never above the unscaled size, and on a quarter
+    /// point that is not a whole pixel (the clipping rule above).
+    pub fn fitted_preview_pt(self, scale: f64) -> f64 {
+        let base = self.preview_pt();
+        let mut pt = ((base * scale.min(1.0)) * 4.0).round() / 4.0;
+        pt = pt.clamp(FIT_MIN_PT.min(base), base);
+        // 0.75pt = 1px: nudge whole-pixel sizes off the grid.
+        if (pt / 0.75).fract() == 0.0 {
+            pt += 0.25;
+        }
+        pt
     }
 }
 
@@ -315,6 +336,7 @@ impl Default for Settings {
             word_wrap: true,
             editor_font: "normal".to_string(),
             preview_font: "normal".to_string(),
+            preview_fit: false,
             remember_folds: true,
             doc_state: Vec::new(),
             recent_files: Vec::new(),
@@ -408,6 +430,20 @@ pub fn keep_foreign_drafts(ours: &mut Vec<MemoDoc>, on_disk: &[MemoDoc]) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fitted_preview_sizes_stay_in_range_and_off_whole_pixels() {
+        for size in ["small", "normal", "large", "xlarge"] {
+            let size = super::FontSize::from_str(size);
+            for step in 0..=120 {
+                let pt = size.fitted_preview_pt(step as f64 / 100.0);
+                assert!(pt >= super::FIT_MIN_PT, "{pt}");
+                assert!(pt <= size.preview_pt() + 0.25, "{pt}");
+                assert_ne!((pt / 0.75).fract(), 0.0, "{pt} is a whole pixel");
+            }
+            assert_eq!(size.fitted_preview_pt(1.0), size.preview_pt());
+        }
+    }
+
     use super::*;
 
     fn doc(path: &str, name: &str, unpushed: bool) -> MemoDoc {

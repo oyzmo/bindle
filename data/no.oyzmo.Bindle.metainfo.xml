@@ -34,6 +34,11 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.20.0" date="2026-10-19">
+      <description>
+        <p>Fit preview to width: an option that shrinks the preview to show the whole document's layout in a narrow panel</p>
+      </description>
+    </release>
     <release version="1.19.0" date="2026-10-18">
       <description>
         <p>Files panel: right-click → Open Location shows the file in the file manager</p>

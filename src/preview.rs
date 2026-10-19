@@ -37,6 +37,71 @@ thread_local! {
     /// `splice` treat unchanged images as unchanged content.
     static LOADER_CACHE: RefCell<HashMap<(String, usize), gdk::Texture>> =
         RefCell::new(HashMap::new());
+
+    /// Image scale for "Fit preview to width" (1.0 = thumbnails as decoded).
+    static IMAGE_SCALE: std::cell::Cell<f64> = const { std::cell::Cell::new(1.0) };
+
+    /// Shrunk copies of cached thumbnails at the current `IMAGE_SCALE`, keyed
+    /// by the source texture's identity (kept alive in the value, so the key
+    /// can't be reused). Stable identity keeps `splice` from re-inserting them.
+    static FIT_CACHE: RefCell<HashMap<usize, (gdk::Texture, gdk::Texture)>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Set the factor images are shrunk by on the next render, matching the
+/// fitted preview font. Changing it drops the shrunk copies of the old one;
+/// returns whether it changed, i.e. whether images need a re-render.
+pub fn set_image_scale(scale: f64) -> bool {
+    let scale = scale.clamp(0.05, 1.0);
+    let changed = IMAGE_SCALE.with(|s| s.replace(scale)) != scale;
+    if changed {
+        FIT_CACHE.with(|cache| cache.borrow_mut().clear());
+    }
+    changed
+}
+
+/// `texture` shrunk by `IMAGE_SCALE`, or itself at full scale.
+fn fit_texture(texture: &gdk::Texture) -> gdk::Texture {
+    let scale = IMAGE_SCALE.with(|s| s.get());
+    if scale >= 1.0 {
+        return texture.clone();
+    }
+    let key = texture.as_ptr() as usize;
+    if let Some(fitted) = FIT_CACHE.with(|cache| cache.borrow().get(&key).map(|(_, f)| f.clone())) {
+        return fitted;
+    }
+    let fitted = shrink_texture(texture, scale).unwrap_or_else(|| texture.clone());
+    FIT_CACHE.with(|cache| cache.borrow_mut().insert(key, (texture.clone(), fitted.clone())));
+    fitted
+}
+
+/// Downscale through cairo: `Texture::download` yields premultiplied BGRA,
+/// which is cairo's ARGB32 on the little-endian machines this runs on.
+fn shrink_texture(texture: &gdk::Texture, scale: f64) -> Option<gdk::Texture> {
+    let (w, h) = (texture.width(), texture.height());
+    let (tw, th) = (
+        ((w as f64 * scale).round() as i32).max(1),
+        ((h as f64 * scale).round() as i32).max(1),
+    );
+    let stride = cairo::Format::ARgb32.stride_for_width(w as u32).ok()?;
+    let mut data = vec![0u8; stride as usize * h as usize];
+    texture.download(&mut data, stride as usize);
+    let src = cairo::ImageSurface::create_for_data(data, cairo::Format::ARgb32, w, h, stride).ok()?;
+    let mut dst = cairo::ImageSurface::create(cairo::Format::ARgb32, tw, th).ok()?;
+    {
+        let cr = cairo::Context::new(&dst).ok()?;
+        cr.scale(tw as f64 / w as f64, th as f64 / h as f64);
+        cr.set_source_surface(&src, 0.0, 0.0).ok()?;
+        cr.source().set_filter(cairo::Filter::Good);
+        cr.paint().ok()?;
+    }
+    dst.flush();
+    let stride = dst.stride() as usize;
+    let bytes = glib::Bytes::from(&*dst.data().ok()?);
+    Some(
+        gdk::MemoryTexture::new(tw, th, gdk::MemoryFormat::B8g8r8a8Premultiplied, &bytes, stride)
+            .upcast(),
+    )
 }
 
 /// Forget loader-provided textures. Call when the document changes: the key
@@ -654,7 +719,7 @@ impl<'a> Renderer<'a> {
     fn insert_texture(&mut self, texture: &gdk::Texture) {
         let mut iter = self.buffer.end_iter();
         let at = iter.offset();
-        self.buffer.insert_paintable(&mut iter, texture);
+        self.buffer.insert_paintable(&mut iter, &fit_texture(texture));
         self.tail = [self.tail[1], '\u{FFFC}'];
         if let Some((source, _)) = self.map_src {
             self.map.entries.push(MapEntry { preview: at, len: 1, source, exact: false });

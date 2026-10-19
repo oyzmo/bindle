@@ -31,6 +31,10 @@ thread_local! {
 /// Horizontal padding on each side of the line numbers in the gutter.
 const GUTTER_PAD: i32 = 8;
 
+/// Text width "Fit preview to width" fits into the panel, in ems of the
+/// chosen preview font — roughly a full reading line (~80 characters).
+const FIT_EMS: f64 = 40.0;
+
 /// Above this, keyword highlighting switches itself off. Tagging is
 /// incremental, but the scanners still read the whole document on every
 /// debounce and nothing here can be done per-line — they take the whole text.
@@ -249,6 +253,13 @@ pub struct App {
     word_wrap: Cell<bool>,
     editor_font: Cell<FontSize>,
     preview_font: Cell<FontSize>,
+    /// "Fit preview to width": the preview font (and images) shrink with the
+    /// panel so a reading line keeps its full-size words — see `fit_scale`.
+    preview_fit: Cell<bool>,
+    /// The scale the preview font was last applied at.
+    preview_scale: Cell<f64>,
+    /// Pending debounced re-fit after a width change, if any.
+    fit_pending: Cell<Option<glib::SourceId>>,
     /// Runtime override of the editor/preview font-size CSS from load_css.
     font_provider: gtk4::CssProvider,
     show_files: Cell<bool>,
@@ -595,6 +606,7 @@ impl App {
         preview_font_menu.append(Some("Large"), Some("win.preview-font::large"));
         preview_font_menu.append(Some("Extra large"), Some("win.preview-font::xlarge"));
         view_section.append_submenu(Some("Preview f_ont size"), &preview_font_menu);
+        view_section.append(Some("Fit preview to wi_dth"), Some("win.preview-fit"));
         view_section.append(Some("Line _numbers"), Some("win.line-numbers"));
         view_section.append(Some("Line numbers in p_review"), Some("win.preview-line-numbers"));
         view_section.append(Some("_Word wrap"), Some("win.word-wrap"));
@@ -795,6 +807,9 @@ impl App {
             word_wrap: Cell::new(settings.word_wrap),
             editor_font: Cell::new(FontSize::from_str(&settings.editor_font)),
             preview_font: Cell::new(FontSize::from_str(&settings.preview_font)),
+            preview_fit: Cell::new(settings.preview_fit),
+            preview_scale: Cell::new(1.0),
+            fit_pending: Cell::new(None),
             font_provider,
             show_files: Cell::new(settings.show_files),
             show_insert: Cell::new(settings.show_insert),
@@ -965,7 +980,10 @@ impl App {
         // area's width, which tables are wrapped to.
         if let Some(adj) = self.preview.hadjustment() {
             let state = self.clone();
-            adj.connect_notify_local(Some("page-size"), move |_, _| state.refit_tables());
+            adj.connect_notify_local(Some("page-size"), move |_, _| {
+                state.schedule_fit();
+                state.refit_tables();
+            });
         }
         if let Some(adj) = self.preview.vadjustment() {
             for signal in ["value-changed", "changed"] {
@@ -1530,6 +1548,21 @@ impl App {
             };
             action.set_state(&choice.to_variant());
             state.preview_font.set(FontSize::from_str(&choice));
+            state.apply_fonts();
+            state.persist_settings();
+        });
+        self.window.add_action(&action);
+
+        let action = gio::SimpleAction::new_stateful(
+            "preview-fit",
+            None,
+            &self.preview_fit.get().to_variant(),
+        );
+        let state = self.clone();
+        action.connect_activate(move |action, _| {
+            let enabled = !state.preview_fit.get();
+            action.set_state(&enabled.to_variant());
+            state.preview_fit.set(enabled);
             state.apply_fonts();
             state.persist_settings();
         });
@@ -3942,11 +3975,55 @@ impl App {
         preview::retint(&self.preview.buffer(), colors);
     }
 
+    /// How far "Fit preview to width" shrinks the preview: the panel's width
+    /// against `FIT_EMS` of the chosen preview font, so a narrow panel shows
+    /// the same words per line as a full-width one, only smaller. Never
+    /// enlarges — a wide preview (view mode) keeps the chosen size.
+    fn fit_scale(&self) -> f64 {
+        if !self.preview_fit.get() {
+            return 1.0;
+        }
+        let width = self.preview.width() - self.preview.left_margin() - self.preview.right_margin();
+        if width <= 0 {
+            return self.preview_scale.get();
+        }
+        let em_px = self.preview_font.get().preview_pt() / 0.75;
+        (width as f64 / (em_px * FIT_EMS)).min(1.0)
+    }
+
+    /// Re-fit the preview font after a width change. Debounced, since every
+    /// font change re-lays out the whole preview and dragging a divider
+    /// changes the width every frame — except the first fit after launch,
+    /// which runs at once so the preview doesn't open at full size.
+    fn schedule_fit(self: &Rc<Self>) {
+        if !self.preview_fit.get() {
+            return;
+        }
+        if let Some(id) = self.fit_pending.take() {
+            id.remove();
+        }
+        let delay = if self.preview_scale.get() == 1.0 { 0 } else { 120 };
+        let state = self.clone();
+        let id = glib::timeout_add_local_once(Duration::from_millis(delay), move || {
+            state.fit_pending.take();
+            let font = state.preview_font.get();
+            if font.fitted_preview_pt(state.fit_scale())
+                != font.fitted_preview_pt(state.preview_scale.get())
+            {
+                state.apply_fonts();
+            }
+        });
+        self.fit_pending.set(Some(id));
+    }
+
     fn apply_fonts(self: &Rc<Self>) {
-        let mut css = format!(
-            "textview.preview-view {{ font-size: {}; }}",
-            self.preview_font.get().preview_pt()
-        );
+        let scale = self.fit_scale();
+        self.preview_scale.set(scale);
+        let font = self.preview_font.get();
+        let pt = font.fitted_preview_pt(scale);
+        // Images follow the size actually applied, floor and rounding included.
+        let images_changed = preview::set_image_scale(pt / font.preview_pt());
+        let mut css = format!("textview.preview-view {{ font-size: {pt}pt; }}");
         // BINDLE_EDITOR_FONT (uishot experiments) keeps the last word.
         if std::env::var("BINDLE_EDITOR_FONT").is_err() {
             css.push_str(&format!(
@@ -3960,7 +4037,11 @@ impl App {
         let state = self.clone();
         glib::idle_add_local_once(move || {
             state.update_gutter();
-            state.refit_tables();
+            if images_changed && state.preview_visible() {
+                state.schedule_preview();
+            } else {
+                state.refit_tables();
+            }
         });
     }
 
@@ -4403,6 +4484,7 @@ impl App {
             ("show-preview", enabled),
             ("view-mode", enabled),
             ("preview-line-numbers", enabled),
+            ("preview-fit", enabled),
             ("word-wrap", kind.wrap_lines()),
         ] {
             if let Some(action) = self.window.lookup_action(name) {
@@ -5000,6 +5082,7 @@ impl App {
             word_wrap: self.word_wrap.get(),
             editor_font: self.editor_font.get().as_str().to_string(),
             preview_font: self.preview_font.get().as_str().to_string(),
+            preview_fit: self.preview_fit.get(),
             show_files: self.show_files.get(),
             show_insert: self.show_insert.get(),
             show_preview: self.show_preview.get(),
