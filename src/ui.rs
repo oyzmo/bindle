@@ -2917,7 +2917,10 @@ impl App {
                     self.syncing_cursor.set(true);
                     self.buffer.select_range(&start, &end);
                     self.syncing_cursor.set(false);
-                    self.center_editor_on_cursor();
+                    // Mirror the selection but keep focus on the preview, so
+                    // Ctrl+C copies the word just selected there.
+                    self.editor
+                        .scroll_to_mark(&self.buffer.get_insert(), 0.0, true, 0.0, 0.5);
                     return;
                 }
             }
