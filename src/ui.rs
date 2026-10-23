@@ -13,12 +13,10 @@ use crate::doc::{self, DocKind};
 use crate::editor;
 use crate::export;
 use crate::highlight;
-use crate::memos;
 use crate::odf;
 use crate::preview;
-use crate::secrets;
 use crate::settings::{
-    self, ColorScheme, DocState, FontSize, MemoDoc, RemotePolicy, Settings, Theme, DOC_STATE_MAX,
+    ColorScheme, DocState, FontSize, RemotePolicy, Settings, Theme, DOC_STATE_MAX,
     RECENT_MAX,
 };
 use crate::snippets::{self, Snippet};
@@ -49,24 +47,6 @@ const HIGHLIGHT_MAX_BYTES: usize = 2 * 1024 * 1024;
 enum OpenTry {
     First,
     AfterMount,
-}
-
-/// Widgets and paging state of the Memos browse dialog, held in one `Rc` so
-/// the search entry, the "Load more" button and the row handler all drive
-/// the same list. `memos` is indexed by `ListBoxRow::index()`, which is why
-/// "Load more" sits outside the list box.
-struct Browse {
-    dialog: adw::Dialog,
-    list: gtk4::ListBox,
-    /// Shown instead of the list while loading, empty or failed.
-    status: gtk4::Label,
-    more: gtk4::Button,
-    spinner: gtk4::Spinner,
-    memos: RefCell<Vec<memos::Memo>>,
-    /// Token for the next page; empty once the list is exhausted.
-    next_token: RefCell<String>,
-    query: RefCell<String>,
-    loading: Cell<bool>,
 }
 
 /// Where the current document lives.
@@ -289,17 +269,6 @@ pub struct App {
     horizontal: Cell<bool>,
     /// Paned positions of the other layout, restored when toggling back.
     saved_panes: Cell<Option<(i32, i32, i32)>>,
-    /// Base URL of the Memos server; empty until configured. The access
-    /// token is deliberately not kept here — every request reads it from
-    /// the keyring on its worker thread (see `secrets`).
-    memos_url: RefCell<String>,
-    /// Memos checked out into local cache files, MRU-ordered, persisted.
-    memo_docs: RefCell<Vec<MemoDoc>>,
-    /// Talk to the Memos server without verifying its certificate.
-    memos_insecure: Cell<bool>,
-    /// The current document is a checked-out memo edited since its last
-    /// push. Seeded from the store on load, so it survives a restart.
-    memo_unpushed: Cell<bool>,
     /// The document's file as last read or written by us (`text_file`).
     /// `None` for an unsaved document, or when the stat failed.
     disk_stamp: Cell<Option<doc::DiskStamp>>,
@@ -591,14 +560,6 @@ impl App {
         file_section.append(Some("_Print…"), Some("win.print"));
         menu.append_section(None, &file_section);
 
-        let memos_section = gio::Menu::new();
-        let memos_menu = gio::Menu::new();
-        memos_menu.append(Some("_Send to Memos…"), Some("win.memos-send"));
-        memos_menu.append(Some("_Browse Memos…"), Some("win.memos-browse"));
-        memos_menu.append(Some("_Push to Memos"), Some("win.memos-push"));
-        memos_menu.append(Some("Server Set_up…"), Some("win.memos-setup"));
-        memos_section.append_submenu(Some("Me_mos"), &memos_menu);
-        menu.append_section(None, &memos_section);
 
         let view_section = gio::Menu::new();
         let appearance_menu = gio::Menu::new();
@@ -841,10 +802,6 @@ impl App {
             show_preview: Cell::new(settings.show_preview),
             horizontal: Cell::new(false),
             saved_panes: Cell::new(None),
-            memos_url: RefCell::new(settings.memos_url.clone()),
-            memo_docs: RefCell::new(settings.memo_docs.clone()),
-            memos_insecure: Cell::new(settings.memos_insecure),
-            memo_unpushed: Cell::new(false),
             disk_stamp: Cell::new(None),
             disk_checking: Cell::new(false),
         });
@@ -878,8 +835,6 @@ impl App {
         state.wire_signals(&elements, &popover_list);
         state.register_actions();
         state.update_recent_menu();
-        // Nothing is loaded yet, so "Push to Memos" starts insensitive.
-        state.update_memos_actions();
 
         // Restore the last opened file if enabled. No is_file() probe: it
         // could hang on an unreachable mount; open_path fails with a toast
@@ -908,18 +863,8 @@ impl App {
                 return;
             }
             state.edit_seq.set(state.edit_seq.get().wrapping_add(1));
-            let first_change = !state.modified.replace(true);
-            // A checked-out memo now differs from the server copy. Persist
-            // that immediately rather than at the next settings write:
-            // opening another document replaces `source`, and this is the
-            // last moment the flag can be attributed to the right memo.
-            let newly_unpushed =
-                state.memo_doc().is_some() && !state.memo_unpushed.replace(true);
-            if first_change || newly_unpushed {
+            if !state.modified.replace(true) {
                 state.update_title();
-            }
-            if newly_unpushed {
-                state.persist_settings();
             }
             state.schedule_preview();
         });
@@ -1350,18 +1295,13 @@ impl App {
         let state = self.clone();
         self.window.connect_close_request(move |_| {
             state.persist_settings();
-            if state.modified.get() || state.memo_unpushed.get() {
-                // Two guards in sequence: unsaved file changes first, then
-                // memo changes that exist only on this computer.
-                let unpushed = state.clone();
+            if state.modified.get() {
                 let destroy = state.clone();
                 state.guard_unsaved(Box::new(move || {
-                    unpushed.guard_unpushed(Box::new(move || {
-                        // Settings were written before the dialogs; a Save
-                        // As in between added a file to the recent list.
-                        destroy.persist_settings();
-                        destroy.window.destroy()
-                    }))
+                    // Settings were written before the dialog; a Save As in
+                    // between added a file to the recent list.
+                    destroy.persist_settings();
+                    destroy.window.destroy()
                 }));
                 glib::Propagation::Stop
             } else {
@@ -1371,11 +1311,7 @@ impl App {
     }
 
     fn register_actions(self: &Rc<Self>) {
-        let actions: [(&str, Box<dyn Fn(&Rc<App>)>); 19] = [
-            ("memos-send", Box::new(|s| s.memos_send_dialog())),
-            ("memos-browse", Box::new(|s| s.memos_browse_dialog())),
-            ("memos-push", Box::new(|s| s.memos_push(None))),
-            ("memos-setup", Box::new(|s| s.memos_setup_dialog())),
+        let actions: [(&str, Box<dyn Fn(&Rc<App>)>); 15] = [
             ("new", Box::new(|s| s.new_file())),
             ("find", Box::new(|s| s.show_find())),
             ("fold-all", Box::new(|s| s.toggle_fold_all())),
@@ -1809,10 +1745,7 @@ impl App {
                      packages carrying their own images and attachments, and \
                      export to HTML or PDF. Bindle also opens plain text, NFO \
                      art, JSON, YAML, TOML, shell scripts and XML with keyword \
-                     highlighting.\n\n\
-                     It can connect to a self-hosted Memos server to send, \
-                     browse, edit and push back memos — the only network \
-                     feature, and never used unless asked.",
+                     highlighting.",
                 )
                 .developer_name("oyzmo")
                 .copyright("Made by oyzmo 2026 together with AI")
@@ -3515,9 +3448,6 @@ impl App {
         self.disk_stamp.set(None);
         self.disk_banner.set_revealed(false);
         self.modified.set(false);
-        // A checked-out memo carries its unpushed state across sessions.
-        self.memo_unpushed.set(self.memo_doc().is_some_and(|doc| doc.unpushed));
-        self.update_memos_actions();
         self.update_title();
         self.apply_kind_layout(false);
         // Same reason `schedule_preview` skips: rendering a preview nobody
@@ -3695,12 +3625,8 @@ impl App {
         // Remembered view mode wins; without a memory the open-in-view
         // setting applies, and view mode is never dropped on open.
         self.set_view_mode(self.view_mode_for(path));
-        // Memo cache files are reached through the browse dialog; keeping
-        // them out of "Open Recent" stops it filling with ~/.cache paths.
-        if self.memo_doc_for(path).is_none() {
-            self.remember_recent(path);
-            self.update_recent_menu();
-        }
+        self.remember_recent(path);
+        self.update_recent_menu();
         self.persist_settings();
     }
 
@@ -3971,17 +3897,9 @@ impl App {
                 let moved = self.source.borrow().container() != Some(path);
                 *self.source.borrow_mut() = DocSource::Plain(path.to_path_buf());
                 if moved {
-                    // A checked-out memo saved under a new name is an
-                    // ordinary file now: nothing of it to push, and "Push to
-                    // Memos" must not stay offered for it. (The memo's own
-                    // entry keeps its flag — it was stored when it flipped.)
-                    self.memo_unpushed.set(self.memo_doc().is_some_and(|d| d.unpushed));
-                    self.update_memos_actions();
                     // Into the Files panel, like a file opened by hand.
-                    if self.memo_doc_for(path).is_none() {
-                        self.remember_recent(path);
-                        self.update_recent_menu();
-                    }
+                    self.remember_recent(path);
+                    self.update_recent_menu();
                 }
                 // No longer a pack: staged entries must not leak into a
                 // later export via asset_source's staged-first lookup.
@@ -4894,146 +4812,6 @@ impl App {
         });
     }
 
-    /// Run `then` unless the document is a checked-out memo with changes
-    /// that were never pushed; ask first in that case. Mirrors
-    /// `guard_unsaved` and composes with it — nothing is lost either way,
-    /// since the local cache file keeps the text.
-    fn guard_unpushed(self: &Rc<Self>, then: Box<dyn FnOnce()>) {
-        if !self.memo_unpushed.get() || self.memo_doc().is_none() {
-            then();
-            return;
-        }
-        if self.guard_active.get() {
-            return;
-        }
-        let dialog = adw::AlertDialog::new(
-            Some("Push to Memos?"),
-            Some(
-                "This memo has changes that exist only on this computer. \
-                 They stay in the local copy either way.",
-            ),
-        );
-        dialog.add_responses(&[("cancel", "_Cancel"), ("later", "_Not Now"), ("push", "_Push")]);
-        dialog.set_response_appearance("push", adw::ResponseAppearance::Suggested);
-        dialog.set_default_response(Some("push"));
-        dialog.set_close_response("cancel");
-        self.guard_active.set(true);
-        let state = self.clone();
-        dialog.choose(Some(&self.window), gio::Cancellable::NONE, move |response| {
-            state.guard_active.set(false);
-            match response.as_str() {
-                "push" => state.memos_push(Some(then)),
-                "later" => then(),
-                _ => {}
-            }
-        });
-    }
-
-    // --- Memos ---
-
-    /// Run a Memos request on a worker thread, then hand the result to
-    /// `done` back on the main loop. Every network call goes through here:
-    /// an unreachable server blocks for the full timeout, which on the main
-    /// thread would freeze the window — the same reason `open_path` reads
-    /// files off the main loop.
-    fn memos_call<T, F, D>(self: &Rc<Self>, work: F, done: D)
-    where
-        T: Send + 'static,
-        F: FnOnce(&memos::Server) -> Result<T, memos::Error> + Send + 'static,
-        D: FnOnce(&Rc<App>, Result<T, memos::Error>) + 'static,
-    {
-        let base = self.memos_url.borrow().clone();
-        let insecure = self.memos_insecure.get();
-        let state = self.clone();
-        glib::spawn_future_local(async move {
-            let joined = gio::spawn_blocking(move || {
-                memos_server(base, insecure).and_then(|s| work(&s))
-            })
-            .await;
-            let result = joined
-                .unwrap_or_else(|_| Err(memos::Error::Network("the request failed".into())));
-            done(&state, result);
-        });
-    }
-
-    /// True once a server is set; the token's absence is reported by the
-    /// request itself, since checking it would mean a keyring round trip.
-    fn memos_ready(&self) -> bool {
-        if self.memos_url.borrow().is_empty() {
-            self.toast(&memos::Error::NoServer.to_string());
-            return false;
-        }
-        true
-    }
-
-    /// The memo link of the current document, if it is a checked-out memo.
-    fn memo_doc(&self) -> Option<MemoDoc> {
-        let path = self.source.borrow().container().map(Path::to_path_buf)?;
-        self.memo_doc_for(&path)
-    }
-
-    fn memo_doc_for(&self, path: &Path) -> Option<MemoDoc> {
-        self.memo_docs.borrow().iter().find(|d| d.path == path).cloned()
-    }
-
-    fn memo_doc_for_name(&self, name: &str) -> Option<MemoDoc> {
-        self.memo_docs.borrow().iter().find(|d| d.name == name).cloned()
-    }
-
-    fn remember_memo_doc(&self, doc: MemoDoc) {
-        settings::remember_memo(&mut self.memo_docs.borrow_mut(), doc);
-    }
-
-    /// Delete checked-out memos that have gone stale in the cache
-    /// directory. Runs when the browse dialog opens — the moment you are
-    /// about to check more out — rather than at startup, so it costs launch
-    /// time nothing; the directory read and the unlinks happen on a worker
-    /// thread all the same.
-    ///
-    /// The guard list is built here, on the main loop, where the open
-    /// document and the store can actually be read: everything currently
-    /// open or holding unpushed edits is protected, and `memo_cache_stale`
-    /// applies the rest of the rules. Anything deleted can be fetched from
-    /// the server again.
-    fn memos_sweep_cache(&self) {
-        let mut protected: Vec<PathBuf> =
-            self.memo_docs.borrow().iter().filter(|d| d.unpushed).map(|d| d.path.clone()).collect();
-        protected.extend(self.source.borrow().container().map(Path::to_path_buf));
-        gio::spawn_blocking(move || {
-            let Ok(entries) = fs::read_dir(memo_cache_dir()) else {
-                return;
-            };
-            let now = std::time::SystemTime::now();
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let age = entry
-                    .metadata()
-                    .ok()
-                    .filter(|meta| meta.is_file())
-                    .and_then(|meta| meta.modified().ok())
-                    .and_then(|modified| now.duration_since(modified).ok());
-                // No age means no readable mtime, or a clock skewed into the
-                // future: leave the file alone rather than guess.
-                if age.is_some_and(|age| settings::memo_cache_stale(&path, age, &protected)) {
-                    let _ = fs::remove_file(&path);
-                }
-            }
-        });
-    }
-
-    /// Keep the stored entry for the current document in step with the live
-    /// unpushed flag, the way `sync_doc_state` does for folds.
-    fn sync_memo_state(&self) {
-        let Some(path) = self.source.borrow().container().map(Path::to_path_buf) else {
-            return;
-        };
-        let unpushed = self.memo_unpushed.get();
-        let mut docs = self.memo_docs.borrow_mut();
-        if let Some(doc) = docs.iter_mut().find(|d| d.path == path) {
-            doc.unpushed = unpushed;
-        }
-    }
-
     /// Grey out the actions that do nothing for the current kind: both panel
     /// toggles and view mode outside markdown, and word wrap for NFO/DIZ art.
     /// `apply_panels`/`apply_wrap` already override the effect — this is so
@@ -5072,522 +4850,6 @@ impl App {
         self.gutter.queue_draw();
     }
 
-    /// Grey out "Push to Memos" for documents that did not come from Memos.
-    fn update_memos_actions(&self) {
-        let enabled = self.memo_doc().is_some();
-        if let Some(action) = self.window.lookup_action("memos-push") {
-            if let Ok(action) = action.downcast::<gio::SimpleAction>() {
-                action.set_enabled(enabled);
-            }
-        }
-    }
-
-    /// Server URL and access token. The token field starts blank and is
-    /// never prefilled from the keyring: reading it back would put the
-    /// secret on screen for no benefit, and leaving it empty is how the
-    /// user says "keep the one already saved".
-    fn memos_setup_dialog(self: &Rc<Self>) {
-        let dialog = adw::AlertDialog::new(
-            Some("Memos Server"),
-            Some(
-                "Bindle signs in with an access token, not a password. \
-                 Create one in the Memos web interface under \
-                 Settings → Access Tokens.",
-            ),
-        );
-        let group = adw::PreferencesGroup::new();
-        group.set_description(Some("Leave the token blank to keep the one already saved."));
-        let url_row = adw::EntryRow::builder().title("Server address").build();
-        url_row.set_text(&self.memos_url.borrow());
-        let token_row = adw::PasswordEntryRow::builder().title("Access token").build();
-        // Last resort for a LAN server whose CA can't be installed on this
-        // machine. Spelled out rather than labelled "insecure", so the
-        // trade is visible at the switch instead of in a wiki somewhere.
-        let insecure_row = adw::SwitchRow::builder()
-            .title("Skip certificate checks")
-            .subtitle(
-                "Accepts any certificate. Anything able to route your traffic \
-                 could then read the access token. Prefer installing your CA.",
-            )
-            .active(self.memos_insecure.get())
-            .build();
-        group.add(&url_row);
-        group.add(&token_row);
-        group.add(&insecure_row);
-        dialog.set_extra_child(Some(&group));
-        dialog.add_responses(&[
-            ("cancel", "_Cancel"),
-            ("forget", "_Forget Token"),
-            ("save", "_Save"),
-        ]);
-        dialog.set_response_appearance("forget", adw::ResponseAppearance::Destructive);
-        dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
-        dialog.set_default_response(Some("save"));
-        dialog.set_close_response("cancel");
-        let state = self.clone();
-        dialog.choose(Some(&self.window), gio::Cancellable::NONE, move |response| {
-            match response.as_str() {
-                "save" => {
-                    let base = memos::normalize_base(&url_row.text());
-                    if base.is_empty() {
-                        return state.toast("Enter the address of your Memos server");
-                    }
-                    *state.memos_url.borrow_mut() = base;
-                    let insecure = insecure_row.is_active();
-                    let newly_insecure = insecure && !state.memos_insecure.replace(insecure);
-                    state.persist_settings();
-                    state.update_title();
-                    if newly_insecure {
-                        state.toast("Certificate checks are off for Memos");
-                    }
-                    state.memos_save_and_test(token_row.text().to_string());
-                }
-                "forget" => state.memos_forget_token(),
-                _ => {}
-            }
-        });
-    }
-
-    /// Store the token (when one was typed) and prove the pair works, so a
-    /// typo surfaces here rather than at the next push.
-    fn memos_save_and_test(self: &Rc<Self>, token: String) {
-        self.toast("Contacting Memos…");
-        let base = self.memos_url.borrow().clone();
-        let insecure = self.memos_insecure.get();
-        let state = self.clone();
-        glib::spawn_future_local(async move {
-            let joined = gio::spawn_blocking(move || {
-                if !token.is_empty() {
-                    secrets::store_token(&token).map_err(memos::Error::Keyring)?;
-                }
-                memos::check(&memos_server(base, insecure)?)
-            })
-            .await;
-            match joined {
-                Ok(Ok(_)) => state.toast("Connected to Memos"),
-                Ok(Err(err)) => state.toast(&err.to_string()),
-                Err(_) => state.toast("Could not reach Memos"),
-            }
-        });
-    }
-
-    fn memos_forget_token(self: &Rc<Self>) {
-        let state = self.clone();
-        glib::spawn_future_local(async move {
-            match gio::spawn_blocking(secrets::clear_token).await {
-                Ok(Ok(())) => state.toast("Access token removed from the keyring"),
-                Ok(Err(err)) => state.toast(&format!("Could not remove the token: {err}")),
-                Err(_) => state.toast("Could not remove the token"),
-            }
-        });
-    }
-
-    /// Post the selection — or the whole document — as a new memo.
-    fn memos_send_dialog(self: &Rc<Self>) {
-        if !self.memos_ready() {
-            return;
-        }
-        let (content, scope) = match self.buffer.selection_bounds() {
-            Some((start, end)) => {
-                (self.buffer.text(&start, &end, false).to_string(), "the selection")
-            }
-            None => (self.text().to_string(), "the whole document"),
-        };
-        if content.trim().is_empty() {
-            return self.toast("Nothing to send — there is no text");
-        }
-        let dialog = adw::AlertDialog::new(
-            Some("Send to Memos"),
-            Some(&format!(
-                "Create a new memo from {scope} ({} characters).",
-                content.chars().count()
-            )),
-        );
-        let group = adw::PreferencesGroup::new();
-        let visibility = adw::ComboRow::new();
-        visibility.set_title("Visibility");
-        let labels: Vec<&str> = memos::Visibility::ALL.iter().map(|v| v.label()).collect();
-        visibility.set_model(Some(&gtk4::StringList::new(&labels)));
-        visibility.set_selected(0);
-        group.add(&visibility);
-        dialog.set_extra_child(Some(&group));
-        dialog.add_responses(&[("cancel", "_Cancel"), ("send", "_Send")]);
-        dialog.set_response_appearance("send", adw::ResponseAppearance::Suggested);
-        dialog.set_default_response(Some("send"));
-        dialog.set_close_response("cancel");
-        let state = self.clone();
-        dialog.choose(Some(&self.window), gio::Cancellable::NONE, move |response| {
-            if response.as_str() != "send" {
-                return;
-            }
-            let chosen = memos::Visibility::ALL
-                .get(visibility.selected() as usize)
-                .copied()
-                .unwrap_or(memos::Visibility::Private);
-            state.toast("Sending to Memos…");
-            state.memos_call(
-                move |server| memos::create(server, &content, chosen),
-                |state, result| match result {
-                    Ok(memo) => state.toast(&format!(
-                        "Sent to Memos ({})",
-                        memo.visibility.short_label().to_lowercase()
-                    )),
-                    Err(err) => state.toast(&err.to_string()),
-                },
-            );
-        });
-    }
-
-    /// Browse the server's memos and open one for editing.
-    fn memos_browse_dialog(self: &Rc<Self>) {
-        if !self.memos_ready() {
-            return;
-        }
-        self.memos_sweep_cache();
-        let search = gtk4::SearchEntry::new();
-        search.set_placeholder_text(Some("Search memos…"));
-        search.set_hexpand(true);
-        let search_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
-        search_box.set_margin_start(12);
-        search_box.set_margin_end(12);
-        search_box.set_margin_top(6);
-        search_box.set_margin_bottom(6);
-        search_box.append(&search);
-
-        let list = gtk4::ListBox::new();
-        list.set_selection_mode(gtk4::SelectionMode::None);
-        list.add_css_class("boxed-list");
-
-        let status = gtk4::Label::new(None);
-        status.add_css_class("dim-label");
-        status.set_wrap(true);
-        status.set_margin_top(24);
-        status.set_margin_start(12);
-        status.set_margin_end(12);
-
-        let spinner = gtk4::Spinner::new();
-        spinner.set_margin_top(24);
-
-        let more = gtk4::Button::with_label("Load more");
-        more.add_css_class("flat");
-        more.set_margin_top(6);
-        more.set_visible(false);
-
-        let column = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
-        column.set_margin_start(12);
-        column.set_margin_end(12);
-        column.set_margin_bottom(12);
-        column.append(&spinner);
-        column.append(&status);
-        column.append(&list);
-        column.append(&more);
-        let scroll = gtk4::ScrolledWindow::builder()
-            .child(&column)
-            .vexpand(true)
-            .hscrollbar_policy(gtk4::PolicyType::Never)
-            .build();
-
-        let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-        content.append(&search_box);
-        content.append(&scroll);
-        let toolbar = adw::ToolbarView::new();
-        toolbar.add_top_bar(&adw::HeaderBar::new());
-        toolbar.set_content(Some(&content));
-        let dialog = adw::Dialog::new();
-        dialog.set_title("Memos");
-        dialog.set_content_width(580);
-        dialog.set_content_height(640);
-        dialog.set_child(Some(&toolbar));
-
-        let browse = Rc::new(Browse {
-            dialog: dialog.clone(),
-            list: list.clone(),
-            status,
-            more: more.clone(),
-            spinner,
-            memos: RefCell::new(Vec::new()),
-            next_token: RefCell::new(String::new()),
-            query: RefCell::new(String::new()),
-            loading: Cell::new(false),
-        });
-
-        // Searching restarts paging from the first page.
-        let state = self.clone();
-        let b = browse.clone();
-        search.connect_search_changed(move |entry| {
-            *b.query.borrow_mut() = entry.text().to_string();
-            state.memos_load_page(&b, false);
-        });
-
-        let state = self.clone();
-        let b = browse.clone();
-        more.connect_clicked(move |_| state.memos_load_page(&b, true));
-
-        let state = self.clone();
-        let b = browse.clone();
-        list.connect_row_activated(move |_, row| {
-            let Some(memo) = b.memos.borrow().get(row.index() as usize).cloned() else {
-                return;
-            };
-            b.dialog.close();
-            let s = state.clone();
-            state.guard_unsaved(Box::new(move || s.memos_open(memo)));
-        });
-
-        dialog.present(Some(&self.window));
-        self.memos_load_page(&browse, false);
-    }
-
-    /// Fetch one page into the browse dialog. `append` adds to the list;
-    /// otherwise it replaces it (a new search, or the first load).
-    fn memos_load_page(self: &Rc<Self>, browse: &Rc<Browse>, append: bool) {
-        if browse.loading.replace(true) {
-            return;
-        }
-        browse.spinner.set_visible(true);
-        browse.spinner.start();
-        browse.more.set_sensitive(false);
-        if !append {
-            browse.status.set_visible(false);
-        }
-        let token = if append { browse.next_token.borrow().clone() } else { String::new() };
-        let query = browse.query.borrow().clone();
-        let asked = query.clone();
-        let browse = browse.clone();
-        self.memos_call(
-            move |server| memos::list(server, &token, &query),
-            move |state, result| {
-                browse.loading.set(false);
-                // The search changed while this page was loading, and that
-                // request was turned away above: this page answers an old
-                // query, so fetch the current one instead of showing it.
-                if *browse.query.borrow() != asked {
-                    return state.memos_load_page(&browse, false);
-                }
-                browse.spinner.stop();
-                browse.spinner.set_visible(false);
-                browse.more.set_sensitive(true);
-                match result {
-                    Ok((page, next)) => state.memos_show_page(&browse, page, next, append),
-                    Err(err) => {
-                        browse.status.set_label(&err.to_string());
-                        browse.status.set_visible(true);
-                    }
-                }
-            },
-        );
-    }
-
-    fn memos_show_page(
-        self: &Rc<Self>,
-        browse: &Rc<Browse>,
-        page: Vec<memos::Memo>,
-        next: String,
-        append: bool,
-    ) {
-        if !append {
-            while let Some(row) = browse.list.first_child() {
-                browse.list.remove(&row);
-            }
-            browse.memos.borrow_mut().clear();
-        }
-        for memo in &page {
-            let row = adw::ActionRow::new();
-            let title = memos::summary(&memo.content);
-            // ActionRow titles are markup: escape, or a memo containing an
-            // ampersand or angle bracket renders wrong (or not at all).
-            row.set_title(&glib::markup_escape_text(if title.is_empty() {
-                "(empty memo)"
-            } else {
-                &title
-            }));
-            row.set_subtitle(&format!(
-                "{} · {}",
-                memos::short_date(&memo.update_time),
-                memo.visibility.short_label()
-            ));
-            // One line each, so rows keep a uniform height however long the
-            // memo's first line is; the full text is one click away anyway.
-            row.set_title_lines(1);
-            row.set_subtitle_lines(1);
-            row.set_activatable(true);
-            browse.list.append(&row);
-        }
-        browse.memos.borrow_mut().extend(page);
-        *browse.next_token.borrow_mut() = next.clone();
-        browse.more.set_visible(!next.is_empty());
-        let empty = browse.memos.borrow().is_empty();
-        browse.list.set_visible(!empty);
-        browse.status.set_visible(empty);
-        if empty {
-            browse.status.set_label(if browse.query.borrow().trim().is_empty() {
-                "No memos on the server yet"
-            } else {
-                "No memos match that search"
-            });
-        }
-    }
-
-    /// Check a memo out into a local cache file and open it as an ordinary
-    /// document. Bindle is path-based end to end — `DocSource`, folds, find,
-    /// save — so a fetched memo becomes a real file rather than a new kind
-    /// of document, and everything downstream keeps working unchanged.
-    fn memos_open(self: &Rc<Self>, memo: memos::Memo) {
-        // Never clobber a local draft with the server's copy: if this memo
-        // has unpushed edits, open those instead and say so.
-        if let Some(doc) = self.memo_doc_for_name(&memo.name) {
-            if doc.unpushed && doc.path.is_file() {
-                self.toast("Opened your unpushed local copy of this memo");
-                return self.open_path(&doc.path);
-            }
-        }
-        let path = match self.memo_cache_path(&memo) {
-            Ok(path) => path,
-            Err(err) => return self.toast(&format!("Could not prepare the local copy: {err}")),
-        };
-        if let Err(err) = doc::write_atomic(&path, memo.content.as_bytes()) {
-            return self.toast(&format!("Could not write {}: {err}", path.display()));
-        }
-        self.remember_memo_doc(MemoDoc {
-            path: path.clone(),
-            name: memo.name,
-            update_time: memo.update_time,
-            unpushed: false,
-        });
-        self.open_path(&path);
-    }
-
-    /// Where a memo is checked out: `~/.cache/bindle/memos/<slug>-<uid>.md`.
-    /// A remembered path is reused so the file stays put when the memo's
-    /// first line — and with it the slug — changes.
-    fn memo_cache_path(&self, memo: &memos::Memo) -> std::io::Result<PathBuf> {
-        let path = match self.memo_doc_for_name(&memo.name) {
-            Some(doc) => doc.path,
-            None => memo_cache_dir().join(format!("{}.md", memos::cache_stem(memo))),
-        };
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)?;
-        }
-        Ok(path)
-    }
-
-    /// Push the buffer back to the memo it was checked out from, saving the
-    /// local copy first so the text survives a refused or failed push.
-    fn memos_push(self: &Rc<Self>, then: Option<Box<dyn FnOnce()>>) {
-        let Some(doc) = self.memo_doc() else {
-            return self
-                .toast("This document is not from Memos — use Send to Memos to create one");
-        };
-        if self.modified.get() {
-            if let Err(err) = doc::write_atomic(&doc.path, self.text().as_bytes()) {
-                return self.toast(&format!("Could not save the local copy: {err}"));
-            }
-            self.restamp();
-            self.modified.set(false);
-            self.update_title();
-        }
-        self.toast("Pushing to Memos…");
-        self.memos_push_request(doc.name, self.text().to_string(), Some(doc.update_time), then);
-    }
-
-    /// One push attempt. `expected` carries the timestamp the memo was
-    /// fetched at, so `memos::push` can refuse to overwrite an edit made
-    /// elsewhere; `None` is the second pass, after the user chose to.
-    fn memos_push_request(
-        self: &Rc<Self>,
-        name: String,
-        content: String,
-        expected: Option<String>,
-        then: Option<Box<dyn FnOnce()>>,
-    ) {
-        let body = content.clone();
-        let target = name.clone();
-        self.memos_call(
-            move |server| memos::push(server, &target, &body, expected.as_deref()),
-            move |state, result| match result {
-                Ok(memos::Push::Done(memo)) => {
-                    if state.memo_pushed(&memo, &content) {
-                        state.toast("Pushed to Memos");
-                        if let Some(then) = then {
-                            then();
-                        }
-                    } else {
-                        // Not running `then`: when that is closing the
-                        // window, the edits made meanwhile would go with it.
-                        state.toast("Pushed — but the memo was edited meanwhile; push again");
-                    }
-                }
-                Ok(memos::Push::Conflict(current)) => {
-                    state.memos_conflict_dialog(name, content, current, then)
-                }
-                Err(err) => state.toast(&err.to_string()),
-            },
-        );
-    }
-
-    /// Record a successful push of `content`: the server's new timestamp
-    /// becomes the one the next push compares against. Returns whether the
-    /// local copy is now fully pushed.
-    ///
-    /// The push ran asynchronously, so the local side may have moved on:
-    /// typing continued, or another document was opened. Only when the memo's
-    /// text still equals what was sent is it marked pushed — clearing the flag
-    /// otherwise lets the next Browse overwrite those edits with the server's
-    /// copy, and would clear it on whichever memo happens to be open now.
-    fn memo_pushed(&self, memo: &memos::Memo, content: &str) -> bool {
-        let Some(doc) = self.memo_doc_for_name(&memo.name) else {
-            return true;
-        };
-        let current = self.memo_doc().is_some_and(|d| d.name == memo.name);
-        let settled = if current {
-            self.text().as_str() == content
-        } else {
-            fs::read_to_string(&doc.path).is_ok_and(|text| text == content)
-        };
-        {
-            let mut docs = self.memo_docs.borrow_mut();
-            if let Some(doc) = docs.iter_mut().find(|d| d.name == memo.name) {
-                doc.update_time = memo.update_time.clone();
-                if settled {
-                    doc.unpushed = false;
-                }
-            }
-        }
-        if current && settled {
-            self.memo_unpushed.set(false);
-        }
-        self.update_title();
-        self.persist_settings();
-        settled
-    }
-
-    fn memos_conflict_dialog(
-        self: &Rc<Self>,
-        name: String,
-        content: String,
-        current: memos::Memo,
-        then: Option<Box<dyn FnOnce()>>,
-    ) {
-        let dialog = adw::AlertDialog::new(
-            Some("Memo Changed on the Server"),
-            Some(&format!(
-                "This memo was edited elsewhere on {}. Pushing now replaces \
-                 that version with the one on this computer.",
-                memos::short_date(&current.update_time)
-            )),
-        );
-        dialog.add_responses(&[("cancel", "_Cancel"), ("overwrite", "_Overwrite")]);
-        dialog.set_response_appearance("overwrite", adw::ResponseAppearance::Destructive);
-        dialog.set_default_response(Some("cancel"));
-        dialog.set_close_response("cancel");
-        let state = self.clone();
-        dialog.choose(Some(&self.window), gio::Cancellable::NONE, move |response| {
-            if response.as_str() == "overwrite" {
-                state.memos_push_request(name, content, None, then);
-            }
-        });
-    }
-
     // --- Misc ---
 
     fn update_title(&self) {
@@ -5599,21 +4861,7 @@ impl App {
             .unwrap_or_else(|| "Untitled".to_string());
         let marker = if self.modified.get() { "• " } else { "" };
         self.title.set_title(&format!("{marker}{name}"));
-        let subtitle = match file.and_then(|p| self.memo_doc_for(p)) {
-            // A checked-out memo's real home is the server; the cache path
-            // it happens to live at locally would say nothing useful.
-            Some(_) => {
-                let unpushed = if self.memo_unpushed.get() { " — unpushed changes" } else { "" };
-                // Keep an unverified connection visible while it is in use,
-                // not just at the switch that turned it on.
-                let unverified = if self.memos_insecure.get() { " (unverified)" } else { "" };
-                format!(
-                    "Memos · {}{unverified}{unpushed}",
-                    server_host(&self.memos_url.borrow())
-                )
-            }
-            None => file.and_then(|p| p.parent()).map(display_dir).unwrap_or_default(),
-        };
+        let subtitle = file.and_then(|p| p.parent()).map(display_dir).unwrap_or_default();
         // Saving an imported .odt writes a new file; say so where it shows.
         let subtitle = if matches!(*source, DocSource::Odt { .. }) {
             format!("{subtitle} · imported")
@@ -5627,9 +4875,6 @@ impl App {
 
     fn persist_settings(&self) {
         self.sync_doc_state();
-        self.sync_memo_state();
-        // Another instance may have checked out drafts since we loaded.
-        settings::keep_foreign_drafts(&mut self.memo_docs.borrow_mut(), &settings::memo_docs_on_disk());
         Settings {
             width: self.window.default_width(),
             height: self.window.default_height(),
@@ -5661,46 +4906,12 @@ impl App {
             doc_state: self.doc_state.borrow().clone(),
             recent_files: self.recent_files.borrow().clone(),
             frozen_files: self.frozen_files.borrow().clone(),
-            memos_url: self.memos_url.borrow().clone(),
-            memo_docs: self.memo_docs.borrow().clone(),
-            memos_insecure: self.memos_insecure.get(),
         }
         .save();
     }
 
     fn toast(&self, message: &str) {
         self.toasts.add_toast(adw::Toast::new(message));
-    }
-}
-
-/// Build the server handle for one request. Called on the worker thread:
-/// reading the keyring is a blocking D-Bus call that can additionally wait
-/// on an unlock prompt, so it must not happen on the main loop. Keeping it
-/// here rather than in `App` also means the token is never held for longer
-/// than the request that uses it.
-fn memos_server(base: String, insecure: bool) -> Result<memos::Server, memos::Error> {
-    if base.is_empty() {
-        return Err(memos::Error::NoServer);
-    }
-    match secrets::load_token() {
-        Some(token) => Ok(memos::Server { base, token, insecure }),
-        None => Err(memos::Error::NoToken),
-    }
-}
-
-/// Where memos are checked out. Under `~/.cache` on purpose: the copies are
-/// re-fetchable, so it is right that a housekeeping sweep — ours or the
-/// system's — may reclaim them.
-fn memo_cache_dir() -> PathBuf {
-    glib::user_cache_dir().join("bindle").join("memos")
-}
-
-/// Host part of a server URL, for the window subtitle of a checked-out memo.
-fn server_host(url: &str) -> String {
-    let host = url.split_once("://").map_or(url, |(_, rest)| rest);
-    match host.trim_end_matches('/') {
-        "" => "Memos".to_string(),
-        host => host.to_string(),
     }
 }
 

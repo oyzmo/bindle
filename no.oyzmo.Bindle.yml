@@ -13,12 +13,8 @@ finish-args:
   - --socket=fallback-x11
   - --share=ipc
   - --device=dri
-  # Remote images (consent-gated in-app) are fetched via gvfs http, and the
-  # Memos client talks to the user's own server.
+  # Remote images (consent-gated in-app) are fetched via gvfs http.
   - --share=network
-  # The Memos access token is stored in the login keyring rather than in
-  # settings.json — it is password-equivalent for that account.
-  - --talk-name=org.freedesktop.secrets
   - --talk-name=org.gtk.vfs.*
   - --filesystem=xdg-run/gvfsd
   # Files on gvfs shares (smb://, sftp://, dav://…) only have a local path

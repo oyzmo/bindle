@@ -19,12 +19,6 @@
       those file types. OpenDocument Text (.odt) files are imported as
       Markdown, and documents export to HTML, PDF and ODT.
     </p>
-    <p>
-      It can also connect to a self-hosted Memos server: send the current
-      document or selection as a new memo, browse and search existing
-      memos, edit one locally and push it back. The access token is kept in
-      the login keyring, and Bindle only contacts the server when asked.
-    </p>
   </description>
   <launchable type="desktop-id">no.oyzmo.Bindle.desktop</launchable>
   <url type="homepage">https://oyzmo.no/apps</url>
@@ -34,6 +28,11 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.24.0" date="2026-10-23">
+      <description>
+        <p>Memos support removed: Bindle no longer talks to a Memos server or the keyring, and needs about 140 fewer crates to build</p>
+      </description>
+    </release>
     <release version="1.23.3" date="2026-10-23">
       <description>
         <ul>

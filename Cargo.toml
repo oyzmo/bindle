@@ -1,6 +1,6 @@
 [package]
 name = "bindle"
-version = "1.23.3"
+version = "1.24.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 description = "A simple Markdown editor for GNOME (GTK4 + Libadwaita)"
@@ -20,14 +20,3 @@ pangocairo = "0.22"
 # ODT import: content.xml is parsed as a pull stream. Export writes the XML by
 # hand, so only reading needs a parser.
 quick-xml = "0.41"
-# Memos client. Both are pure Rust on purpose: the GNOME-native pair
-# (libsoup3 / libsecret) would add two -sys build dependencies for something
-# that runs on a worker thread anyway and never touches the GLib main loop.
-# platform-verifier: trust the OS certificate store rather than ureq's
-# compiled-in Mozilla bundle, so a self-hosted server behind a private CA
-# works once that CA is installed system-wide.
-ureq = { version = "3.4.0", features = ["platform-verifier"] }
-keyring = { version = "4.1.6", default-features = false, features = [
-    "v1",
-    "zbus-secret-service-keyring-store",
-] }

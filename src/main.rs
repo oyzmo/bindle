@@ -50,10 +50,9 @@ fn main() -> glib::ExitCode {
 
     app.connect_startup(|app| {
         ui::load_css();
-        let accels: [(&str, &[&str]); 11] = [
+        let accels: [(&str, &[&str]); 10] = [
             ("win.new", &["<Control>n"]),
             ("win.print", &["<Control>p"]),
-            ("win.memos-push", &["<Control><Shift>m"]),
             ("win.find", &["<Control>f"]),
             ("win.view-mode", &["<Control>e"]),
             ("win.open", &["<Control>o"]),
