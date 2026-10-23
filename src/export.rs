@@ -280,6 +280,10 @@ struct Builder<'a> {
     table: Option<Vec<Vec<String>>>,
     /// Alt text of an image that got its own block is dropped.
     in_rendered_image: bool,
+    /// The current line holds only a list item's marker so far. The item's
+    /// first paragraph (a loose list wraps every item's text in one) joins
+    /// it rather than starting a line of its own below the bullet.
+    item_fresh: bool,
     resolve: &'a dyn Fn(&str) -> Option<Vec<u8>>,
 }
 
@@ -290,6 +294,7 @@ impl Builder<'_> {
         // reopened after it. Every block's markup has to stand alone: pango
         // rejects an unbalanced one outright and its text never reaches the page.
         let reopen: String = self.closers.iter().map(|(open, _)| *open).collect();
+        self.item_fresh = false;
         let text = std::mem::replace(&mut self.cur, reopen.clone());
         let mut trimmed = text.trim_end_matches('\n').to_string();
         if trimmed.is_empty() || trimmed == reopen {
@@ -318,6 +323,7 @@ impl Builder<'_> {
             }
             return;
         }
+        self.item_fresh = false;
         self.cur.push_str(&escape_markup(text));
     }
 
@@ -363,7 +369,10 @@ impl Builder<'_> {
                     });
                 }
                 Event::TaskListMarker(done) => {
+                    // Part of the marker: the item's text still joins it.
+                    let fresh = self.item_fresh;
                     self.push_text(if done { "☑ " } else { "☐ " });
+                    self.item_fresh = fresh;
                 }
                 Event::Html(text) | Event::InlineHtml(text) => {
                     self.open("<span foreground=\"#77767b\">", "</span>");
@@ -381,7 +390,7 @@ impl Builder<'_> {
             Tag::Paragraph => {
                 if self.lists.is_empty() {
                     self.flush();
-                } else if !self.cur.is_empty() {
+                } else if !self.cur.is_empty() && !self.item_fresh {
                     self.cur.push('\n');
                 }
             }
@@ -413,8 +422,7 @@ impl Builder<'_> {
             }
             Tag::Item => {
                 self.flush();
-                self.indent = self.quote as f64 * 14.0
-                    + 16.0 * self.lists.len().saturating_sub(1) as f64;
+                self.indent = self.list_indent();
                 self.space = 2.0;
                 match self.lists.last_mut() {
                     Some(Some(n)) => {
@@ -423,6 +431,7 @@ impl Builder<'_> {
                     }
                     _ => self.cur.push_str("• "),
                 }
+                self.item_fresh = true;
             }
             Tag::Emphasis => self.open("<i>", "</i>"),
             Tag::Strong => self.open("<b>", "</b>"),
@@ -492,9 +501,9 @@ impl Builder<'_> {
             TagEnd::List(_) => {
                 self.flush();
                 self.lists.pop();
-                if self.lists.is_empty() {
-                    self.indent = self.quote as f64 * 14.0;
-                }
+                // Back to the enclosing item's indent: its text may go on
+                // after the nested list (a continuation paragraph).
+                self.indent = self.list_indent();
             }
             TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link => {
                 self.close()
@@ -507,6 +516,13 @@ impl Builder<'_> {
             }
             _ => {}
         }
+    }
+
+    /// Indent of text in the innermost open list item: one step per level
+    /// below the first, plus the quotes around it; the quotes alone outside
+    /// any list.
+    fn list_indent(&self) -> f64 {
+        self.quote as f64 * 14.0 + 16.0 * self.lists.len().saturating_sub(1) as f64
     }
 
     /// A real grid, drawn at export time. Monospace columns padded to the
@@ -542,6 +558,7 @@ fn markdown_blocks(text: &str, resolve: &dyn Fn(&str) -> Option<Vec<u8>>) -> Vec
         quote: 0,
         table: None,
         in_rendered_image: false,
+        item_fresh: false,
         resolve,
     };
     builder.run(text);
@@ -863,6 +880,28 @@ fn draw_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn texts(markdown: &str) -> Vec<(String, f64)> {
+        let resolve = |_: &str| None;
+        markdown_blocks(markdown, &resolve).into_iter().map(|b| (b.text, b.indent)).collect()
+    }
+
+    #[test]
+    fn loose_list_items_keep_their_text_beside_the_marker() {
+        let blocks = texts("- one\n\n- two\n\n1. first\n\n2. second\n\n- [x] done\n\n- [ ] todo\n");
+        let lines: Vec<&str> = blocks.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(lines, ["• one", "• two", "1. first", "2. second", "• ☑ done", "• ☐ todo"]);
+        // A second paragraph of an item still gets its own line.
+        assert_eq!(texts("- one\n\n  more\n")[0].0, "• one\nmore");
+    }
+
+    #[test]
+    fn text_after_a_nested_list_returns_to_its_items_indent() {
+        let blocks = texts("- outer\n  - inner\n\n  more of outer\n- next\n");
+        let more = blocks.iter().find(|(t, _)| t == "more of outer").expect("block");
+        let outer = blocks.iter().find(|(t, _)| t == "• outer").expect("block");
+        assert_eq!(more.1, outer.1);
+    }
 
     #[test]
     fn html_embeds_only_files_that_are_images() {

@@ -987,7 +987,7 @@ impl Importer<'_> {
                 Block::Heading(level, text) => {
                     out.push_str(&"#".repeat(*level as usize));
                     out.push(' ');
-                    out.push_str(text);
+                    out.push_str(&escape_closing_hashes(text));
                 }
                 Block::Item { indent, marker, text, .. } => {
                     out.push_str(&format!("{}{marker} {text}", " ".repeat(*indent)));
@@ -1256,6 +1256,18 @@ fn escape(s: &str, mode: Mode) -> String {
     out
 }
 
+/// Heading text with a trailing `#` run escaped. Markdown reads ` #…` at the
+/// end of an ATX heading as an optional closing sequence and drops it, so
+/// "Issue #" would come back as "Issue"; "C#" (no space before) is safe.
+fn escape_closing_hashes(text: &str) -> String {
+    let head = text.trim_end_matches('#');
+    if head.len() < text.len() && (head.is_empty() || head.ends_with(' ')) {
+        format!("{head}\\{}", &text[head.len()..])
+    } else {
+        text.to_string()
+    }
+}
+
 /// Text that would start a heading, quote, list, rule or setext underline.
 fn escape_line_start(line: &str) -> String {
     if line.starts_with(['#', '>', '-', '+', '=']) {
@@ -1441,10 +1453,33 @@ fn odf_href(dest: &str) -> String {
     if !export::is_local(dest) {
         dest.to_string()
     } else if dest.starts_with('/') {
-        format!("file://{dest}")
+        format!("file://{}", encode_path(dest))
     } else {
-        format!("../{dest}")
+        format!("../{}", encode_path(dest))
     }
+}
+
+/// Percent-encode what a URI can't hold literally: a markdown destination
+/// written `<my file.pdf>` arrives with its space, which is no valid href.
+/// `%` is left alone (the destination may already be encoded) and so is
+/// `#`, which in a link is the fragment.
+fn encode_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        match c {
+            ' ' | '"' | '<' | '>' | '\\' | '^' | '`' | '{' | '|' | '}' => {
+                out.push_str(&format!("%{:02X}", c as u32))
+            }
+            c if c.is_control() => {
+                let mut buf = [0u8; 4];
+                for b in c.encode_utf8(&mut buf).bytes() {
+                    out.push_str(&format!("%{b:02X}"));
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn picture_ext(mime: &str) -> &'static str {
@@ -1483,6 +1518,9 @@ struct OdtWriter<'a> {
     image: Option<(String, String)>,
     table: Option<TableOut>,
     tables: usize,
+    /// Open `text:a` elements; an image that can't be embedded must not
+    /// become a link inside one (a badge: `[![build](….svg)](ci)`).
+    links: usize,
 }
 
 impl OdtWriter<'_> {
@@ -1653,6 +1691,7 @@ impl OdtWriter<'_> {
             Tag::Strong => self.span("Strong_20_Emphasis"),
             Tag::Strikethrough => self.span("Strike"),
             Tag::Link { dest_url, .. } => {
+                self.links += 1;
                 self.ensure_para();
                 self.raw(&format!(
                     "<text:a xlink:type=\"simple\" xlink:href=\"{}\" \
@@ -1704,7 +1743,10 @@ impl OdtWriter<'_> {
             }
             TagEnd::Table => self.close_table(),
             TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => self.raw("</text:span>"),
-            TagEnd::Link => self.raw("</text:a>"),
+            TagEnd::Link => {
+                self.links = self.links.saturating_sub(1);
+                self.raw("</text:a>");
+            }
             TagEnd::Image => self.close_image(),
             _ => {}
         }
@@ -1770,8 +1812,12 @@ impl OdtWriter<'_> {
                 (w > 0 && h > 0).then_some((bytes, w, h))
             });
         let Some((bytes, w, h)) = embedded else {
-            // Remote or unreadable: keep it reachable as a link.
+            // Remote or unreadable: keep it reachable as a link — unless it
+            // already sits in one, where its alt text is the link's label.
             let label = if alt.trim().is_empty() { dest.clone() } else { alt };
+            if self.links > 0 {
+                return self.text(&label);
+            }
             self.raw(&format!("<text:a xlink:type=\"simple\" xlink:href=\"{}\">", esc(&odf_href(&dest))));
             self.text(&label);
             return self.raw("</text:a>");
@@ -1815,6 +1861,7 @@ pub fn write_odt(path: &Path, title: &str, text: &str, content: Content) -> Resu
                 image: None,
                 table: None,
                 tables: 0,
+                links: 0,
             };
             w.run(text);
             (w.body, w.pictures)
@@ -1925,6 +1972,36 @@ mod tests {
     /// Markdown already in the importer's canonical form survives a trip
     /// through an exported .odt unchanged — the importer reading the
     /// exporter's styles is what this pins down.
+    fn round_trip(md: &str, name: &str) -> String {
+        let path = temp_odt(name);
+        let resolve = |_: &str| None;
+        write_odt(&path, "T", md, Content::Markdown { resolve: &resolve }).expect("written");
+        let back = import(&path).expect("imported");
+        let _ = std::fs::remove_file(&path);
+        back
+    }
+
+    #[test]
+    fn a_web_image_inside_a_link_does_not_nest_links() {
+        let back = round_trip("[![build](https://x.test/badge.svg)](https://x.test/ci)\n", "badge");
+        assert_eq!(back, "[build](https://x.test/ci)\n");
+    }
+
+    #[test]
+    fn a_trailing_hash_in_a_heading_survives() {
+        assert_eq!(round_trip("## Issue \\#\n\n## C#\n", "hash"), "## Issue \\#\n\n## C#\n");
+        assert_eq!(escape_closing_hashes("#"), "\\#");
+        assert_eq!(escape_closing_hashes("a ##"), "a \\##");
+    }
+
+    #[test]
+    fn local_hrefs_are_percent_encoded() {
+        assert_eq!(odf_href("my file.pdf"), "../my%20file.pdf");
+        assert_eq!(odf_href("/tmp/a b.pdf"), "file:///tmp/a%20b.pdf");
+        assert_eq!(odf_href("notes.md#part"), "../notes.md#part");
+        assert_eq!(odf_href("https://x.test/a b"), "https://x.test/a b");
+    }
+
     #[test]
     fn export_then_import_round_trips() {
         let md = "\

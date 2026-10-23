@@ -34,6 +34,15 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.22.3" date="2026-10-23">
+      <description>
+        <ul>
+          <li>PDF and print: loose lists keep each item's text beside its bullet, and text after a nested list returns to its item's indent</li>
+          <li>ODT export: a web image inside a link (a badge) no longer becomes a link inside a link; local links with spaces are URL-encoded</li>
+          <li>ODT import: a heading ending in # keeps it</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.22.2" date="2026-10-23">
       <description>
         <ul>
