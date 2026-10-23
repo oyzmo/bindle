@@ -3541,7 +3541,7 @@ impl App {
                     })
                 } else if bundle::is_pack(&p) {
                     bundle::open_pack(&p)
-                        .map(|(text, info)| (text, DocSource::Pack { path: p.clone(), info }, None))
+                        .map(|(text, info, legacy)| (text, DocSource::Pack { path: p.clone(), info }, legacy))
                 } else if odf::is_odt(&p) {
                     odf::import(&p).map(|text| (text, DocSource::Odt { path: p.clone() }, None))
                 } else {

@@ -342,8 +342,9 @@ enum Block {
     Text(String),
     Heading(u8, String),
     Quote(String),
-    /// One line of a code block; consecutive lines share one fence.
-    Code(String),
+    /// One line of a code block; consecutive lines at one indent share a
+    /// fence. `lead` is the list marker when the block opens a list item.
+    Code { indent: usize, lead: Option<String>, line: String },
     Item { list: usize, indent: usize, marker: String, text: String },
     /// A later paragraph of a list item.
     ItemMore { indent: usize, text: String },
@@ -364,6 +365,16 @@ enum Sink {
     Cell,
     TextBox,
     Note,
+}
+
+/// Where a paragraph inside a list item goes; see `Importer::item_slot`.
+struct ItemSlot {
+    list: usize,
+    /// Column of the item's marker.
+    indent: usize,
+    /// Column of the item's content.
+    content: usize,
+    marker: Option<String>,
 }
 
 struct ListCtx {
@@ -818,57 +829,68 @@ impl Importer<'_> {
     }
 
     fn emit_para(&mut self, p: Para) {
-        let text = match p.kind {
-            ParaKind::Pre => return self.blocks.push(Block::Code(raw_text(&p.runs))),
-            ParaKind::Heading(level) => {
-                let text = render_inline(&p.runs, Mode::Line);
-                if !text.is_empty() {
-                    self.blocks.push(Block::Heading(level, text));
-                }
-                return;
-            }
-            ParaKind::Quote => {
-                let text = render_inline(&p.runs, Mode::Block);
-                if !text.is_empty() {
-                    self.blocks.push(Block::Quote(text));
-                }
-                return;
-            }
-            ParaKind::Normal => render_inline(&p.runs, Mode::Block),
-        };
+        if p.kind == ParaKind::Pre {
+            // Blank lines count: they are part of the code.
+            let line = raw_text(&p.runs);
+            let (indent, lead) = match self.item_slot() {
+                Some(slot) => (slot.content, slot.marker),
+                None => (0, None),
+            };
+            return self.blocks.push(Block::Code { indent, lead, line });
+        }
+        let mode = if matches!(p.kind, ParaKind::Heading(_)) { Mode::Line } else { Mode::Block };
+        let text = render_inline(&p.runs, mode);
         if text.is_empty() {
             return;
         }
-        let item = match self.containers.last_mut() {
-            Some(Container::Item { paras, header, start }) => {
-                let first = *paras == 0 && !*header;
-                *paras += 1;
-                Some((first, start.take()))
-            }
-            _ => None,
+        // Inside a list item every kind takes the item's place — marker on
+        // its first paragraph, indentation after — or the list would end at
+        // a heading, quote or code block and lose its numbering.
+        let Some(slot) = self.item_slot() else {
+            return self.blocks.push(match p.kind {
+                ParaKind::Heading(level) => Block::Heading(level, text),
+                ParaKind::Quote => Block::Quote(text),
+                _ => Block::Text(text),
+            });
         };
-        let (Some((first, start)), Some(list)) = (item, self.lists.last_mut()) else {
-            return self.blocks.push(Block::Text(text));
+        let text = match p.kind {
+            ParaKind::Heading(level) => format!("{} {}", "#".repeat(level as usize), escape_closing_hashes(&text)),
+            ParaKind::Quote => quote_lines(&text),
+            _ => text,
         };
-        if first {
+        let pad = format!("\n{}", " ".repeat(slot.content));
+        let text = text.replace('\n', &pad);
+        match slot.marker {
+            Some(marker) => self.blocks.push(Block::Item { list: slot.list, indent: slot.indent, marker, text }),
+            None => self.blocks.push(Block::ItemMore { indent: slot.content, text }),
+        }
+    }
+
+    /// Claim the next paragraph of the list item being read, if any: its
+    /// marker when it is the item's first, and where its text goes.
+    fn item_slot(&mut self) -> Option<ItemSlot> {
+        let Some(Container::Item { paras, header, start }) = self.containers.last_mut() else {
+            return None;
+        };
+        let first = *paras == 0 && !*header;
+        *paras += 1;
+        let start = start.take();
+        let list = self.lists.last_mut()?;
+        let marker = first.then(|| {
             if let Some(start) = start {
                 list.count = start.saturating_sub(1);
             }
             list.count += 1;
             let marker = if list.numbered { format!("{}.", list.count) } else { "-".to_string() };
             list.marker_width = marker.len() + 1;
-            let pad = format!("\n{}", " ".repeat(list.indent + list.marker_width));
-            self.blocks.push(Block::Item {
-                list: list.id,
-                indent: list.indent,
-                marker,
-                text: text.replace('\n', &pad),
-            });
-        } else {
-            let indent = list.indent + list.marker_width.max(2);
-            let pad = format!("\n{}", " ".repeat(indent));
-            self.blocks.push(Block::ItemMore { indent, text: text.replace('\n', &pad) });
-        }
+            marker
+        });
+        Some(ItemSlot {
+            list: list.id,
+            indent: list.indent,
+            content: list.indent + list.marker_width.max(2),
+            marker,
+        })
     }
 
     fn open_list(&mut self, e: &BytesStart) {
@@ -960,9 +982,14 @@ impl Importer<'_> {
             }
             prev_list = list;
             match &blocks[i] {
-                Block::Code(_) => {
+                Block::Code { indent, lead, .. } => {
+                    let (indent, lead) = (*indent, lead.clone());
                     let mut lines = Vec::new();
-                    while let Some(Block::Code(line)) = blocks.get(i) {
+                    while let Some(Block::Code { indent: at, lead: l, line }) = blocks.get(i) {
+                        // A new indent, or a new item's marker, is a new block.
+                        if *at != indent || (l.is_some() && !lines.is_empty()) {
+                            break;
+                        }
                         lines.push(line.as_str());
                         i += 1;
                     }
@@ -971,13 +998,28 @@ impl Importer<'_> {
                     }
                     let longest = lines.iter().map(|l| longest_run(l, '`')).max().unwrap_or(0);
                     let fence = "`".repeat(longest.max(2) + 1);
-                    out.push_str(&format!("{fence}\n{}\n{fence}", lines.join("\n")));
+                    let pad = " ".repeat(indent);
+                    match lead {
+                        Some(marker) => {
+                            let at = indent.saturating_sub(marker.len() + 1);
+                            out.push_str(&format!("{}{marker} {fence}", " ".repeat(at)));
+                        }
+                        None => out.push_str(&format!("{pad}{fence}")),
+                    }
+                    for line in lines {
+                        out.push('\n');
+                        if !line.is_empty() {
+                            out.push_str(&pad);
+                            out.push_str(line);
+                        }
+                    }
+                    out.push_str(&format!("\n{pad}{fence}"));
                     continue;
                 }
                 Block::Quote(_) => {
                     let mut quoted = Vec::new();
                     while let Some(Block::Quote(text)) = blocks.get(i) {
-                        quoted.push(text.lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n"));
+                        quoted.push(quote_lines(text));
                         i += 1;
                     }
                     out.push_str(&quoted.join("\n>\n"));
@@ -1008,6 +1050,10 @@ impl Importer<'_> {
         }
         out
     }
+}
+
+fn quote_lines(text: &str) -> String {
+    text.lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n")
 }
 
 /// Package-relative hrefs, as a markdown file next to the .odt sees them.
@@ -1165,7 +1211,16 @@ impl InlineWriter {
                     let mode = if self.mode == Mode::Cell { Mode::Cell } else { Mode::Line };
                     let inner = render_inline(kids, mode);
                     let label = if inner.is_empty() { escape(href, self.mode) } else { inner };
+                    // The label is trimmed, so whitespace inside the link at
+                    // either end moves outside it ("see<a> docs </a>now").
+                    let raw = raw_text(kids);
+                    if raw.starts_with(char::is_whitespace) && !self.pending.ends_with(char::is_whitespace) {
+                        self.pending.push(' ');
+                    }
                     self.atom(&format!("[{label}]({})", dest(href)));
+                    if raw.ends_with(char::is_whitespace) {
+                        self.pending.push(' ');
+                    }
                 }
                 Inline::Image(src, alt) => {
                     self.atom(&format!("![{}]({})", escape(alt, self.mode), dest(src)));
@@ -1439,8 +1494,10 @@ fn push_xml_text(out: &mut String, s: &str, prev_space: &mut bool, layout: bool)
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
-            // XML 1.0 has no representation for other control characters.
+            // XML 1.0 has no representation for other control characters,
+            // nor for these two noncharacters (LibreOffice rejects the file).
             c if (c as u32) < 0x20 && !matches!(c, '\t' | '\n') => {}
+            '\u{FFFE}' | '\u{FFFF}' => {}
             c => out.push(c),
         }
         *prev_space = layout && matches!(c, '\t' | '\n');
@@ -2182,6 +2239,34 @@ see [the notes](notes.pdf)
 [^1]: The note.
 ";
         assert_eq!(md, expected);
+    }
+
+    #[test]
+    fn whitespace_inside_a_link_moves_outside_it() {
+        let content = r#"<office:text><text:p>see<text:a xlink:href="http://a"> the docs </text:a>now</text:p></office:text>"#;
+        assert_eq!(to_markdown(content, "").unwrap(), "see [the docs](http://a) now\n");
+    }
+
+    #[test]
+    fn headings_code_and_quotes_stay_inside_their_list_items() {
+        let styles = r#"<office:styles><text:list-style style:name="N"><text:list-level-style-number text:level="1" style:num-format="1"/></text:list-style></office:styles>"#;
+        let content = r#"<office:text><text:list text:style-name="N">
+<text:list-item><text:h text:outline-level="2">Step one</text:h><text:p>Body</text:p></text:list-item>
+<text:list-item><text:p text:style-name="Preformatted_20_Text">let x = 1;</text:p><text:p text:style-name="Preformatted_20_Text"><text:s text:c="2"/>x</text:p></text:list-item>
+<text:list-item><text:p text:style-name="Quotations">Quoted</text:p></text:list-item>
+<text:list-item><text:p>Last</text:p></text:list-item>
+</text:list></office:text>"#;
+        let md = to_markdown(content, styles).unwrap();
+        assert_eq!(md, "1. ## Step one\n\n   Body\n\n2. ```\n   let x = 1;\n     x\n   ```\n\n3. > Quoted\n4. Last\n");
+        // One list of four items, as a markdown reader sees it.
+        let events: Vec<_> = Parser::new(&md).collect();
+        assert_eq!(events.iter().filter(|e| matches!(e, Event::Start(Tag::List(_)))).count(), 1);
+        assert_eq!(events.iter().filter(|e| matches!(e, Event::Start(Tag::Item))).count(), 4);
+    }
+
+    #[test]
+    fn xml_noncharacters_are_dropped() {
+        assert_eq!(esc("a\u{FFFE}b\u{FFFF}"), "ab");
     }
 
     #[test]

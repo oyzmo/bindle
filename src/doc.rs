@@ -90,9 +90,14 @@ impl DocKind {
 /// A byte-order mark is dropped (Notepad writes one, and it would sit in
 /// front of the first heading); one that says UTF-16 decodes as UTF-16.
 pub fn read_text(path: &Path) -> io::Result<(String, Option<&'static str>)> {
-    let bytes = fs::read(path)?;
+    Ok(decode_text(fs::read(path)?, DocKind::of(path)))
+}
+
+/// `read_text` for bytes already in hand (a pack's text entry): `kind`
+/// picks the 8-bit fallback, CP437 for NFO art, Windows-1252 otherwise.
+pub fn decode_text(bytes: Vec<u8>, kind: DocKind) -> (String, Option<&'static str>) {
     if let Some(text) = utf16(&bytes) {
-        return Ok((normalize_newlines(text), Some("UTF-16")));
+        return (normalize_newlines(text), Some("UTF-16"));
     }
     let (text, legacy) = match String::from_utf8(bytes) {
         Ok(s) => match s.strip_prefix('\u{FEFF}') {
@@ -101,14 +106,14 @@ pub fn read_text(path: &Path) -> io::Result<(String, Option<&'static str>)> {
         },
         Err(err) => {
             let bytes = err.into_bytes();
-            if DocKind::of(path) == DocKind::Nfo {
+            if kind == DocKind::Nfo {
                 (cp437(&bytes), Some("CP437"))
             } else {
                 (cp1252(&bytes), Some("Windows-1252"))
             }
         }
     };
-    Ok((normalize_newlines(text), legacy))
+    (normalize_newlines(text), legacy)
 }
 
 fn normalize_newlines(text: String) -> String {

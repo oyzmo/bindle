@@ -79,27 +79,38 @@ pub fn is_pack(path: &Path) -> bool {
     path.extension().is_some_and(|e| e.eq_ignore_ascii_case("textpack"))
 }
 
+/// The text file's possible names, in order of preference.
+const TEXT_NAMES: [&str; 3] = ["text.md", "text.markdown", "text.txt"];
+
 fn is_text_name(name: &str) -> bool {
-    matches!(name, "text.md" | "text.markdown" | "text.txt")
+    TEXT_NAMES.contains(&name)
 }
 
 /// Read the markdown of a .textbundle directory: (text, text file name,
 /// legacy encoding). Read like a plain file (`doc::read_text`): a bundle
 /// made on Windows has CRLF lines or a Windows-1252 text file just as often.
+///
+/// With more than one candidate the order of `TEXT_NAMES` decides, not the
+/// directory listing's, and only a regular file counts.
 pub fn open_bundle(dir: &Path) -> io::Result<(String, String, Option<&'static str>)> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if is_text_name(&name) {
-            let (text, legacy) = crate::doc::read_text(&entry.path())?;
-            return Ok((text, name, legacy));
+    // Listed first so a missing bundle stays `NotFound` (ui.rs reads that
+    // as an unmounted share).
+    let names: Vec<String> =
+        fs::read_dir(dir)?.flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+    for name in TEXT_NAMES {
+        let path = dir.join(name);
+        if names.iter().any(|n| n == name) && path.is_file() {
+            let (text, legacy) = crate::doc::read_text(&path)?;
+            return Ok((text, name.to_string(), legacy));
         }
     }
     Err(io::Error::other("no text.md in the bundle"))
 }
 
-/// Read the markdown of a .textpack zip: (text, entry location).
-pub fn open_pack(path: &Path) -> io::Result<(String, PackInfo)> {
+/// Read the markdown of a .textpack zip: (text, entry location, legacy
+/// encoding). Decoded like a plain file (`doc::decode_text`): a pack made
+/// on Windows has CRLF lines or Windows-1252 text as often as a bundle.
+pub fn open_pack(path: &Path) -> io::Result<(String, PackInfo, Option<&'static str>)> {
     let mut zip = ZipArchive::new(File::open(path)?).map_err(io::Error::other)?;
     let names: Vec<String> = zip.file_names().map(String::from).collect();
     let mut best: Option<PackInfo> = None;
@@ -125,12 +136,13 @@ pub fn open_pack(path: &Path) -> io::Result<(String, PackInfo)> {
     if entry.size() > TEXT_MAX_BYTES {
         return Err(io::Error::other("the pack's text entry is unreasonably large"));
     }
-    let mut text = String::new();
-    (&mut entry).take(TEXT_MAX_BYTES + 1).read_to_string(&mut text)?;
-    if text.len() as u64 > TEXT_MAX_BYTES {
+    let mut bytes = Vec::new();
+    (&mut entry).take(TEXT_MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > TEXT_MAX_BYTES {
         return Err(io::Error::other("the pack's text entry is unreasonably large"));
     }
-    Ok((text, info))
+    let (text, legacy) = crate::doc::decode_text(bytes, crate::doc::DocKind::of(Path::new(&info.text_name)));
+    Ok((text, info, legacy))
 }
 
 /// Read one asset (e.g. "assets/pic.png") from a pack. `max` caps the size —
@@ -403,6 +415,103 @@ pub fn decode_dest(dest: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| dest.to_string())
 }
 
+/// `s` with markdown's backslash escapes (before ASCII punctuation) removed.
+fn unescape_backslashes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && chars.peek().is_some_and(char::is_ascii_punctuation) {
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Byte length of the link destination `s` starts with, as markdown reads
+/// it: `<…>` through the closing bracket, or a bare run ending at whitespace
+/// or an unbalanced `)`, backslash escapes included. Only ASCII bytes end
+/// it, so the length always falls on a char boundary.
+fn dest_len(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    if b.first() == Some(&b'<') {
+        i = 1;
+        while i < b.len() {
+            match b[i] {
+                b'\\' => i += 2,
+                b'>' => return Some(i + 1),
+                b'<' | b'\n' => return None,
+                _ => i += 1,
+            }
+        }
+        return None;
+    }
+    let mut depth = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'\\' if b.get(i + 1).is_some_and(u8::is_ascii_punctuation) => i += 2,
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' if depth == 0 => break,
+            b')' => {
+                depth -= 1;
+                i += 1;
+            }
+            c if c.is_ascii_whitespace() || c.is_ascii_control() => break,
+            _ => i += 1,
+        }
+    }
+    (i > 0).then_some(i)
+}
+
+/// Whether `s`, the text after a destination, closes the link: optional
+/// whitespace, an optional `"…"`/`'…'`/`(…)` title, whitespace, then `)` as
+/// the last character.
+fn closes_link(s: &str) -> bool {
+    let rest = s.trim_start();
+    let b = rest.as_bytes();
+    let rest = match b.first() {
+        Some(&open @ (b'"' | b'\'' | b'(')) => {
+            let close = if open == b'(' { b')' } else { open };
+            let mut i = 1;
+            loop {
+                match b.get(i) {
+                    None => return false,
+                    Some(b'\\') => i += 2,
+                    Some(&c) if c == close => break,
+                    _ => i += 1,
+                }
+            }
+            rest[i + 1..].trim_start()
+        }
+        _ => rest,
+    };
+    rest == ")"
+}
+
+/// Byte range of the destination inside `src`, the whole source of one
+/// inline link or image: after the leftmost `](` from which a destination,
+/// an optional title and the closing `)` make up exactly the rest. Link
+/// text (a nested image) and titles may hold `](` too; neither parses so.
+fn inline_dest_range(src: &str) -> Option<(usize, usize)> {
+    let mut from = 0;
+    while let Some(p) = src[from..].find("](") {
+        let open = from + p + 2;
+        let tail = &src[open..];
+        let start = open + tail.len() - tail.trim_start().len();
+        if let Some(len) = dest_len(&src[start..]) {
+            if closes_link(&src[start + len..]) {
+                return Some((start, start + len));
+            }
+        }
+        from = open;
+    }
+    None
+}
+
 fn wrap_target(target: &str) -> String {
     if target.contains(' ') { format!("<{target}>") } else { target.to_string() }
 }
@@ -448,30 +557,13 @@ pub fn rewrite_asset_dests(markdown: &str, renames: &[(String, String)]) -> Stri
         if !src.ends_with(')') {
             continue;
         }
-        // The destination follows the last `](`, as written: literal or
-        // %20-encoded. The first match after it, so neither a lookalike in
-        // the link text nor one in a title is taken.
-        let Some(open) = src.rfind("](").map(|p| p + 2) else {
+        // Located by parsing, not by searching for `dest`: the parser hands
+        // over the destination unescaped (`a\_b.png` arrives as `a_b.png`),
+        // which the source need not contain as written.
+        let Some((start, end)) = inline_dest_range(src) else {
             continue;
         };
-        let tail = &src[open..];
-        let encoded = dest.replace(' ', "%20");
-        let (pos, len) = match tail.find(dest.as_str()) {
-            Some(p) => (p, dest.len()),
-            None => match tail.find(encoded.as_str()) {
-                Some(p) => (p, encoded.len()),
-                None => continue,
-            },
-        };
-        let mut start = range.start + open + pos;
-        let mut end = start + len;
-        if markdown.as_bytes().get(start.wrapping_sub(1)) == Some(&b'<')
-            && markdown.as_bytes().get(end) == Some(&b'>')
-        {
-            start -= 1;
-            end += 1;
-        }
-        spans.push((start, end, wrap_target(&format!("assets/{name}"))));
+        spans.push((range.start + start, range.start + end, wrap_target(&format!("assets/{name}"))));
     }
     // Reference definitions ("[label]: dest") have no parser event; scan lines.
     let mut pos = 0;
@@ -486,13 +578,16 @@ pub fn rewrite_asset_dests(markdown: &str, renames: &[(String, String)]) -> Stri
                 let after = &trimmed[colon + 2..];
                 let lead = after.len() - after.trim_start().len();
                 let rest = after.trim_start();
-                let token_len = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                // `<my file.pdf>` is one destination, spaces and all.
+                let token_len = dest_len(rest).unwrap_or(0);
                 let token = &rest[..token_len];
                 let plain =
                     token.strip_prefix('<').and_then(|t| t.strip_suffix('>')).unwrap_or(token);
                 let decoded = decode_dest(plain);
-                if let Some((_, name)) =
-                    renames.iter().find(|(old, _)| *old == plain || *old == decoded)
+                let unescaped = unescape_backslashes(plain);
+                if let Some((_, name)) = renames
+                    .iter()
+                    .find(|(old, _)| !plain.is_empty() && (*old == plain || *old == decoded || *old == unescaped))
                 {
                     let start = pos + indent + colon + 2 + lead;
                     spans.push((start, start + token_len, wrap_target(&format!("assets/{name}"))));
@@ -543,6 +638,23 @@ mod tests {
             rewrite_asset_dests(md, &renames),
             "[report.pdf](assets/report.pdf \"see report.pdf\") ![a](assets/report.pdf)\n"
         );
+    }
+
+    #[test]
+    fn escaped_and_bracketed_dests_are_found() {
+        let md = "![](a\\_b.png) [t](<x](y.pdf> \"t](z\")\n\n[d]: <my report.pdf> \"T\"\n[e]: c\\_d.pdf\n";
+        let renames = [
+            ("a_b.png".to_string(), "a_b.png".to_string()),
+            ("x](y.pdf".to_string(), "y.pdf".to_string()),
+            ("my report.pdf".to_string(), "report.pdf".to_string()),
+            ("c_d.pdf".to_string(), "c_d.pdf".to_string()),
+        ];
+        assert_eq!(
+            rewrite_asset_dests(md, &renames),
+            "![](assets/a_b.png) [t](assets/y.pdf \"t](z\")\n\n[d]: assets/report.pdf \"T\"\n[e]: assets/c_d.pdf\n"
+        );
+        // A nested image's `](` is not the outer link's.
+        assert_eq!(inline_dest_range("[![i](a.png)](b.pdf)"), Some((14, 19)));
     }
 
     #[test]

@@ -28,6 +28,18 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.24.2" date="2026-10-23">
+      <description>
+        <ul>
+          <li>TextPacks in Windows-1252 or with CRLF lines open correctly</li>
+          <li>Packed links with spaces in angle brackets or escaped characters keep working</li>
+          <li>TextBundles with several text files open text.md first</li>
+          <li>ODT import keeps the spaces around links</li>
+          <li>ODT import keeps headings, code and quotes inside numbered lists</li>
+          <li>ODT export no longer writes characters LibreOffice rejects</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.24.1" date="2026-10-23">
       <description>
         <ul>
