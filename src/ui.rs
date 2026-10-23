@@ -2844,7 +2844,8 @@ impl App {
 
     /// Rebuild the Files panel from the same list, under the same rule: no
     /// stat on the main loop, so a gone entry only says so when clicked.
-    /// The rows keep `files_order`, reconciled with the recent list.
+    /// The rows keep `files_order`, reconciled with the recent list, with
+    /// pinned files on top.
     fn update_files_panel(&self) {
         {
             let recent = self.recent_files.borrow();
@@ -2856,6 +2857,7 @@ impl App {
                     order.push(path.clone());
                 }
             }
+            *order = pinned_first(std::mem::take(&mut *order), &frozen);
         }
         // Not remove_all(): with a placeholder set, GTK's loop keeps trying
         // to remove the placeholder (a child, but not a row) forever.
@@ -2922,11 +2924,10 @@ impl App {
                 }
             }
             state.persist_settings();
-            // An unfrozen file that is no longer recent leaves the list;
-            // rebuild after this handler, not under the button emitting it.
-            if !on && !state.recent_files.borrow().contains(&path) {
-                glib::idle_add_local_once(move || state.update_files_panel());
-            }
+            // The row moves (pinned rows sit on top; an unpinned file that
+            // is no longer recent leaves the list). Rebuild after this
+            // handler, not under the button emitting it.
+            glib::idle_add_local_once(move || state.update_files_panel());
         });
         button
     }
@@ -5608,6 +5609,17 @@ fn file_stem_label(path: &Path) -> String {
         .unwrap_or_else(|| "Document".to_string())
 }
 
+/// The Files panel's order with pinned files first, in the order they were
+/// pinned (so a new pin joins the bottom of the group and the others stay
+/// put); everything else keeps its place below them.
+fn pinned_first(order: Vec<PathBuf>, frozen: &[PathBuf]) -> Vec<PathBuf> {
+    let (mut pinned, rest): (Vec<PathBuf>, Vec<PathBuf>) =
+        order.into_iter().partition(|p| frozen.contains(p));
+    pinned.sort_by_key(|p| frozen.iter().position(|f| f == p));
+    pinned.extend(rest);
+    pinned
+}
+
 /// Copy `src` over `dest` without leaving `dest` half-written, like
 /// `doc::write_atomic` (including its write-in-place fallback).
 fn copy_atomic(src: &Path, dest: &Path) -> std::io::Result<()> {
@@ -5800,7 +5812,18 @@ fn md_filters() -> gio::ListStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{markdown_dest, markdown_label};
+    use super::{markdown_dest, markdown_label, pinned_first};
+    use std::path::PathBuf;
+
+    #[test]
+    fn pinned_files_lead_in_pin_order_and_the_rest_keep_theirs() {
+        let p = |names: &[&str]| names.iter().map(PathBuf::from).collect::<Vec<_>>();
+        let order = p(&["a", "b", "c", "d", "e"]);
+        // d pinned first, then b.
+        assert_eq!(pinned_first(order, &p(&["d", "b"])), p(&["d", "b", "a", "c", "e"]));
+        // Unpinning d: it heads the unpinned files rather than jumping down.
+        assert_eq!(pinned_first(p(&["d", "b", "a", "c"]), &p(&["b"])), p(&["b", "d", "a", "c"]));
+    }
     use pulldown_cmark::{Event, Parser, Tag};
 
     /// (link text, destination) of the first image `markdown` parses to.
