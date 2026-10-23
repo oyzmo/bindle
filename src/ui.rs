@@ -115,7 +115,11 @@ impl DocSource {
             DocSource::Pack { path, info } => Some((path.clone(), info.clone())),
             DocSource::Odt { path } => Some((
                 path.clone(),
-                bundle::PackInfo { prefix: String::new(), text_name: "content.xml".into() },
+                bundle::PackInfo {
+                    prefix: String::new(),
+                    text_name: "content.xml".into(),
+                    entries: Vec::new(),
+                },
             )),
             _ => None,
         }
@@ -1935,7 +1939,7 @@ impl App {
                     }
                 }
             }
-            DocSource::Pack { path: pack, info } => self.stage_pack_asset(pack, info, path)?,
+            DocSource::Pack { info, .. } => self.stage_pack_asset(info, path),
             _ => {
                 let target = match source.preview_base() {
                     Some(dir) => relative_to(&dir, path),
@@ -2040,10 +2044,8 @@ impl App {
                 Some(dir) => dir.join("assets"),
                 None => return self.toast("The document has no folder to attach files in"),
             },
-            DocSource::Pack { path: pack, info } => {
-                let Some(dest) = self.stage_pack_asset(pack, info, path) else {
-                    return;
-                };
+            DocSource::Pack { info, .. } => {
+                let dest = self.stage_pack_asset(info, path);
                 return self.insert_attachment_link(&name, dest);
             }
             DocSource::None | DocSource::Odt { .. } => {
@@ -2064,21 +2066,14 @@ impl App {
     }
 
     /// Stage `file` for the pack's `assets/` and return its `assets/…`
-    /// reference, or None (with a toast) when the pack can't be read. Names
-    /// already used — by an entry of the pack or by another staged file — are
-    /// left alone, since saving would otherwise replace what other references
-    /// point at; the same file staged twice keeps its first name.
-    fn stage_pack_asset(&self, pack: &Path, info: &bundle::PackInfo, file: &Path) -> Option<String> {
-        let entries = match bundle::pack_entry_names(pack) {
-            Ok(entries) => entries,
-            Err(err) => {
-                self.toast(&format!("Could not read the pack: {err}"));
-                return None;
-            }
-        };
+    /// reference. Names already used — by an entry of the pack or by another
+    /// staged file — are left alone, since saving would otherwise replace
+    /// what other references point at; the same file staged twice keeps its
+    /// first name.
+    fn stage_pack_asset(&self, info: &bundle::PackInfo, file: &Path) -> String {
         let base = file_label(&file.to_path_buf());
         let asset = bundle::AssetSource::File(file.to_path_buf());
-        Some(self.stage_asset(&base, asset, |key| entries.contains(&format!("{}{key}", info.prefix))))
+        self.stage_asset(&base, asset, |key| info.entries.contains(&format!("{}{key}", info.prefix)))
     }
 
     /// Stage `asset` as `assets/<base>` until the next save and return that
@@ -2129,6 +2124,10 @@ impl App {
                 .unwrap_or_default();
             let images: Vec<PathBuf> =
                 files.iter().filter_map(|f| f.path()).filter(|p| is_image_file(p)).collect();
+            if !images.is_empty() && images.len() < files.len() {
+                let skipped = files.len() - images.len();
+                state.toast(&format!("Pasted the images; skipped {skipped} file(s) that aren't"));
+            }
             if images.is_empty() {
                 if let Ok(Some(text)) = clipboard.read_text_future().await {
                     let editable = state.editor.is_editable();
@@ -2163,14 +2162,10 @@ impl App {
                 Some(dir) => dir.join("assets"),
                 None => return self.toast("The document has no folder to store the image in"),
             },
-            DocSource::Pack { path, info } => {
-                let entries = match bundle::pack_entry_names(path) {
-                    Ok(entries) => entries,
-                    Err(err) => return self.toast(&format!("Could not read the pack: {err}")),
-                };
+            DocSource::Pack { info, .. } => {
                 let asset = bundle::AssetSource::Bytes(png.to_vec());
                 let dest = self.stage_asset(&name, asset, |key| {
-                    entries.contains(&format!("{}{key}", info.prefix))
+                    info.entries.contains(&format!("{}{key}", info.prefix))
                 });
                 return self.paste_image_reference(&dest);
             }
@@ -2695,20 +2690,32 @@ impl App {
     /// Put the full-size original of an image reference on the clipboard —
     /// not the preview's thumbnail. Web images are only held as thumbnails,
     /// so they are refused rather than copied small.
-    fn copy_image(&self, dest: &str) {
+    ///
+    /// The file is read on a worker thread: the document may live on a
+    /// share that hangs, and the original can be up to `ASSET_MAX_BYTES`.
+    fn copy_image(self: &Rc<Self>, dest: &str) {
         if external_link(dest) {
             return self.toast("Web images can't be copied; open the link instead");
         }
-        let texture = self
-            .resolve_asset_bytes(dest)
-            .and_then(|bytes| gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)).ok());
-        match texture {
-            Some(texture) => {
-                self.preview.clipboard().set_texture(&texture);
-                self.toast("Image copied");
+        let Some(loc) = self.asset_loc(dest) else {
+            return self.toast("Could not read the image");
+        };
+        let state = self.clone();
+        glib::spawn_future_local(async move {
+            let bytes = gio::spawn_blocking(move || loc.read(bundle::ASSET_MAX_BYTES))
+                .await
+                .ok()
+                .flatten();
+            let texture = bytes
+                .and_then(|bytes| gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)).ok());
+            match texture {
+                Some(texture) => {
+                    state.preview.clipboard().set_texture(&texture);
+                    state.toast("Image copied");
+                }
+                None => state.toast("Could not read the image"),
             }
-            None => self.toast("Could not read the image"),
-        }
+        });
     }
 
     /// The task list checkbox glyph at a preview char offset, if any.
@@ -3112,8 +3119,8 @@ impl App {
         dialog.save(Some(&self.window), gio::Cancellable::NONE, move |result| {
             if let Some(path) = state.picked_path(result) {
                 let written = match &asset {
-                    bundle::AssetSource::Bytes(bytes) => fs::write(&path, bytes),
-                    bundle::AssetSource::File(src) => fs::copy(src, &path).map(|_| ()),
+                    bundle::AssetSource::Bytes(bytes) => doc::write_atomic(&path, bytes),
+                    bundle::AssetSource::File(src) => copy_atomic(src, &path),
                 };
                 match written {
                     Ok(()) => state.toast(&format!(
@@ -3464,8 +3471,8 @@ impl App {
                     doc::wait_for_path(&p);
                 }
                 let read = if bundle::is_bundle(&p) {
-                    bundle::open_bundle(&p).map(|(text, text_name)| {
-                        (text, DocSource::Bundle { dir: p.clone(), text_name }, None)
+                    bundle::open_bundle(&p).map(|(text, text_name, legacy)| {
+                        (text, DocSource::Bundle { dir: p.clone(), text_name }, legacy)
                     })
                 } else if bundle::is_pack(&p) {
                     bundle::open_pack(&p)
@@ -3691,7 +3698,11 @@ impl App {
             DocSource::Pack { path, info } => {
                 let staged = self.staged_assets.borrow().clone();
                 match bundle::save_pack(&path, &info, self.text().as_str(), &staged) {
-                    Ok(()) => {
+                    Ok(entries) => {
+                        // What later staging must not collide with.
+                        if let DocSource::Pack { info, .. } = &mut *self.source.borrow_mut() {
+                            info.entries = entries;
+                        }
                         // The zip content changed; cached entry bytes are stale.
                         self.staged_assets.borrow_mut().clear();
                         self.pack_bytes_cache.borrow_mut().clear();
@@ -3791,11 +3802,15 @@ impl App {
 
     /// Write the buffer to a plain markdown file (Save As always saves plain).
     fn write_to(self: &Rc<Self>, path: &Path, then: Option<Box<dyn FnOnce()>>) {
-        if let Err(err) = self.write_pasted_images(path) {
-            return self.toast(&format!("Could not save the pasted images: {err}"));
-        }
-        match doc::write_atomic(path, self.text().as_bytes()) {
+        let (text, written) = match self.write_pasted_images(path) {
+            Ok(done) => done,
+            Err(err) => return self.toast(&format!("Could not save the pasted images: {err}")),
+        };
+        match doc::write_atomic(path, text.as_bytes()) {
             Ok(()) => {
+                if text != self.text().as_str() {
+                    self.replace_text(&text);
+                }
                 let old_kind = self.doc_kind();
                 let moved = self.source.borrow().container() != Some(path);
                 *self.source.borrow_mut() = DocSource::Plain(path.to_path_buf());
@@ -3821,16 +3836,36 @@ impl App {
                 }
                 self.finish_save(path, then);
             }
-            Err(err) => self.toast(&format!("Could not save: {err}")),
+            Err(err) => {
+                // Nothing was saved: take back the images written for it, or
+                // every retry would leave another numbered copy behind.
+                for file in written {
+                    let _ = fs::remove_file(file);
+                }
+                self.toast(&format!("Could not save: {err}"));
+            }
         }
+    }
+
+    /// Replace the whole buffer with `text` as one undoable edit, keeping
+    /// the cursor's offset.
+    fn replace_text(&self, text: &str) {
+        let offset = self.buffer.iter_at_mark(&self.buffer.get_insert()).offset();
+        self.buffer.begin_user_action();
+        let (mut start, mut end) = self.buffer.bounds();
+        self.buffer.delete(&mut start, &mut end);
+        self.buffer.insert(&mut self.buffer.start_iter(), text);
+        self.buffer.end_user_action();
+        self.buffer.place_cursor(&self.buffer.iter_at_offset(offset));
     }
 
     /// Before saving as plain markdown at `path`: write images that exist
     /// only in memory (pasted into an unsaved document or a pack) into the
     /// `assets/` folder beside it, where their `assets/…` references point.
-    /// A name already taken there is renumbered and the buffer's reference
-    /// follows it, as one undoable edit.
-    fn write_pasted_images(&self, path: &Path) -> std::io::Result<()> {
+    /// Returns the text to save — with references renumbered where a name
+    /// was already taken there — and the files written. The buffer is left
+    /// alone: `write_to` adopts the text only once the save succeeded.
+    fn write_pasted_images(&self, path: &Path) -> std::io::Result<(String, Vec<PathBuf>)> {
         let pasted: Vec<(String, Vec<u8>)> = self
             .staged_assets
             .borrow()
@@ -3840,36 +3875,36 @@ impl App {
                 bundle::AssetSource::File(_) => None,
             })
             .collect();
-        if pasted.is_empty() {
-            return Ok(());
-        }
         let text = self.text().to_string();
+        if pasted.is_empty() {
+            return Ok((text, Vec::new()));
+        }
         let referenced: HashSet<String> =
             bundle::local_asset_dests(&text).iter().map(|d| bundle::decode_dest(d)).collect();
         let assets = path.parent().unwrap_or(Path::new(".")).join("assets");
         let mut renames = Vec::new();
+        let mut written = Vec::new();
         for (key, bytes) in pasted {
             // A paste since deleted (or undone) leaves nothing behind.
             if !referenced.contains(&key) {
                 continue;
             }
             let name = key.strip_prefix("assets/").unwrap_or(&key);
-            let stored = bundle::write_into_assets(name, &bytes, &assets)?;
+            let stored = match bundle::write_into_assets(name, &bytes, &assets) {
+                Ok(stored) => stored,
+                Err(err) => {
+                    for file in written {
+                        let _ = fs::remove_file(file);
+                    }
+                    return Err(err);
+                }
+            };
+            written.push(assets.join(&stored));
             if stored != name {
                 renames.push((key.clone(), stored));
             }
         }
-        let rewritten = bundle::rewrite_asset_dests(&text, &renames);
-        if rewritten != text {
-            let offset = self.buffer.iter_at_mark(&self.buffer.get_insert()).offset();
-            self.buffer.begin_user_action();
-            let (mut start, mut end) = self.buffer.bounds();
-            self.buffer.delete(&mut start, &mut end);
-            self.buffer.insert(&mut self.buffer.start_iter(), &rewritten);
-            self.buffer.end_user_action();
-            self.buffer.place_cursor(&self.buffer.iter_at_offset(offset));
-        }
-        Ok(())
+        Ok((bundle::rewrite_asset_dests(&text, &renames), written))
     }
 
     // --- TextPack export ---
@@ -3886,7 +3921,56 @@ impl App {
     /// Ask for a .textpack destination and write the document there.
     /// `rebind` gives Save As semantics: the window switches to editing the
     /// new pack; false is a plain export that leaves the document alone.
+    ///
+    /// Files referenced from outside the document's folder are listed for
+    /// confirmation first: a document written by someone else can point at
+    /// any file this user can read (`~/.ssh` included), and the pack would
+    /// carry a copy of it to whoever it is sent to.
     fn pack_save_dialog(self: &Rc<Self>, rebind: bool, then: Option<Box<dyn FnOnce()>>) {
+        let outside = self.outside_refs();
+        if outside.is_empty() {
+            return self.pick_pack_dest(rebind, then);
+        }
+        let mut list: Vec<String> = outside.iter().take(8).map(|p| format!("• {p}")).collect();
+        if outside.len() > 8 {
+            list.push(format!("…and {} more", outside.len() - 8));
+        }
+        let dialog = adw::AlertDialog::new(
+            Some("Include Files From Elsewhere?"),
+            Some(&format!(
+                "The TextPack will contain copies of these files from outside the document's folder:\n\n{}",
+                list.join("\n")
+            )),
+        );
+        dialog.add_responses(&[("cancel", "_Cancel"), ("include", "_Include Them")]);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        let state = self.clone();
+        dialog.choose(Some(&self.window), gio::Cancellable::NONE, move |response| {
+            if response == "include" {
+                state.pick_pack_dest(rebind, then);
+            }
+        });
+    }
+
+    /// Local files the document references from outside its own folder —
+    /// absolute paths, or relative ones climbing out with `..` — that a
+    /// TextPack export would copy in. Archive entries can't leave their
+    /// archive, and staged files were picked by the user, so neither counts.
+    fn outside_refs(&self) -> Vec<String> {
+        if self.source.borrow().archive().is_some() {
+            return Vec::new();
+        }
+        bundle::local_asset_dests(&self.text())
+            .iter()
+            .map(|dest| bundle::decode_dest(dest))
+            .filter(|clean| !self.staged_assets.borrow().contains_key(clean))
+            .filter(|clean| escapes_folder(Path::new(clean)))
+            .filter(|clean| self.asset_source(clean).is_some())
+            .collect()
+    }
+
+    fn pick_pack_dest(self: &Rc<Self>, rebind: bool, then: Option<Box<dyn FnOnce()>>) {
         let name = self
             .source
             .borrow()
@@ -4425,16 +4509,32 @@ impl App {
 
     /// Bytes of a local image reference, for embedding in exports.
     fn resolve_asset_bytes(&self, dest: &str) -> Option<Vec<u8>> {
+        self.asset_loc(dest)?.read(bundle::ASSET_MAX_BYTES)
+    }
+
+    /// Where a local reference's bytes live, worked out without touching
+    /// the disk, so the read itself can run on a worker thread.
+    fn asset_loc(&self, dest: &str) -> Option<AssetLoc> {
         if external_link(dest) || dest.starts_with('#') || dest.starts_with("data:") {
             return None;
         }
         let clean = bundle::decode_dest(dest);
-        match self.asset_source(&clean)? {
-            bundle::AssetSource::Bytes(bytes) => Some(bytes),
-            bundle::AssetSource::File(path) => {
-                bundle::read_file_capped(&path, bundle::ASSET_MAX_BYTES)
-            }
+        if let Some(staged) = self.staged_assets.borrow().get(&clean) {
+            return Some(match staged {
+                bundle::AssetSource::Bytes(bytes) => AssetLoc::Bytes(bytes.clone()),
+                bundle::AssetSource::File(path) => AssetLoc::File(path.clone()),
+            });
         }
+        let source = self.source.borrow().clone();
+        if let Some((path, info)) = source.archive() {
+            return Some(AssetLoc::Archive(path, info, clean));
+        }
+        let raw = Path::new(&clean);
+        Some(AssetLoc::File(if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            source.preview_base()?.join(raw)
+        }))
     }
 
     fn export_html_dialog(self: &Rc<Self>) {
@@ -4452,7 +4552,7 @@ impl App {
                     export::Content::Plain
                 };
                 let html = export::html_document(&file_stem_label(&path), &state.text(), content);
-                match fs::write(&path, html) {
+                match doc::write_atomic(&path, html.as_bytes()) {
                     Ok(()) => state.toast(&format!("Exported {}", file_label(&path))),
                     Err(err) => state.toast(&format!("Could not export: {err}")),
                 }
@@ -5470,6 +5570,56 @@ fn file_stem_label(path: &Path) -> String {
 }
 
 /// True for link destinations handled by URI schemes rather than files.
+/// Copy `src` over `dest` without leaving `dest` half-written, like
+/// `doc::write_atomic` (including its write-in-place fallback).
+fn copy_atomic(src: &Path, dest: &Path) -> std::io::Result<()> {
+    let copy = |file: &mut fs::File| std::io::copy(&mut fs::File::open(src)?, file).map(|_| ());
+    match doc::replace_via_temp(dest, copy) {
+        Ok(()) => Ok(()),
+        Err(doc::Replace::Unsupported(_)) => fs::copy(src, dest).map(|_| ()),
+        Err(doc::Replace::Failed(err)) => Err(err),
+    }
+}
+
+/// See `App::asset_loc`.
+enum AssetLoc {
+    Bytes(Vec<u8>),
+    Archive(PathBuf, bundle::PackInfo, String),
+    File(PathBuf),
+}
+
+impl AssetLoc {
+    /// The bytes, capped at `max`; None when missing or larger. Blocks.
+    fn read(self, max: u64) -> Option<Vec<u8>> {
+        match self {
+            AssetLoc::Bytes(bytes) => (bytes.len() as u64 <= max).then_some(bytes),
+            AssetLoc::Archive(path, info, rel) => bundle::read_asset(&path, &info, &rel, max),
+            AssetLoc::File(path) => bundle::read_file_capped(&path, max),
+        }
+    }
+}
+
+/// Whether a relative reference climbs out of the folder it is resolved
+/// against (or is not relative at all).
+fn escapes_folder(rel: &Path) -> bool {
+    use std::path::Component;
+    let mut depth = 0i32;
+    for part in rel.components() {
+        match part {
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return true;
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => return true,
+        }
+    }
+    false
+}
+
 fn external_link(dest: &str) -> bool {
     dest.contains("://") || dest.starts_with("mailto:") || dest.starts_with("tel:")
 }

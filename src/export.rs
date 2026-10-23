@@ -96,25 +96,36 @@ fn base64(data: &[u8]) -> String {
 /// Sniff an image MIME type from magic bytes; the bytes always came from an
 /// image reference, so an image/* fallback beats octet-stream.
 pub(crate) fn image_mime(data: &[u8]) -> &'static str {
+    sniff_image(data).unwrap_or("image/png")
+}
+
+/// The MIME type of `data` when its magic bytes say it is an image. SVG
+/// counts only with an `<svg` element near the start, not for any file
+/// that opens with `<`.
+fn sniff_image(data: &[u8]) -> Option<&'static str> {
     if data.starts_with(b"\x89PNG") {
-        "image/png"
+        Some("image/png")
     } else if data.starts_with(b"\xFF\xD8") {
-        "image/jpeg"
+        Some("image/jpeg")
     } else if data.starts_with(b"GIF8") {
-        "image/gif"
+        Some("image/gif")
     } else if data.len() > 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP" {
-        "image/webp"
+        Some("image/webp")
     } else if data.starts_with(b"BM") {
-        "image/bmp"
-    } else if data.starts_with(b"<") || data.starts_with(b"\xEF\xBB\xBF<") {
-        "image/svg+xml"
+        Some("image/bmp")
+    } else if data[..data.len().min(4096)].windows(4).any(|w| w == b"<svg") {
+        Some("image/svg+xml")
     } else {
-        "image/png"
+        None
     }
 }
 
-fn data_uri(bytes: &[u8]) -> String {
-    format!("data:{};base64,{}", image_mime(bytes), base64(bytes))
+/// The bytes as a data: URI, or None when they are not an image. A
+/// document can point an "image" at any file (`![](../.ssh/id_ed25519)`);
+/// embedding it regardless would put that file in the exported page.
+fn data_uri(bytes: &[u8]) -> Option<String> {
+    let mime = sniff_image(bytes)?;
+    Some(format!("data:{mime};base64,{}", base64(bytes)))
 }
 
 /// A complete standalone HTML document for `text`.
@@ -125,8 +136,8 @@ pub fn html_document(title: &str, text: &str, content: Content) -> String {
                 Event::Start(Tag::Image { link_type, dest_url, title, id })
                     if is_local(&dest_url) =>
                 {
-                    let dest = match resolve(&dest_url) {
-                        Some(bytes) => data_uri(&bytes).into(),
+                    let dest = match resolve(&dest_url).and_then(|bytes| data_uri(&bytes)) {
+                        Some(uri) => uri.into(),
                         None => dest_url,
                     };
                     Event::Start(Tag::Image { link_type, dest_url: dest, title, id })
@@ -554,16 +565,11 @@ fn document_blocks(text: &str, content: Content) -> Vec<Block> {
     }
 }
 
-/// Write `text` as a paginated A4 PDF to `path`.
+/// Write `text` as a paginated A4 PDF to `path`. Rendered in memory and
+/// written atomically, so a failure never leaves a truncated file behind.
 pub fn write_pdf(path: &Path, title: &str, text: &str, content: Content) -> Result<(), String> {
-    let blocks = document_blocks(text, content);
-    let page = Page::A4;
-    let surface =
-        cairo::PdfSurface::new(page.width, page.height, path).map_err(|e| e.to_string())?;
-    let _ = surface.set_metadata(cairo::PdfMetadata::Title, title);
-    draw_document(&surface, &blocks, page)?;
-    surface.finish();
-    Ok(())
+    let bytes = pdf_bytes(title, text, content, Page::A4)?;
+    crate::doc::write_atomic(path, &bytes).map_err(|e| e.to_string())
 }
 
 /// The same PDF in memory, laid out for `page`. This is what printing spools:
@@ -857,6 +863,25 @@ fn draw_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn html_embeds_only_files_that_are_images() {
+        let resolve = |dest: &str| match dest {
+            "key" => Some(b"-----BEGIN OPENSSH PRIVATE KEY-----".to_vec()),
+            "page.html" => Some(b"<html><body>hi</body></html>".to_vec()),
+            "logo.svg" => Some(b"<?xml version=\"1.0\"?>\n<svg xmlns=\"x\"/>".to_vec()),
+            _ => None,
+        };
+        let html = html_document(
+            "Doc",
+            "![](key) ![](page.html) ![](logo.svg)\n",
+            Content::Markdown { resolve: &resolve },
+        );
+        assert!(html.contains("src=\"key\""));
+        assert!(html.contains("src=\"page.html\""));
+        assert!(html.contains("data:image/svg+xml;base64,"));
+        assert!(!html.contains("PRIVATE"));
+    }
 
     #[test]
     fn html_renders_structure_and_embeds_images() {

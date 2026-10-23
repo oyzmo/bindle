@@ -34,6 +34,18 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.22.1" date="2026-10-23">
+      <description>
+        <ul>
+          <li>TextPack export keeps reference-style links working and leaves code blocks alone</li>
+          <li>Exports ask before including files from outside the document's folder; HTML export embeds only real images</li>
+          <li>Pack attachments open from your private runtime folder instead of the shared /tmp</li>
+          <li>Bundles made on Windows open with their line endings and accented letters intact</li>
+          <li>Exports and saved attachments are written atomically; a failed save no longer leaves pasted images behind</li>
+          <li>Copy Image no longer freezes the window on a slow network share</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.22.0" date="2026-10-23">
       <description>
         <p>Preview: right-click an image → Copy Image, or select it and press Ctrl+C, copies the full-size image</p>

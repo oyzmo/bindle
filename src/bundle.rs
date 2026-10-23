@@ -65,6 +65,10 @@ const INFO_JSON: &str = r#"{
 pub struct PackInfo {
     pub prefix: String,
     pub text_name: String,
+    /// Every entry name in the zip, prefix included, as of opening or the
+    /// last save — what a newly staged asset must not collide with. Kept
+    /// here so staging never has to re-read the pack on the main loop.
+    pub entries: Vec<String>,
 }
 
 pub fn is_bundle(path: &Path) -> bool {
@@ -79,13 +83,16 @@ fn is_text_name(name: &str) -> bool {
     matches!(name, "text.md" | "text.markdown" | "text.txt")
 }
 
-/// Read the markdown of a .textbundle directory: (text, text file name).
-pub fn open_bundle(dir: &Path) -> io::Result<(String, String)> {
+/// Read the markdown of a .textbundle directory: (text, text file name,
+/// legacy encoding). Read like a plain file (`doc::read_text`): a bundle
+/// made on Windows has CRLF lines or a Windows-1252 text file just as often.
+pub fn open_bundle(dir: &Path) -> io::Result<(String, String, Option<&'static str>)> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
         if is_text_name(&name) {
-            return Ok((fs::read_to_string(entry.path())?, name));
+            let (text, legacy) = crate::doc::read_text(&entry.path())?;
+            return Ok((text, name, legacy));
         }
     }
     Err(io::Error::other("no text.md in the bundle"))
@@ -107,10 +114,11 @@ pub fn open_pack(path: &Path) -> io::Result<(String, PackInfo)> {
             && full.matches('/').count() <= 1
             && best.as_ref().is_none_or(|b| prefix.len() < b.prefix.len())
         {
-            best = Some(PackInfo { prefix, text_name: base.to_string() });
+            best = Some(PackInfo { prefix, text_name: base.to_string(), entries: Vec::new() });
         }
     }
-    let info = best.ok_or_else(|| io::Error::other("no text.md in the textpack"))?;
+    let mut info = best.ok_or_else(|| io::Error::other("no text.md in the textpack"))?;
+    info.entries = names;
     let mut entry = zip
         .by_name(&format!("{}{}", info.prefix, info.text_name))
         .map_err(io::Error::other)?;
@@ -148,14 +156,15 @@ pub fn read_asset(path: &Path, info: &PackInfo, rel: &str, max: u64) -> Option<V
 /// via `doc::replace_via_temp` so a symlinked pack stays a symlink and a
 /// private one stays private. Unlike a plain file there is no write-in-place
 /// fallback: the new pack is built *from* the old one, so truncating it first
-/// would destroy the source mid-copy.
+/// would destroy the source mid-copy. Returns the entry names now in it.
 pub fn save_pack(
     path: &Path,
     info: &PackInfo,
     text: &str,
     staged: &HashMap<String, AssetSource>,
-) -> io::Result<()> {
+) -> io::Result<Vec<String>> {
     let mut old = ZipArchive::new(File::open(path)?).map_err(io::Error::other)?;
+    let mut names: Vec<String> = Vec::new();
     let result = crate::doc::replace_via_temp(path, |file| {
         let mut writer = ZipWriter::new(file);
         let opts = SimpleFileOptions::default();
@@ -168,8 +177,10 @@ pub fn save_pack(
             if replaced.iter().any(|r| r == entry.name()) {
                 continue;
             }
+            names.push(entry.name().to_string());
             writer.raw_copy_file(entry).map_err(io::Error::other)?;
         }
+        names.extend(replaced);
         writer.start_file(text_full, opts).map_err(io::Error::other)?;
         writer.write_all(text.as_bytes())?;
         for (rel, source) in staged {
@@ -182,7 +193,7 @@ pub fn save_pack(
         Ok(())
     });
     match result {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(names),
         Err(crate::doc::Replace::Unsupported(e) | crate::doc::Replace::Failed(e)) => Err(e),
     }
 }
@@ -194,9 +205,10 @@ pub fn export_pack(dest: &Path, text: &str, assets: &[(String, AssetSource)]) ->
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "Document".into());
     let prefix = format!("{stem}.textbundle/");
-    let tmp = tmp_path(dest);
-    let result = (|| {
-        let mut writer = ZipWriter::new(File::create(&tmp)?);
+    // Through `replace_via_temp` like pack saves: overwriting an existing
+    // pack keeps a symlink a symlink and a private file private.
+    let result = crate::doc::replace_via_temp(dest, |file| {
+        let mut writer = ZipWriter::new(file);
         let opts = SimpleFileOptions::default();
         writer.start_file(format!("{prefix}info.json"), opts).map_err(io::Error::other)?;
         writer.write_all(INFO_JSON.as_bytes())?;
@@ -210,13 +222,10 @@ pub fn export_pack(dest: &Path, text: &str, assets: &[(String, AssetSource)]) ->
         }
         writer.finish().map_err(io::Error::other)?;
         Ok(())
-    })();
+    });
     match result {
-        Ok(()) => fs::rename(&tmp, dest),
-        Err(e) => {
-            let _ = fs::remove_file(&tmp);
-            Err(e)
-        }
+        Ok(()) => Ok(()),
+        Err(crate::doc::Replace::Unsupported(e) | crate::doc::Replace::Failed(e)) => Err(e),
     }
 }
 
@@ -225,24 +234,36 @@ pub fn export_pack(dest: &Path, text: &str, assets: &[(String, AssetSource)]) ->
 /// behind "attachments open as read-only copies": most applications will
 /// then require Save As instead of silently editing a file that would be
 /// thrown away.
+///
+/// The copies live in the user's own runtime directory, not the shared
+/// `/tmp`: there another local user could plant a symlink under the
+/// predictable name and have the write land wherever it points.
 pub fn extract_readonly_temp(scope: &str, rel: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+    extract_readonly_into(&gtk4::glib::user_runtime_dir(), scope, rel, bytes)
+}
+
+fn extract_readonly_into(root: &Path, scope: &str, rel: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     let name = Path::new(rel)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "attachment".to_string());
-    let dir = std::env::temp_dir().join("bindle-attachments").join(scope);
-    fs::create_dir_all(&dir)?;
+    let dir = root.join("bindle-attachments").join(scope);
+    fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
     let path = dir.join(name);
-    if let Ok(meta) = fs::metadata(&path) {
-        // A previous extraction left it read-only; unlock to overwrite.
-        let mut perms = meta.permissions();
-        perms.set_readonly(false);
-        let _ = fs::set_permissions(&path, perms);
+    // A previous extraction: replace it rather than write through it.
+    match fs::remove_file(&path) {
+        Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err),
+        _ => {}
     }
-    fs::write(&path, bytes)?;
-    let mut perms = fs::metadata(&path)?.permissions();
-    perms.set_readonly(true);
-    fs::set_permissions(&path, perms)?;
+    // create_new never follows a link; the read-only mode applies to later
+    // opens, so this handle can still write.
+    let mut out = fs::OpenOptions::new().write(true).create_new(true).mode(0o400).open(&path)?;
+    if let Err(err) = out.write_all(bytes) {
+        drop(out);
+        let _ = fs::remove_file(&path);
+        return Err(err);
+    }
     Ok(path)
 }
 
@@ -326,18 +347,6 @@ pub fn write_into_assets(name: &str, bytes: &[u8], assets: &Path) -> io::Result<
     Ok(stored)
 }
 
-/// Every entry name in a zip, prefix included.
-pub fn pack_entry_names(path: &Path) -> io::Result<Vec<String>> {
-    let zip = ZipArchive::new(File::open(path)?).map_err(io::Error::other)?;
-    Ok(zip.file_names().map(String::from).collect())
-}
-
-fn tmp_path(path: &Path) -> PathBuf {
-    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
-    name.push(".tmp");
-    path.with_file_name(name)
-}
-
 /// Distinct local file destinations referenced by `markdown` — images and
 /// link targets — in order. Web URLs, anchors and the like are skipped;
 /// whether a destination actually resolves to a file is the caller's problem.
@@ -413,8 +422,14 @@ pub fn rewrite_asset_dests(markdown: &str, renames: &[(String, String)]) -> Stri
     options.insert(Options::ENABLE_TASKLISTS);
     // Byte spans of destinations as written, with their replacements.
     let mut spans: Vec<(usize, usize, String)> = Vec::new();
+    // Code blocks, so the definition scan below can leave their text alone.
+    let mut code: Vec<std::ops::Range<usize>> = Vec::new();
     for (event, range) in Parser::new_ext(markdown, options).into_offset_iter() {
         let dest = match event {
+            Event::Start(Tag::CodeBlock(_)) => {
+                code.push(range);
+                continue;
+            }
             Event::Start(Tag::Image { dest_url, .. }) => dest_url.to_string(),
             Event::Start(Tag::Link { dest_url, .. }) => dest_url.to_string(),
             _ => continue,
@@ -425,18 +440,30 @@ pub fn rewrite_asset_dests(markdown: &str, renames: &[(String, String)]) -> Stri
         let Some(src) = markdown.get(range.clone()) else {
             continue;
         };
-        // The destination appears as written: literal or %20-encoded.
-        // rfind: the dest sits at the end of `[text](dest)`, so a lookalike
-        // in the link text is not matched.
+        // Only the inline form `[text](dest)` holds its destination here.
+        // A reference link (`[text][label]`, `[label]`, `[label][]`) is
+        // rewritten at its definition line below; its label must stay as
+        // written, or it would stop matching that definition — and in the
+        // shortcut form the label is the only place the name appears.
+        if !src.ends_with(')') {
+            continue;
+        }
+        // The destination follows the last `](`, as written: literal or
+        // %20-encoded. The first match after it, so neither a lookalike in
+        // the link text nor one in a title is taken.
+        let Some(open) = src.rfind("](").map(|p| p + 2) else {
+            continue;
+        };
+        let tail = &src[open..];
         let encoded = dest.replace(' ', "%20");
-        let (pos, len) = match src.rfind(dest.as_str()) {
+        let (pos, len) = match tail.find(dest.as_str()) {
             Some(p) => (p, dest.len()),
-            None => match src.rfind(encoded.as_str()) {
+            None => match tail.find(encoded.as_str()) {
                 Some(p) => (p, encoded.len()),
-                None => continue, // reference-style usage: definition line below
+                None => continue,
             },
         };
-        let mut start = range.start + pos;
+        let mut start = range.start + open + pos;
         let mut end = start + len;
         if markdown.as_bytes().get(start.wrapping_sub(1)) == Some(&b'<')
             && markdown.as_bytes().get(end) == Some(&b'>')
@@ -452,7 +479,9 @@ pub fn rewrite_asset_dests(markdown: &str, renames: &[(String, String)]) -> Stri
         let content = line.trim_end_matches(['\n', '\r']);
         let trimmed = content.trim_start();
         let indent = content.len() - trimmed.len();
-        if trimmed.starts_with('[') {
+        // Four spaces is an indented code block; a fenced one is in `code`.
+        let in_code = indent >= 4 || code.iter().any(|r| r.contains(&pos));
+        if !in_code && trimmed.starts_with('[') {
             if let Some(colon) = trimmed.find("]:") {
                 let after = &trimmed[colon + 2..];
                 let lead = after.len() - after.trim_start().len();
@@ -491,6 +520,57 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn pdf(dest: &str) -> Vec<(String, String)> {
+        vec![(dest.to_string(), "report.pdf".to_string())]
+    }
+
+    #[test]
+    fn a_shortcut_reference_keeps_its_label() {
+        let md = "See [report.pdf] and [this][report.pdf].\n\n[report.pdf]: report.pdf\n";
+        assert_eq!(
+            rewrite_asset_dests(md, &pdf("report.pdf")),
+            "See [report.pdf] and [this][report.pdf].\n\n[report.pdf]: assets/report.pdf\n"
+        );
+    }
+
+    #[test]
+    fn inline_dests_are_rewritten_but_not_titles_or_link_text() {
+        let md = "[report.pdf](report.pdf \"see report.pdf\") ![a](<my report.pdf>)\n";
+        let renames = [pdf("report.pdf"), pdf("my report.pdf")].concat();
+        assert_eq!(
+            rewrite_asset_dests(md, &renames),
+            "[report.pdf](assets/report.pdf \"see report.pdf\") ![a](assets/report.pdf)\n"
+        );
+    }
+
+    #[test]
+    fn definitions_inside_code_are_left_alone() {
+        let md = "```\n[x]: report.pdf\n```\n\n    [y]: report.pdf\n\n[z]: report.pdf\n";
+        assert_eq!(
+            rewrite_asset_dests(md, &pdf("report.pdf")),
+            "```\n[x]: report.pdf\n```\n\n    [y]: report.pdf\n\n[z]: assets/report.pdf\n"
+        );
+    }
+
+    #[test]
+    fn extraction_replaces_a_planted_symlink_instead_of_following_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("extract");
+        let victim = dir.join("victim.txt");
+        fs::write(&victim, b"keep me").unwrap();
+        let scope_dir = dir.join("bindle-attachments").join("s");
+        fs::create_dir_all(&scope_dir).unwrap();
+        std::os::unix::fs::symlink(&victim, scope_dir.join("a.pdf")).unwrap();
+        let path = extract_readonly_into(&dir, "s", "assets/a.pdf", b"attachment").unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"keep me");
+        assert_eq!(fs::read(&path).unwrap(), b"attachment");
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o400);
+        // A second extraction over the read-only copy still works.
+        extract_readonly_into(&dir, "s", "assets/a.pdf", b"again").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"again");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

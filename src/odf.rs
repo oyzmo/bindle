@@ -13,7 +13,7 @@
 //! standard LibreOffice style names, so the result edits naturally there.
 
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
 
@@ -1829,21 +1829,16 @@ pub fn write_odt(path: &Path, title: &str, text: &str, content: Content) -> Resu
             (body, Vec::new())
         }
     };
-    let mut tmp_name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
-    tmp_name.push(".tmp");
-    let tmp = path.with_file_name(tmp_name);
-    let result = write_package(&tmp, title, &body, &pictures);
-    match result.and_then(|()| fs::rename(&tmp, path)) {
+    match crate::doc::replace_via_temp(path, |file| write_package(file, title, &body, &pictures)) {
         Ok(()) => Ok(()),
-        Err(err) => {
-            let _ = fs::remove_file(&tmp);
+        Err(crate::doc::Replace::Unsupported(err) | crate::doc::Replace::Failed(err)) => {
             Err(err.to_string())
         }
     }
 }
 
 fn write_package(
-    dest: &Path,
+    dest: &mut File,
     title: &str,
     body: &str,
     pictures: &[(String, &'static str, Vec<u8>)],
@@ -1880,7 +1875,7 @@ fn write_package(
     }
     manifest.push_str("</manifest:manifest>");
 
-    let mut zip = ZipWriter::new(File::create(dest)?);
+    let mut zip = ZipWriter::new(dest);
     // The package spec: "mimetype" first and uncompressed, so the type can
     // be sniffed at a fixed offset.
     let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
@@ -1965,7 +1960,7 @@ line  two & \\<more>
         let resolve = |_: &str| None;
         write_odt(&path, "T", md, Content::Markdown { resolve: &resolve }).expect("written");
         let back = import(&path).expect("imported");
-        let _ = fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path);
         assert_eq!(back, md);
     }
 
@@ -1985,7 +1980,7 @@ line  two & \\<more>
         drop(first);
         assert!(zip.by_name("Pictures/image1.png").is_ok());
         let back = import(&path).expect("imported");
-        let _ = fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path);
         assert_eq!(back, "![A cat](Pictures/image1.png)\n");
     }
 

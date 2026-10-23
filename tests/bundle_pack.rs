@@ -42,9 +42,14 @@ fn textpack_roundtrip() {
     let mut staged = HashMap::new();
     staged.insert("assets/new.png".to_string(), bundle::AssetSource::Bytes(vec![9u8]));
     staged.insert("assets/staged.pdf".to_string(), bundle::AssetSource::File(on_disk));
-    bundle::save_pack(&pack, &info, "# Changed\n", &staged).unwrap();
+    let mut saved = bundle::save_pack(&pack, &info, "# Changed\n", &staged).unwrap();
     let (text, info) = bundle::open_pack(&pack).unwrap();
     assert_eq!(text, "# Changed\n");
+    // What a save reports is what a fresh open of the pack finds.
+    let mut reopened = info.entries.clone();
+    saved.sort();
+    reopened.sort();
+    assert_eq!(saved, reopened);
     assert_eq!(bundle::read_asset(&pack, &info, "assets/pic.png", bundle::COPY_MAX_BYTES), Some(vec![1, 2, 3]));
     assert_eq!(bundle::read_asset(&pack, &info, "assets/new.png", bundle::COPY_MAX_BYTES), Some(vec![9]));
     assert_eq!(
@@ -65,7 +70,7 @@ fn textbundle_open_and_detect() {
 
     assert!(bundle::is_bundle(&bundle_dir));
     assert!(!bundle::is_bundle(&dir));
-    let (text, name) = bundle::open_bundle(&bundle_dir).unwrap();
+    let (text, name, _) = bundle::open_bundle(&bundle_dir).unwrap();
     assert_eq!(text, "# Bundle\n");
     assert_eq!(name, "text.md");
 
