@@ -34,6 +34,21 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.23.2" date="2026-10-23">
+      <description>
+        <p>Images inside TextPack and ODT files load off the main thread, so a pack on a dropped network share no longer freezes the window</p>
+      </description>
+    </release>
+    <release version="1.23.1" date="2026-10-23">
+      <description>
+        <ul>
+          <li>Preview: a second paragraph in a list item no longer runs into the first</li>
+          <li>Preview: oversized images are refused before decoding, remote downloads are capped, and local images load off the main thread</li>
+          <li>Preview: tables with wide characters stay aligned; HTML blocks get their own line</li>
+          <li>Highlighting: fewer false hits (apostrophes in YAML/TOML, shell words in paths and flags, underscores inside words, mismatched fences)</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.23.0" date="2026-10-23">
       <description>
         <p>Files panel: pinned files always sit at the top of the list</p>

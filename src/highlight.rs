@@ -110,13 +110,51 @@ pub fn spans(text: &str, kind: DocKind) -> Vec<Span> {
     split_at_newlines(text, raw)
 }
 
-/// Char offset of every newline in `text`, ascending.
+/// The characters GTK's `TextBuffer` ends a line on. `\r\n` is one break
+/// made of two of them.
+fn is_break(c: char) -> bool {
+    matches!(c, '\n' | '\r' | '\u{2029}')
+}
+
+/// Char offset of every line-break character in `text`, ascending.
 fn newline_offsets(text: &str) -> Vec<i32> {
     text.chars()
         .enumerate()
-        .filter(|(_, c)| *c == '\n')
+        .filter(|(_, c)| is_break(*c))
         .map(|(i, _)| i as i32)
         .collect()
+}
+
+/// Lines as GTK counts them — `\n`, `\r`, `\r\n` and U+2029 all end one —
+/// as (char offset of the line start, text without its terminator). The
+/// line indices `track_edits` gets from GTK must name the same lines as
+/// these, or a lone `\r` from a paste would shift every index after it.
+fn gtk_lines(text: &str) -> Vec<(i32, &str)> {
+    let mut out = Vec::new();
+    let (mut start_byte, mut start_char, mut pos) = (0usize, 0i32, 0i32);
+    let mut iter = text.char_indices().peekable();
+    while let Some((b, c)) = iter.next() {
+        pos += 1;
+        if !is_break(c) {
+            continue;
+        }
+        let mut next_byte = b + c.len_utf8();
+        if c == '\r' && matches!(iter.peek(), Some((_, '\n'))) {
+            iter.next();
+            next_byte += 1;
+            pos += 1;
+        }
+        out.push((start_char, &text[start_byte..b]));
+        (start_byte, start_char) = (next_byte, pos);
+    }
+    out.push((start_char, &text[start_byte..]));
+    out
+}
+
+/// Line breaks in `text` as GTK counts them (`\r\n` once).
+fn line_breaks(text: &str) -> usize {
+    text.matches('\n').count() + text.matches('\u{2029}').count() + text.matches('\r').count()
+        - text.matches("\r\n").count()
 }
 
 /// Cut any span that runs past a newline into one span per line it covers.
@@ -135,8 +173,9 @@ fn split_at_newlines(text: &str, spans: Vec<Span>) -> Vec<Span> {
     let mut out = Vec::with_capacity(spans.len());
     for span in spans {
         let mut start = span.start;
-        // First newline strictly inside the span.
-        let mut i = newlines.partition_point(|&n| n <= start);
+        // First break at or after the span start: one *starting* on a break
+        // char still crosses into the next line.
+        let mut i = newlines.partition_point(|&n| n < start);
         while i < newlines.len() && newlines[i] < span.end {
             push(&mut out, start, newlines[i], span.tag);
             start = newlines[i] + 1;
@@ -160,11 +199,9 @@ fn split_at_newlines(text: &str, spans: Vec<Span>) -> Vec<Span> {
 pub fn line_sigs(text: &str, spans: &[Span]) -> (Vec<i32>, Vec<u64>) {
     let mut starts = Vec::new();
     let mut sigs = Vec::new();
-    let mut offset = 0i32;
-    for line in text.split('\n') {
-        starts.push(offset);
+    for (start, line) in gtk_lines(text) {
+        starts.push(start);
         sigs.push(fnv(line.as_bytes(), FNV_OFFSET));
-        offset += line.chars().count() as i32 + 1;
     }
     for span in spans {
         // The line this span starts on; spans never cross a newline.
@@ -231,7 +268,7 @@ pub fn note_delete(baseline: &mut Vec<u64>, first: usize, last: usize) {
 pub fn track_edits(buffer: &gtk4::TextBuffer, baseline: std::rc::Rc<std::cell::RefCell<Vec<u64>>>) {
     let inserts = baseline.clone();
     buffer.connect_insert_text(move |_, at, text| {
-        note_insert(&mut inserts.borrow_mut(), at.line() as usize, text.matches('\n').count());
+        note_insert(&mut inserts.borrow_mut(), at.line() as usize, line_breaks(text));
     });
     buffer.connect_delete_range(move |_, start, end| {
         note_delete(&mut baseline.borrow_mut(), start.line() as usize, end.line() as usize);
@@ -303,24 +340,39 @@ fn push(out: &mut Vec<Span>, start: i32, end: i32, tag: &'static str) {
 
 fn markdown(text: &str) -> Vec<Span> {
     let mut out = Vec::new();
-    let mut in_fence = false;
+    // The open fence's character and length: only a run of the same
+    // character, at least as long and with nothing after it, closes it.
+    let mut fence: Option<(char, usize)> = None;
     for (base, chars) in lines(text) {
         let n = chars.len();
         let end = base + n as i32;
         let indent = chars.iter().take_while(|c| c.is_whitespace()).count();
         let rest = &chars[indent..];
-        if rest.starts_with(&['`', '`', '`']) || rest.starts_with(&['~', '~', '~']) {
+        let ch = rest.first().copied().filter(|c| matches!(c, '`' | '~'));
+        let run = ch.map_or(0, |ch| rest.iter().take_while(|c| **c == ch).count());
+        let fence_line = match (fence, ch) {
+            (None, Some(ch)) if run >= 3 => {
+                fence = Some((ch, run));
+                true
+            }
+            (Some((open, len)), Some(ch))
+                if ch == open && run >= len && rest[run..].iter().all(|c| c.is_whitespace()) =>
+            {
+                fence = None;
+                true
+            }
+            _ => false,
+        };
+        if fence_line || fence.is_some() {
             push(&mut out, base, end, "hl-code");
-            in_fence = !in_fence;
             continue;
         }
-        if in_fence {
-            push(&mut out, base, end, "hl-code");
-            continue;
-        }
-        // Headings: whole line.
+        // Headings: whole line. Four columns of indent make it indented
+        // code instead.
+        let cols: usize = chars[..indent].iter().map(|c| if *c == '\t' { 4 } else { 1 }).sum();
         let hashes = rest.iter().take_while(|c| **c == '#').count();
-        if (1..=6).contains(&hashes)
+        if cols < 4
+            && (1..=6).contains(&hashes)
             && rest.get(hashes).map(|c| *c == ' ').unwrap_or(true)
         {
             push(&mut out, base, end, "hl-heading");
@@ -375,6 +427,11 @@ fn inline_markdown(chars: &[char], from: usize, base: i32, out: &mut Vec<Span>) 
             *slot = true;
         }
     };
+    // `_` never opens or closes emphasis inside a word (`snake_case_name`);
+    // `*` may. Both look at the char just outside the delimiter run.
+    let word_at = |k: Option<usize>| k.and_then(|k| chars.get(k)).is_some_and(|c| c.is_alphanumeric());
+    let opens = |d: char, i: usize| d == '*' || !word_at(i.checked_sub(1));
+    let closes = |d: char, after: usize| d == '*' || !word_at(Some(after));
     // `code` spans first; nothing else matches inside them.
     let mut i = from;
     while i < n {
@@ -410,10 +467,10 @@ fn inline_markdown(chars: &[char], from: usize, base: i32, out: &mut Vec<Span>) 
     for d in ['*', '_'] {
         let mut i = from;
         while i + 1 < n {
-            if !used[i] && chars[i] == d && chars[i + 1] == d {
-                if let Some(j) =
-                    (i + 2..n - 1).find(|&j| chars[j] == d && chars[j + 1] == d && !used[j])
-                {
+            if !used[i] && chars[i] == d && chars[i + 1] == d && opens(d, i) {
+                if let Some(j) = (i + 2..n - 1).find(|&j| {
+                    chars[j] == d && chars[j + 1] == d && !used[j] && closes(d, j + 2)
+                }) {
                     push(out, base + i as i32, base + j as i32 + 2, "hl-strong");
                     mark(i, j + 2, &mut used);
                     i = j + 2;
@@ -430,10 +487,14 @@ fn inline_markdown(chars: &[char], from: usize, base: i32, out: &mut Vec<Span>) 
             if !used[i]
                 && chars[i] == d
                 && chars.get(i + 1).map(|c| !c.is_whitespace() && *c != d).unwrap_or(false)
+                && opens(d, i)
             {
-                if let Some(j) = (i + 2..n)
-                    .find(|&j| chars[j] == d && !used[j] && !chars[j - 1].is_whitespace())
-                {
+                if let Some(j) = (i + 2..n).find(|&j| {
+                    chars[j] == d
+                        && !used[j]
+                        && !chars[j - 1].is_whitespace()
+                        && closes(d, j + 1)
+                }) {
                     push(out, base + i as i32, base + j as i32 + 1, "hl-emph");
                     mark(i, j + 1, &mut used);
                     i = j + 1;
@@ -497,9 +558,19 @@ fn json(text: &str) -> Vec<Span> {
 
 // --- YAML ---
 
+/// Whether the quote at `i` opens a string. In YAML and TOML/INI (`strict`)
+/// only one starting a value does; mid-word it is an apostrophe (`don't`,
+/// `O'Brien`), which would otherwise swallow the rest of the line — comment
+/// included. The shell quotes mid-word (`--opt="a b"`), so it isn't strict.
+fn quote_opens(chars: &[char], i: usize, strict: bool) -> bool {
+    !strict
+        || i == 0
+        || matches!(chars[i - 1], ' ' | '\t' | ':' | '=' | '[' | '{' | ',' | '(')
+}
+
 /// Position of the first '#' starting a comment (quote-aware, needs a
 /// preceding space unless at line start), or line length.
-fn comment_start(chars: &[char], hash_needs_space: bool) -> usize {
+fn comment_start(chars: &[char], hash_needs_space: bool, strict_quotes: bool) -> usize {
     let mut quote: Option<char> = None;
     for (i, &c) in chars.iter().enumerate() {
         match quote {
@@ -509,7 +580,7 @@ fn comment_start(chars: &[char], hash_needs_space: bool) -> usize {
                 }
             }
             None => match c {
-                '"' | '\'' => quote = Some(c),
+                '"' | '\'' if quote_opens(chars, i, strict_quotes) => quote = Some(c),
                 '#' => {
                     if !hash_needs_space || i == 0 || chars[i - 1].is_whitespace() {
                         return i;
@@ -523,11 +594,11 @@ fn comment_start(chars: &[char], hash_needs_space: bool) -> usize {
 }
 
 /// Quoted string runs within `chars[from..to]`.
-fn string_spans(chars: &[char], from: usize, to: usize, base: i32, out: &mut Vec<Span>) {
+fn string_spans(chars: &[char], from: usize, to: usize, base: i32, strict: bool, out: &mut Vec<Span>) {
     let mut i = from;
     while i < to {
         let c = chars[i];
-        if c == '"' || c == '\'' {
+        if (c == '"' || c == '\'') && quote_opens(chars, i, strict) {
             if let Some(j) = (i + 1..to).find(|&j| chars[j] == c) {
                 push(out, base + i as i32, base + j as i32 + 1, "hl-string");
                 i = j + 1;
@@ -561,7 +632,7 @@ fn value_token(chars: &[char], from: usize, to: usize) -> Option<(usize, usize)>
 }
 
 fn classify_value(chars: &[char], from: usize, to: usize, base: i32, out: &mut Vec<Span>) {
-    string_spans(chars, from, to, base, out);
+    string_spans(chars, from, to, base, true, out);
     if let Some((start, end)) = value_token(chars, from, to) {
         let token: String = chars[start..end].iter().collect();
         let tag = match token.as_str() {
@@ -579,7 +650,7 @@ fn yaml(text: &str) -> Vec<Span> {
     let mut out = Vec::new();
     for (base, chars) in lines(text) {
         let n = chars.len();
-        let code_end = comment_start(&chars, true);
+        let code_end = comment_start(&chars, true, true);
         if code_end < n {
             push(&mut out, base + code_end as i32, base + n as i32, "hl-comment");
         }
@@ -617,7 +688,7 @@ fn toml(text: &str) -> Vec<Span> {
     let mut out = Vec::new();
     for (base, chars) in lines(text) {
         let n = chars.len();
-        let code_end = comment_start(&chars, false);
+        let code_end = comment_start(&chars, false, true);
         if code_end < n {
             push(&mut out, base + code_end as i32, base + n as i32, "hl-comment");
         }
@@ -662,7 +733,7 @@ fn toml(text: &str) -> Vec<Span> {
             push(&mut out, base + indent as i32, base + key_end as i32, "hl-key");
             classify_value(&chars, eq + 1, code_end, base, &mut out);
         } else {
-            string_spans(&chars, indent, code_end, base, &mut out);
+            string_spans(&chars, indent, code_end, base, true, &mut out);
         }
     }
     out
@@ -695,7 +766,7 @@ fn shell(text: &str) -> Vec<Span> {
         }
         // Same rule as YAML: a '#' at line start or after whitespace, and
         // not inside quotes — which keeps ${v#pat}, $# and "a # b" intact.
-        let code_end = comment_start(&chars, true);
+        let code_end = comment_start(&chars, true, false);
         if code_end < n {
             push(&mut out, base + code_end as i32, base + n as i32, "hl-comment");
         }
@@ -724,6 +795,13 @@ fn shell(text: &str) -> Vec<Span> {
                 while i < code_end && is_word(chars[i]) {
                     i += 1;
                 }
+                // Only a word standing on its own is a keyword: one glued to
+                // a path or flag (`/usr/local`, `--local`, `-exec`) is not.
+                let free = start == 0
+                    || matches!(chars[start - 1], ' ' | '\t' | ';' | '|' | '&' | '(' | '{' | '`' | '!');
+                if !free {
+                    continue;
+                }
                 let word: String = chars[start..i].iter().collect();
                 // name() — a function definition, not a call.
                 let paren = (i..code_end).take_while(|&j| chars[j] == ' ').count() + i;
@@ -739,7 +817,7 @@ fn shell(text: &str) -> Vec<Span> {
         // Quoted runs overlap the variables inside them; hl-string is added
         // to the tag table after hl-key, so GTK's tag priority already gives
         // the quote the last word and the two can simply both be emitted.
-        string_spans(&chars, 0, code_end, base, &mut out);
+        string_spans(&chars, 0, code_end, base, false, &mut out);
     }
     out
 }
@@ -1075,5 +1153,69 @@ mod tests {
         let after = "a\nNEW\n**b**\n";
         let (a, b) = (sigs_of(before, DocKind::Markdown), sigs_of(after, DocKind::Markdown));
         assert_eq!(a[1], b[2]);
+    }
+
+    #[test]
+    fn an_apostrophe_does_not_hide_a_yaml_or_toml_comment() {
+        let s = tagged("msg: don't panic # note\n", DocKind::Yaml);
+        assert!(has(&s, "hl-comment", "# note"));
+        let s = tagged("name = O'Brien # who\n", DocKind::Toml);
+        assert!(has(&s, "hl-comment", "# who"));
+        // A quote that does open a value still protects its '#'.
+        let s = tagged("k: 'a # b'\n", DocKind::Yaml);
+        assert!(has(&s, "hl-string", "'a # b'"));
+        assert!(!s.iter().any(|(t, _)| t == "hl-comment"));
+    }
+
+    #[test]
+    fn shell_keywords_inside_paths_and_flags_are_not_keywords() {
+        let s = tagged("cd /usr/local; git config --local x; find . -exec rm {} \\;\n", DocKind::Shell);
+        assert!(!s.iter().any(|(t, _)| t == "hl-bool"), "{s:?}");
+        let s = tagged("x=1; local y; if true; then :; fi\n", DocKind::Shell);
+        assert!(has(&s, "hl-bool", "local"));
+        assert!(has(&s, "hl-bool", "then"));
+    }
+
+    #[test]
+    fn underscores_inside_words_are_not_emphasis() {
+        let s = tagged("call snake_case_name and __init__ here, _real_ too\n", DocKind::Markdown);
+        assert!(!has(&s, "hl-emph", "_case_"));
+        assert!(has(&s, "hl-emph", "_real_"));
+        assert!(has(&s, "hl-strong", "__init__"));
+        assert!(has(&tagged("x*a*y\n", DocKind::Markdown), "hl-emph", "*a*"));
+    }
+
+    #[test]
+    fn a_fence_closes_only_on_its_own_kind() {
+        let s = tagged("~~~\n```\ncode\n~~~\nplain\n", DocKind::Markdown);
+        assert!(has(&s, "hl-code", "code"));
+        assert!(!has(&s, "hl-code", "plain"));
+        // "```rust" can't close a fence: it has an info string.
+        let s = tagged("```\n```rust\nstill\n```\nafter\n", DocKind::Markdown);
+        assert!(has(&s, "hl-code", "still"));
+        assert!(!has(&s, "hl-code", "after"));
+    }
+
+    #[test]
+    fn indented_hashes_are_not_a_heading() {
+        assert!(!has(&tagged("    # code\n", DocKind::Markdown), "hl-heading", "    # code"));
+        assert!(has(&tagged("  # still\n", DocKind::Markdown), "hl-heading", "  # still"));
+    }
+
+    #[test]
+    fn lines_break_where_gtk_breaks_them() {
+        let text = "a\rb\r\nc\u{2029}d\n";
+        let (starts, sigs) = line_sigs(text, &[]);
+        assert_eq!(starts, [0, 2, 5, 7, 9]);
+        assert_eq!(sigs.len(), 5);
+        assert_eq!(line_breaks(text), 4);
+        assert_eq!(line_breaks("\r\n\r\n"), 2);
+    }
+
+    #[test]
+    fn a_span_starting_on_a_break_is_split() {
+        let out = split_at_newlines("ab\ncd", vec![Span { start: 2, end: 5, tag: "hl-code" }]);
+        assert!(out.iter().all(|s| s.start >= 3 || s.end <= 2));
+        assert!(out.iter().any(|s| s.start == 3 && s.end == 5));
     }
 }

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use gtk4::prelude::*;
 use gtk4::{gdk, gdk_pixbuf, gio, glib, pango};
@@ -12,8 +12,17 @@ use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, T
 /// Maximum thumbnail width in the preview pane.
 const IMAGE_MAX_WIDTH: i32 = 220;
 
-/// Refuse to decode remote images larger than this.
+/// Refuse to download or decode remote images larger than this.
 const REMOTE_MAX_BYTES: usize = 20 * 1024 * 1024;
+
+/// Refuse to decode images with more pixels than this. A byte cap alone
+/// bounds nothing: a 1 MB PNG can declare 40000×40000 and decode to 6 GB.
+/// 120 MP still takes the largest common phone photos (108 MP).
+const IMAGE_MAX_PIXELS: i64 = 120_000_000;
+
+/// How often a local image is re-stat'ed for changes while the preview is
+/// being re-rendered.
+const LOCAL_RECHECK: Duration = Duration::from_secs(2);
 
 enum Remote {
     Loading,
@@ -26,11 +35,10 @@ thread_local! {
     /// Failed downloads stay Failed so they are not retried on every render.
     static REMOTE_CACHE: RefCell<HashMap<String, Remote>> = RefCell::new(HashMap::new());
 
-    /// Scaled textures of local image files, keyed by path and invalidated
-    /// by mtime — the preview re-renders on every debounced keystroke and
+    /// Thumbnails of local image files, keyed by path and invalidated by
+    /// mtime — the preview re-renders on every debounced keystroke and
     /// re-decoding images each time is wasted work.
-    static LOCAL_CACHE: RefCell<HashMap<PathBuf, (SystemTime, gdk::Texture)>> =
-        RefCell::new(HashMap::new());
+    static LOCAL_CACHE: RefCell<HashMap<PathBuf, LocalEntry>> = RefCell::new(HashMap::new());
 
     /// Scaled textures of loader-provided assets (.textpack), keyed by
     /// destination and byte length. Stable texture identity also lets
@@ -108,29 +116,168 @@ fn shrink_texture(texture: &gdk::Texture, scale: f64) -> Option<gdk::Texture> {
 /// is only (dest, length), so without this a same-named, same-sized asset of
 /// another pack would be served the previous pack's image.
 pub fn reset_loader_cache() {
-    LOADER_CACHE.with(|cache| cache.borrow_mut().clear());
+    let gone: Vec<usize> = LOADER_CACHE.with(|cache| {
+        cache.borrow_mut().drain().map(|(_, t)| t.as_ptr() as usize).collect()
+    });
+    forget_fitted(&gone);
 }
 
-/// Scale a pixbuf to the preview width and turn it into a texture.
-fn scaled_texture(pixbuf: gdk_pixbuf::Pixbuf) -> Option<gdk::Texture> {
-    let pixbuf = if pixbuf.width() > IMAGE_MAX_WIDTH {
-        let height = (pixbuf.height() as f64 * IMAGE_MAX_WIDTH as f64 / pixbuf.width() as f64)
-            .round()
-            .max(1.0) as i32;
-        pixbuf.scale_simple(IMAGE_MAX_WIDTH, height, gdk_pixbuf::InterpType::Bilinear)?
-    } else {
-        pixbuf
-    };
-    Some(gdk::Texture::for_pixbuf(&pixbuf))
+/// Drop the shrunk copies of textures that are no longer cached, which
+/// `FIT_CACHE` would otherwise keep alive (with their sources) until the
+/// next scale change.
+fn forget_fitted(sources: &[usize]) {
+    FIT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        for key in sources {
+            cache.remove(key);
+        }
+    });
+}
+
+/// A local image file's thumbnail. Stat'ing and decoding happen on a worker
+/// thread: the file may sit on a network mount that hangs, and this runs on
+/// every debounced keystroke.
+struct LocalEntry {
+    /// None while the first load runs, or when the file can't be shown.
+    texture: Option<gdk::Texture>,
+    mtime: Option<SystemTime>,
+    /// When the file was last stat'ed.
+    checked: Instant,
+    /// A stat or load is running. Never start a second for the same path:
+    /// on a hung mount they would pile up on the worker pool.
+    busy: bool,
+}
+
+/// A decoded thumbnail's pixels: plain data, so it can come back from a
+/// worker thread, which `Pixbuf` (not `Send`) can't.
+struct Thumb {
+    width: i32,
+    height: i32,
+    stride: usize,
+    alpha: bool,
+    pixels: glib::Bytes,
+}
+
+impl Thumb {
+    fn texture(&self) -> gdk::Texture {
+        let format = if self.alpha {
+            gdk::MemoryFormat::R8g8b8a8
+        } else {
+            gdk::MemoryFormat::R8g8b8
+        };
+        gdk::MemoryTexture::new(self.width, self.height, format, &self.pixels, self.stride).upcast()
+    }
+}
+
+/// Decode an image scaled to the preview width. The size is checked from
+/// the header, before any pixels are decoded, so an image over
+/// `IMAGE_MAX_PIXELS` costs nothing; scaling happens in the loader, which
+/// lets JPEG decode at a reduced size outright.
+fn decode_thumbnail(source: &mut dyn std::io::Read) -> Option<Thumb> {
+    let loader = gdk_pixbuf::PixbufLoader::new();
+    let refused = Rc::new(std::cell::Cell::new(false));
+    let flag = refused.clone();
+    loader.connect_size_prepared(move |loader, w, h| {
+        if w as i64 * h as i64 > IMAGE_MAX_PIXELS {
+            flag.set(true);
+        } else if w > IMAGE_MAX_WIDTH {
+            let height = ((h as f64 * IMAGE_MAX_WIDTH as f64 / w as f64).round() as i32).max(1);
+            loader.set_size(IMAGE_MAX_WIDTH, height);
+        }
+    });
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let fed = match source.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => loader.write(&buf[..n]).is_ok(),
+            Err(_) => false,
+        };
+        // The loader must be closed whatever happens, or it warns when
+        // finalized; the error from closing a half-fed one is expected.
+        if !fed || refused.get() {
+            let _ = loader.close();
+            return None;
+        }
+    }
+    loader.close().ok()?;
+    let pixbuf = loader.pixbuf()?;
+    if pixbuf.bits_per_sample() != 8 || !matches!(pixbuf.n_channels(), 3 | 4) {
+        return None;
+    }
+    Some(Thumb {
+        width: pixbuf.width(),
+        height: pixbuf.height(),
+        stride: pixbuf.rowstride() as usize,
+        alpha: pixbuf.n_channels() == 4,
+        pixels: pixbuf.read_pixel_bytes(),
+    })
 }
 
 fn texture_from_bytes(data: &[u8]) -> Option<gdk::Texture> {
     if data.len() > REMOTE_MAX_BYTES {
         return None;
     }
-    let stream = gio::MemoryInputStream::from_bytes(&glib::Bytes::from(data));
-    let pixbuf = gdk_pixbuf::Pixbuf::from_stream(&stream, gio::Cancellable::NONE).ok()?;
-    Some(scaled_texture(pixbuf)?)
+    decode_thumbnail(&mut &data[..]).map(|t| t.texture())
+}
+
+/// Stat (and, if it changed or is new, decode) a local image on a worker
+/// thread; `known` is the mtime of the texture already shown, if any.
+/// Re-renders through `refresh` only when what the preview shows changed.
+fn load_local(path: PathBuf, known: Option<SystemTime>, refresh: Option<Rc<dyn Fn()>>) {
+    glib::spawn_future_local(async move {
+        let file = path.clone();
+        let result = gio::spawn_blocking(move || {
+            let mtime = fs::metadata(&file).ok().and_then(|m| m.modified().ok());
+            if mtime.is_some() && mtime == known {
+                return (mtime, None);
+            }
+            let thumb = fs::File::open(&file).ok().and_then(|mut f| decode_thumbnail(&mut f));
+            (mtime, Some(thumb))
+        })
+        .await;
+        let (mtime, loaded) = result.unwrap_or((None, Some(None)));
+        let changed = LOCAL_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let Some(entry) = cache.get_mut(&path) else {
+                return false;
+            };
+            entry.busy = false;
+            entry.checked = Instant::now();
+            // Unchanged on disk: keep what is shown.
+            let Some(thumb) = loaded else {
+                return false;
+            };
+            entry.mtime = mtime;
+            let texture = thumb.map(|t| t.texture());
+            let changed = entry.texture.is_some() || texture.is_some();
+            if let Some(old) = std::mem::replace(&mut entry.texture, texture) {
+                forget_fitted(&[old.as_ptr() as usize]);
+            }
+            changed
+        });
+        if changed {
+            if let Some(refresh) = refresh {
+                refresh();
+            }
+        }
+    });
+}
+
+/// Read `url` into memory, giving up past `REMOTE_MAX_BYTES` rather than
+/// buffering a response of any size first and checking afterwards.
+async fn fetch_capped(url: &str) -> Option<Vec<u8>> {
+    let stream = gio::File::for_uri(url).read_future(glib::Priority::DEFAULT).await.ok()?;
+    let mut data = Vec::new();
+    loop {
+        let chunk = stream.read_bytes_future(64 * 1024, glib::Priority::DEFAULT).await.ok()?;
+        if chunk.is_empty() {
+            return Some(data);
+        }
+        if data.len() + chunk.len() > REMOTE_MAX_BYTES {
+            return None;
+        }
+        data.extend_from_slice(&chunk);
+    }
 }
 
 /// Create the text tags used by the rendered preview. Call once per buffer.
@@ -329,7 +476,7 @@ struct Renderer<'a> {
     base: Option<&'a Path>,
     /// When Some, local images are read through this instead of the
     /// filesystem (assets inside a .textpack).
-    loader: Option<&'a dyn Fn(&str) -> Option<Vec<u8>>>,
+    loader: Option<&'a dyn Fn(&str) -> Option<glib::Bytes>>,
     /// Called (later, from the main loop) when a remote image finishes
     /// downloading, so the owner can re-render the preview.
     refresh: Option<Rc<dyn Fn()>>,
@@ -340,6 +487,12 @@ struct Renderer<'a> {
     tags: Vec<&'static str>,
     /// One entry per open list; Some(n) for ordered lists, None for bullets.
     lists: Vec<Option<u64>>,
+    /// Per open list item, spaces as wide as its marker: a further
+    /// paragraph of the item lines up under the item's text.
+    item_indents: Vec<String>,
+    /// Nothing has been written since the innermost item's marker, so its
+    /// first paragraph flows on the marker's line.
+    item_fresh: bool,
     /// Last two characters written, used to manage blank lines between blocks.
     tail: [char; 2],
     /// While Some, inline text is captured into cells instead of the buffer.
@@ -436,6 +589,7 @@ impl<'a> Renderer<'a> {
         if text.is_empty() || self.in_rendered_image {
             return;
         }
+        self.item_fresh = false;
         if let Some(table) = &mut self.table {
             if let Some(cell) = table.rows.last_mut().and_then(|r| r.last_mut()) {
                 if cell.src.is_none() {
@@ -536,7 +690,11 @@ impl<'a> Renderer<'a> {
                 }
                 Event::TaskListMarker(done) => {
                     let start = self.buffer.end_iter().offset();
+                    // The box belongs with the marker: the paragraph after
+                    // it is still the item's first.
+                    let fresh = self.item_fresh;
                     self.insert(if done { "☑ " } else { "☐ " });
+                    self.item_fresh = fresh;
                     // The marker's range starts at its `[`; ui.rs re-checks
                     // the bracket before editing, in case the text moved.
                     if let Some((source, _)) = self.map_src {
@@ -552,11 +710,18 @@ impl<'a> Renderer<'a> {
     fn start(&mut self, tag: Tag) {
         match tag {
             Tag::Paragraph => {
-                // Inside list items the paragraph flows on the marker's line.
+                // Inside list items the first paragraph flows on the
+                // marker's line. A further one (a loose item) is its own
+                // block — without this it ran straight on: "• ab".
                 if self.lists.is_empty() {
                     self.block_gap();
+                } else if !self.item_fresh {
+                    self.block_gap();
+                    let indent = self.item_indents.last().cloned().unwrap_or_default();
+                    self.insert(&indent);
                 }
             }
+            Tag::HtmlBlock => self.block_gap(),
             Tag::Heading { level, .. } => {
                 self.block_gap();
                 // Disclosure marker; ui.rs toggles section folding on click.
@@ -602,14 +767,17 @@ impl<'a> Renderer<'a> {
             Tag::Item => {
                 self.line_break();
                 let indent = "    ".repeat(self.lists.len().saturating_sub(1));
-                match self.lists.last_mut() {
+                let marker = match self.lists.last_mut() {
                     Some(Some(n)) => {
                         let marker = format!("{indent}{n}. ");
                         *n += 1;
-                        self.insert(&marker);
+                        marker
                     }
-                    _ => self.insert(&format!("{indent}• ")),
-                }
+                    _ => format!("{indent}• "),
+                };
+                self.insert(&marker);
+                self.item_indents.push(" ".repeat(marker.chars().count()));
+                self.item_fresh = true;
             }
             Tag::Emphasis => self.tags.push("italic"),
             Tag::Strong => self.tags.push("bold"),
@@ -701,7 +869,11 @@ impl<'a> Renderer<'a> {
                 self.lists.pop();
                 self.line_break();
             }
-            TagEnd::Item => self.line_break(),
+            TagEnd::Item => {
+                self.item_indents.pop();
+                self.line_break();
+            }
+            TagEnd::HtmlBlock => self.line_break(),
             TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
                 self.tags.pop();
             }
@@ -732,6 +904,7 @@ impl<'a> Renderer<'a> {
         let at = iter.offset();
         self.buffer.insert_paintable(&mut iter, &fit_texture(texture));
         self.tail = [self.tail[1], '\u{FFFC}'];
+        self.item_fresh = false;
         if let Some((source, _)) = self.map_src {
             self.map.entries.push(MapEntry { preview: at, len: 1, source, exact: false });
         }
@@ -779,33 +952,35 @@ impl<'a> Renderer<'a> {
                 None => return false,
             }
         };
-        let mtime = fs::metadata(&path).ok().and_then(|m| m.modified().ok());
-        if let Some(mtime) = mtime {
-            let cached = LOCAL_CACHE.with(|cache| {
-                cache
-                    .borrow()
-                    .get(&path)
-                    .filter(|(stamp, _)| *stamp == mtime)
-                    .map(|(_, texture)| texture.clone())
-            });
-            if let Some(texture) = cached {
-                self.insert_texture(&texture);
-                return true;
+        // Show whatever is cached and (re)check in the background: a first
+        // sighting shows the placeholder until the load's refresh, a changed
+        // file the old thumbnail until then.
+        let (texture, check) = LOCAL_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            match cache.get_mut(&path) {
+                Some(entry) => {
+                    let due = !entry.busy && entry.checked.elapsed() >= LOCAL_RECHECK;
+                    entry.busy |= due;
+                    (entry.texture.clone(), due.then_some(entry.mtime))
+                }
+                None => {
+                    let entry =
+                        LocalEntry { texture: None, mtime: None, checked: Instant::now(), busy: true };
+                    cache.insert(path.clone(), entry);
+                    (None, Some(None))
+                }
             }
+        });
+        if let Some(known) = check {
+            load_local(path, known, self.refresh.clone());
         }
-        let Ok(pixbuf) = gdk_pixbuf::Pixbuf::from_file(&path) else {
-            return false;
-        };
-        let Some(texture) = scaled_texture(pixbuf) else {
-            return false;
-        };
-        if let Some(mtime) = mtime {
-            LOCAL_CACHE.with(|cache| {
-                cache.borrow_mut().insert(path.clone(), (mtime, texture.clone()));
-            });
+        match texture {
+            Some(texture) => {
+                self.insert_texture(&texture);
+                true
+            }
+            None => false,
         }
-        self.insert_texture(&texture);
-        true
     }
 
     fn try_insert_remote(&mut self, url: &str) -> bool {
@@ -833,22 +1008,22 @@ impl<'a> Renderer<'a> {
         });
         let key = url.to_string();
         let refresh = self.refresh.clone();
-        gio::File::for_uri(url).load_contents_async(
-            gio::Cancellable::NONE,
-            move |result| {
-                let entry = result
+        glib::spawn_future_local(async move {
+            let thumb = match fetch_capped(&key).await {
+                Some(data) => gio::spawn_blocking(move || decode_thumbnail(&mut &data[..]))
+                    .await
                     .ok()
-                    .and_then(|(data, _etag)| texture_from_bytes(&data))
-                    .map(Remote::Ready)
-                    .unwrap_or(Remote::Failed);
-                REMOTE_CACHE.with(|cache| {
-                    cache.borrow_mut().insert(key, entry);
-                });
-                if let Some(refresh) = refresh {
-                    refresh();
-                }
-            },
-        );
+                    .flatten(),
+                None => None,
+            };
+            let entry = thumb.map(|t| Remote::Ready(t.texture())).unwrap_or(Remote::Failed);
+            REMOTE_CACHE.with(|cache| {
+                cache.borrow_mut().insert(key, entry);
+            });
+            if let Some(refresh) = refresh {
+                refresh();
+            }
+        });
         false
     }
 
@@ -868,8 +1043,8 @@ impl<'a> Renderer<'a> {
         let mut word = vec![0usize; cols];
         for row in &table.rows {
             for (i, cell) in row.iter().enumerate() {
-                natural[i] = natural[i].max(cell.text.chars().count());
-                let longest = cell.text.split(' ').map(|w| w.chars().count()).max().unwrap_or(0);
+                natural[i] = natural[i].max(text_width(&cell.text));
+                let longest = cell.text.split(' ').map(text_width).max().unwrap_or(0);
                 word[i] = word[i].max(longest);
             }
         }
@@ -912,7 +1087,7 @@ impl<'a> Renderer<'a> {
                     }
                     self.map_src = self.map_src.map(|(s, _)| (s, false));
                     if i + 1 < cols {
-                        let pad = widths[i].saturating_sub(text.chars().count());
+                        let pad = widths[i].saturating_sub(text_width(text));
                         self.insert(&" ".repeat(pad));
                         self.insert_dim(" │ ");
                     }
@@ -1016,14 +1191,44 @@ fn fit_columns(natural: &[usize], word: &[usize], avail: usize) -> Option<Vec<us
     }
 }
 
-/// Word-wrap a cell to `width` chars: (char offset in `text`, line) pairs.
-/// Breaks at the last space that fits, hard-breaks words longer than the
-/// column, and drops the spaces at a break.
+/// Monospace cells a char takes: two for East Asian wide/fullwidth text and
+/// emoji-range pictographs, none for combining marks and zero-width chars,
+/// one otherwise. Approximate (no grapheme clusters), but enough to keep CJK
+/// text and the `🖼` placeholder from pushing their column out of line.
+fn cell_width(c: char) -> usize {
+    match c as u32 {
+        0x0300..=0x036F | 0x200B..=0x200F | 0x20D0..=0x20FF | 0xFE00..=0xFE0F | 0xFE20..=0xFE2F => 0,
+        0x1100..=0x115F
+        | 0x2E80..=0x303E
+        | 0x3041..=0x33FF
+        | 0x3400..=0x4DBF
+        | 0x4E00..=0x9FFF
+        | 0xA000..=0xA4CF
+        | 0xAC00..=0xD7A3
+        | 0xF900..=0xFAFF
+        | 0xFE30..=0xFE4F
+        | 0xFF00..=0xFF60
+        | 0xFFE0..=0xFFE6
+        | 0x1F000..=0x1FAFF
+        | 0x20000..=0x3FFFD => 2,
+        _ => 1,
+    }
+}
+
+/// Monospace cells `text` takes; see [`cell_width`].
+fn text_width(text: &str) -> usize {
+    text.chars().map(cell_width).sum()
+}
+
+/// Word-wrap a cell to `width` monospace cells: (char offset in `text`,
+/// line) pairs. Breaks at the last space that fits, hard-breaks words longer
+/// than the column, and drops the spaces at a break.
 fn wrap_cell(text: &str, width: usize) -> Vec<(usize, String)> {
     let chars: Vec<char> = text.chars().collect();
-    if width == 0 || chars.len() <= width {
+    if width == 0 || text_width(text) <= width {
         return vec![(0, text.to_string())];
     }
+    let cells: Vec<usize> = chars.iter().map(|c| cell_width(*c)).collect();
     let mut lines = Vec::new();
     let mut start = 0;
     while start < chars.len() {
@@ -1035,12 +1240,19 @@ fn wrap_cell(text: &str, width: usize) -> Vec<(usize, String)> {
                 break;
             }
         }
-        if chars.len() - start <= width {
+        if cells[start..].iter().sum::<usize>() <= width {
             lines.push((start, chars[start..].iter().collect()));
             break;
         }
-        let limit = start + width;
-        let brk = (start + 1..=limit).rev().find(|&i| chars[i] == ' ').unwrap_or(limit);
+        // The first char that no longer fits; at least one char per line,
+        // even one wider than the column.
+        let (mut limit, mut used) = (start, 0);
+        while limit < chars.len() && used + cells[limit] <= width {
+            used += cells[limit];
+            limit += 1;
+        }
+        let limit = limit.max(start + 1);
+        let brk = (start + 1..=limit).rev().find(|&i| chars.get(i) == Some(&' ')).unwrap_or(limit);
         let mut end = brk;
         while end > start && chars[end - 1] == ' ' {
             end -= 1;
@@ -1255,7 +1467,7 @@ pub fn render(
     base: Option<&Path>,
     allow_remote: bool,
     refresh: Option<Rc<dyn Fn()>>,
-    loader: Option<&dyn Fn(&str) -> Option<Vec<u8>>>,
+    loader: Option<&dyn Fn(&str) -> Option<glib::Bytes>>,
 ) -> Rendered {
     render_fitted(buffer, markdown, base, allow_remote, refresh, loader, None)
 }
@@ -1268,7 +1480,7 @@ pub fn render_fitted(
     base: Option<&Path>,
     allow_remote: bool,
     refresh: Option<Rc<dyn Fn()>>,
-    loader: Option<&dyn Fn(&str) -> Option<Vec<u8>>>,
+    loader: Option<&dyn Fn(&str) -> Option<glib::Bytes>>,
     table_cols: Option<usize>,
 ) -> Rendered {
     buffer.set_text("");
@@ -1281,6 +1493,8 @@ pub fn render_fitted(
         saw_remote: false,
         tags: Vec::new(),
         lists: Vec::new(),
+        item_indents: Vec::new(),
+        item_fresh: false,
         tail: ['\n', '\n'],
         table: None,
         in_rendered_image: false,
@@ -1386,6 +1600,51 @@ mod tests {
             [(0, "abcd".to_string()), (4, "efgh".to_string()), (8, "ij".to_string()), (11, "kl".to_string())]
         );
         assert_eq!(wrap_cell("short", 9), [(0, "short".to_string())]);
+    }
+
+    #[test]
+    fn wide_chars_count_two_cells() {
+        assert_eq!(text_width("日本語"), 6);
+        assert_eq!(text_width("🖼 cat"), 6);
+        assert_eq!(text_width("e\u{301}"), 1);
+        // Wraps by cells, not chars: two wide chars fill a 4-cell column.
+        assert_eq!(
+            wrap_cell("日本語です", 4),
+            [(0, "日本".to_string()), (2, "語で".to_string()), (4, "す".to_string())]
+        );
+        // A char wider than the column still gets a line of its own.
+        assert_eq!(wrap_cell("日本", 1), [(0, "日".to_string()), (1, "本".to_string())]);
+    }
+
+    #[test]
+    fn oversized_images_are_refused_before_decoding() {
+        // A PNG header declaring 20000×20000 (400 MP), with no pixel data:
+        // the size check must stop it at the header.
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let mut ihdr = b"IHDR".to_vec();
+        ihdr.extend_from_slice(&20000u32.to_be_bytes());
+        ihdr.extend_from_slice(&20000u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(&ihdr);
+        png.extend_from_slice(&crc32(&ihdr).to_be_bytes());
+        assert!(decode_thumbnail(&mut &png[..]).is_none());
+        // A real image of ordinary size decodes, scaled to the preview width.
+        let pixbuf = gdk_pixbuf::Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, true, 8, 1000, 500).unwrap();
+        let png = pixbuf.save_to_bufferv("png", &[]).unwrap();
+        let thumb = decode_thumbnail(&mut &png[..]).expect("decodes");
+        assert_eq!((thumb.width, thumb.height), (IMAGE_MAX_WIDTH, 110));
+    }
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for b in data {
+            crc ^= *b as u32;
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+            }
+        }
+        !crc
     }
 
     fn entry(preview: i32, len: i32, source: i32, exact: bool) -> MapEntry {

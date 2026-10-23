@@ -431,7 +431,7 @@ fn images_in_table_cells_stay_in_their_cell() {
     let pixbuf = gtk4::gdk_pixbuf::Pixbuf::new(gtk4::gdk_pixbuf::Colorspace::Rgb, false, 8, 16, 16)
         .expect("pixbuf");
     let png = pixbuf.save_to_bufferv("png", &[]).expect("png");
-    let loader = move |dest: &str| (dest == "pic.png").then(|| png.clone());
+    let loader = move |dest: &str| (dest == "pic.png").then(|| gtk4::glib::Bytes::from(&png[..]));
 
     let markdown = "Intro\n\n| Pic | Name |\n| - | - |\n| ![cat](pic.png) | Tom |\n";
     preview::render(&buffer, markdown, None, false, None, Some(&loader));
@@ -476,4 +476,19 @@ fn wide_tables_wrap_inside_their_columns() {
     assert!(body.iter().all(|r| r.source == body[0].source));
     let joined: Vec<String> = lines[2..].iter().map(|l| l[l.find('│').unwrap() + "│ ".len()..].to_string()).collect();
     assert_eq!(joined.join(" "), "the quick brown fox jumps over the lazy dog");
+}
+
+#[test]
+fn a_loose_list_item_keeps_its_paragraphs_apart() {
+    if gtk4::init().is_err() {
+        eprintln!("no display available, skipping");
+        return;
+    }
+    let buffer = gtk4::TextBuffer::new(None);
+    preview::setup_tags(&buffer);
+    preview::render(&buffer, "- first\n\n  second\n- [ ] task\n\n  more\n", None, false, None, None);
+    let text = buffer.slice(&buffer.start_iter(), &buffer.end_iter(), true).to_string();
+    // Both paragraphs used to run into one line: "• firstsecond".
+    assert!(text.contains("• first\n\n  second"), "{text:?}");
+    assert!(text.contains("• ☐ task\n\n  more"), "{text:?}");
 }

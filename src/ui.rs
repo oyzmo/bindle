@@ -135,6 +135,13 @@ impl DocSource {
     }
 }
 
+/// A preview image's bytes, read off the main loop (`App::asset_reads`).
+enum AssetRead {
+    Pending,
+    Ready(glib::Bytes),
+    Failed,
+}
+
 pub struct App {
     window: adw::ApplicationWindow,
     toasts: adw::ToastOverlay,
@@ -181,9 +188,13 @@ pub struct App {
     source: RefCell<DocSource>,
     /// Files added to a .textpack document, written into the zip on save.
     staged_assets: RefCell<HashMap<String, bundle::AssetSource>>,
-    /// Pack asset bytes already read out of the zip this document; avoids
-    /// re-opening and re-inflating the archive on every debounced render.
-    pack_bytes_cache: RefCell<HashMap<String, Vec<u8>>>,
+    /// Preview image bytes read from disk for this document (pack/ODT
+    /// entries, staged files, an unsaved document's absolute paths), by
+    /// reference. Reads run on a worker thread; see `read_asset_async`.
+    asset_reads: RefCell<HashMap<String, AssetRead>>,
+    /// Bumped whenever `asset_reads` is cleared, so a read still in flight
+    /// from before can't land in the new document's (or new pack's) cache.
+    asset_gen: Cell<u64>,
     /// True while an unsaved-changes dialog is up (blocks external opens).
     guard_active: Cell<bool>,
     modified: Cell<bool>,
@@ -773,7 +784,8 @@ impl App {
             disk_banner,
             source: RefCell::new(DocSource::None),
             staged_assets: RefCell::new(HashMap::new()),
-            pack_bytes_cache: RefCell::new(HashMap::new()),
+            asset_reads: RefCell::new(HashMap::new()),
+            asset_gen: Cell::new(0),
             guard_active: Cell::new(false),
             modified: Cell::new(false),
             loading: Cell::new(false),
@@ -2434,6 +2446,43 @@ impl App {
         }
     }
 
+    /// Run `read` on a worker thread and keep its bytes for the preview
+    /// loader under `rel`, re-rendering once they are in. A failed read is
+    /// remembered too, so a missing image isn't retried (and the preview
+    /// re-rendered) on every keystroke.
+    fn read_asset_async(
+        self: &Rc<Self>,
+        rel: &str,
+        read: Box<dyn FnOnce() -> Option<Vec<u8>> + Send>,
+    ) {
+        self.asset_reads.borrow_mut().insert(rel.to_string(), AssetRead::Pending);
+        let generation = self.asset_gen.get();
+        let weak = Rc::downgrade(self);
+        let rel = rel.to_string();
+        glib::spawn_future_local(async move {
+            let bytes = gio::spawn_blocking(read).await.ok().flatten();
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
+            if state.asset_gen.get() != generation {
+                return;
+            }
+            let found = bytes.is_some();
+            let entry = bytes.map_or(AssetRead::Failed, |b| AssetRead::Ready(glib::Bytes::from_owned(b)));
+            state.asset_reads.borrow_mut().insert(rel, entry);
+            if found {
+                state.render_preview(true);
+            }
+        });
+    }
+
+    /// Drop the preview's asset bytes (the document changed, or the pack
+    /// was rewritten) and orphan any read still in flight.
+    fn forget_asset_reads(&self) {
+        self.asset_reads.borrow_mut().clear();
+        self.asset_gen.set(self.asset_gen.get().wrapping_add(1));
+    }
+
     /// Re-render the preview. `keep_position` restores the scroll position
     /// afterwards; pass false on document load to show the top. The restore
     /// is synchronous (same main-loop iteration, before the next draw) — a
@@ -2455,33 +2504,42 @@ impl App {
         let pack_ctx = source.archive();
         let pasted = matches!(source, DocSource::None) && !self.staged_assets.borrow().is_empty();
         let archive = pack_ctx.as_ref();
+        //
+        // The loader only ever answers from memory. Anything on disk is read
+        // on a worker thread (the pack may sit on a share that hangs) and
+        // shows the placeholder until that read re-renders the preview.
         let loader = (archive.is_some() || pasted).then(|| {
             move |rel: &str| {
-                match self.staged_assets.borrow().get(rel) {
-                    Some(bundle::AssetSource::Bytes(bytes)) => return Some(bytes.clone()),
-                    Some(bundle::AssetSource::File(p)) => {
-                        return bundle::read_file_capped(p, bundle::ASSET_MAX_BYTES);
-                    }
+                let staged_file = match self.staged_assets.borrow().get(rel) {
+                    Some(bundle::AssetSource::Bytes(bytes)) => return Some(glib::Bytes::from(&bytes[..])),
+                    Some(bundle::AssetSource::File(p)) => Some(p.clone()),
+                    None => None,
+                };
+                match self.asset_reads.borrow().get(rel) {
+                    Some(AssetRead::Ready(bytes)) => return Some(bytes.clone()),
+                    Some(AssetRead::Pending | AssetRead::Failed) => return None,
                     None => {}
                 }
-                let Some((path, info)) = archive else {
+                let max = bundle::ASSET_MAX_BYTES;
+                let read: Box<dyn FnOnce() -> Option<Vec<u8>> + Send> = match (staged_file, archive) {
+                    (Some(file), _) => Box::new(move || bundle::read_file_capped(&file, max)),
+                    (None, Some((path, info))) => {
+                        let (path, info, rel) = (path.clone(), info.clone(), rel.to_string());
+                        Box::new(move || bundle::read_asset(&path, &info, &rel, max))
+                    }
                     // Nothing else of an unsaved document is relative.
-                    let path = Path::new(rel);
-                    return path
-                        .is_absolute()
-                        .then(|| bundle::read_file_capped(path, bundle::ASSET_MAX_BYTES))
-                        .flatten();
+                    (None, None) if Path::new(rel).is_absolute() => {
+                        let path = PathBuf::from(rel);
+                        Box::new(move || bundle::read_file_capped(&path, max))
+                    }
+                    (None, None) => return None,
                 };
-                if let Some(bytes) = self.pack_bytes_cache.borrow().get(rel) {
-                    return Some(bytes.clone());
-                }
-                let bytes = bundle::read_asset(path, info, rel, bundle::ASSET_MAX_BYTES)?;
-                self.pack_bytes_cache.borrow_mut().insert(rel.to_string(), bytes.clone());
-                Some(bytes)
+                self.read_asset_async(rel, read);
+                None
             }
         });
-        let loader_ref: Option<&dyn Fn(&str) -> Option<Vec<u8>>> =
-            loader.as_ref().map(|f| f as &dyn Fn(&str) -> Option<Vec<u8>>);
+        let loader_ref: Option<&dyn Fn(&str) -> Option<glib::Bytes>> =
+            loader.as_ref().map(|f| f as &dyn Fn(&str) -> Option<glib::Bytes>);
         let weak = Rc::downgrade(self);
         let refresh: Rc<dyn Fn()> = Rc::new(move || {
             if let Some(state) = weak.upgrade() {
@@ -3388,7 +3446,7 @@ impl App {
         self.loading.set(false);
         *self.source.borrow_mut() = source;
         self.staged_assets.borrow_mut().clear();
-        self.pack_bytes_cache.borrow_mut().clear();
+        self.forget_asset_reads();
         preview::reset_loader_cache();
         {
             // Restore this document's remembered folds; unknown keys are
@@ -3728,7 +3786,7 @@ impl App {
                         }
                         // The zip content changed; cached entry bytes are stale.
                         self.staged_assets.borrow_mut().clear();
-                        self.pack_bytes_cache.borrow_mut().clear();
+                        self.forget_asset_reads();
                         self.finish_save(&path, then);
                     }
                     Err(err) => self.toast(&format!("Could not save: {err}")),
@@ -3853,7 +3911,7 @@ impl App {
                 // No longer a pack: staged entries must not leak into a
                 // later export via asset_source's staged-first lookup.
                 self.staged_assets.borrow_mut().clear();
-                self.pack_bytes_cache.borrow_mut().clear();
+                self.forget_asset_reads();
                 if self.doc_kind() != old_kind {
                     self.kind_changed();
                 }
