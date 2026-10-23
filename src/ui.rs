@@ -226,6 +226,10 @@ pub struct App {
     /// Generation counter for async opens; a completion whose sequence no
     /// longer matches is stale (a newer open started) and gets dropped.
     open_seq: Cell<u64>,
+    /// Bumped by every user edit. An open asks about unsaved changes before
+    /// it starts, but the read can take minutes on a hung share while the
+    /// window stays usable: a completion that finds this moved asks again.
+    edit_seq: Cell<u64>,
     /// "Open Recent" submenu, rebuilt from recent_files on every open.
     recent_menu: gio::Menu,
     /// Menu toggle: remember per-document state across sessions.
@@ -804,6 +808,7 @@ impl App {
             files_order: RefCell::new(settings.recent_files.clone()),
             frozen_files: RefCell::new(settings.frozen_files.clone()),
             open_seq: Cell::new(0),
+            edit_seq: Cell::new(0),
             recent_menu,
             remember_folds: Cell::new(settings.remember_folds),
             syncing_cursor: Cell::new(false),
@@ -902,6 +907,7 @@ impl App {
             if state.loading.get() {
                 return;
             }
+            state.edit_seq.set(state.edit_seq.get().wrapping_add(1));
             let first_change = !state.modified.replace(true);
             // A checked-out memo now differs from the server copy. Persist
             // that immediately rather than at the next settings write:
@@ -1326,13 +1332,13 @@ impl App {
             let item = gio::MenuItem::new(Some("Open _Location"), None);
             item.set_action_and_target_value(
                 Some("win.open-location"),
-                Some(&path.to_string_lossy().to_variant()),
+                Some(&path_variant(&path)),
             );
             files_menu.append_item(&item);
             let item = gio::MenuItem::new(Some("_Remove from List"), None);
             item.set_action_and_target_value(
                 Some("win.forget-recent"),
-                Some(&path.to_string_lossy().to_variant()),
+                Some(&path_variant(&path)),
             );
             files_menu.append_item(&item);
             files_popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
@@ -1350,7 +1356,12 @@ impl App {
                 let unpushed = state.clone();
                 let destroy = state.clone();
                 state.guard_unsaved(Box::new(move || {
-                    unpushed.guard_unpushed(Box::new(move || destroy.window.destroy()))
+                    unpushed.guard_unpushed(Box::new(move || {
+                        // Settings were written before the dialogs; a Save
+                        // As in between added a file to the recent list.
+                        destroy.persist_settings();
+                        destroy.window.destroy()
+                    }))
                 }));
                 glib::Propagation::Stop
             } else {
@@ -1388,10 +1399,10 @@ impl App {
             self.window.add_action(&action);
         }
 
-        let action = gio::SimpleAction::new("open-recent", Some(glib::VariantTy::STRING));
+        let action = gio::SimpleAction::new("open-recent", Some(glib::VariantTy::BYTE_STRING));
         let state = self.clone();
         action.connect_activate(move |_, param| {
-            let Some(path) = param.and_then(|v| v.str()).map(PathBuf::from) else {
+            let Some(path) = param.and_then(variant_path) else {
                 return;
             };
             let s = state.clone();
@@ -1411,10 +1422,10 @@ impl App {
         // Show the file selected in the file manager (OpenURI portal, so it
         // works under Flatpak). An unmounted share or a vanished folder fails
         // here, asynchronously, rather than via a stat on the main loop.
-        let action = gio::SimpleAction::new("open-location", Some(glib::VariantTy::STRING));
+        let action = gio::SimpleAction::new("open-location", Some(glib::VariantTy::BYTE_STRING));
         let state = self.clone();
         action.connect_activate(move |_, param| {
-            let Some(path) = param.and_then(|v| v.str()).map(PathBuf::from) else {
+            let Some(path) = param.and_then(variant_path) else {
                 return;
             };
             let s = state.clone();
@@ -1432,10 +1443,10 @@ impl App {
         });
         self.window.add_action(&action);
 
-        let action = gio::SimpleAction::new("forget-recent", Some(glib::VariantTy::STRING));
+        let action = gio::SimpleAction::new("forget-recent", Some(glib::VariantTy::BYTE_STRING));
         let state = self.clone();
         action.connect_activate(move |_, param| {
-            let Some(path) = param.and_then(|v| v.str()).map(PathBuf::from) else {
+            let Some(path) = param.and_then(variant_path) else {
                 return;
             };
             state.recent_files.borrow_mut().retain(|p| *p != path);
@@ -2126,8 +2137,13 @@ impl App {
     /// belong to another process), as a PNG stored with the document.
     fn paste_image(self: &Rc<Self>, clipboard: gdk::Clipboard) {
         let state = self.clone();
+        let seq = self.open_seq.get();
         glib::spawn_future_local(async move {
-            match clipboard.read_texture_future().await {
+            let read = clipboard.read_texture_future().await;
+            if !state.still_open(seq) {
+                return;
+            }
+            match read {
                 Ok(Some(texture)) => state.store_pasted_image(&texture.save_to_png_bytes()),
                 Ok(None) => {}
                 Err(err) => state.toast(&format!("Could not paste the image: {err}")),
@@ -2140,6 +2156,7 @@ impl App {
     /// which is what the editor would have done.
     fn paste_files(self: &Rc<Self>, clipboard: gdk::Clipboard) {
         let state = self.clone();
+        let seq = self.open_seq.get();
         glib::spawn_future_local(async move {
             let files = clipboard
                 .read_value_future(gdk::FileList::static_type(), glib::Priority::DEFAULT)
@@ -2148,6 +2165,9 @@ impl App {
                 .and_then(|value| value.get::<gdk::FileList>().ok())
                 .map(|list| list.files())
                 .unwrap_or_default();
+            if !state.still_open(seq) {
+                return;
+            }
             let images: Vec<PathBuf> =
                 files.iter().filter_map(|f| f.path()).filter(|p| is_image_file(p)).collect();
             if !images.is_empty() && images.len() < files.len() {
@@ -2156,9 +2176,15 @@ impl App {
             }
             if images.is_empty() {
                 if let Ok(Some(text)) = clipboard.read_text_future().await {
+                    if !state.still_open(seq) {
+                        return;
+                    }
+                    // One undo step, as an ordinary paste is.
                     let editable = state.editor.is_editable();
+                    state.buffer.begin_user_action();
                     state.buffer.delete_selection(true, editable);
                     state.buffer.insert_interactive_at_cursor(&text, editable);
+                    state.buffer.end_user_action();
                 }
                 return;
             }
@@ -2170,6 +2196,17 @@ impl App {
             let markdown = refs.iter().map(|(md, _)| md.as_str()).collect::<Vec<_>>().join("\n");
             state.paste_reference(&markdown, markdown.chars().count() as i32, 0);
         });
+    }
+
+    /// Whether the document a paste started in (`open_seq` then) is still
+    /// the open one. A clipboard read is asynchronous — another process owns
+    /// the data — and must not land in a document opened meanwhile.
+    fn still_open(&self, seq: u64) -> bool {
+        let same = self.open_seq.get() == seq;
+        if !same {
+            self.toast("Paste cancelled — another document was opened");
+        }
+        same
     }
 
     /// Store pasted PNG bytes where an inserted image of this document goes:
@@ -2774,12 +2811,19 @@ impl App {
         };
         let state = self.clone();
         glib::spawn_future_local(async move {
-            let bytes = gio::spawn_blocking(move || loc.read(bundle::ASSET_MAX_BYTES))
-                .await
-                .ok()
-                .flatten();
-            let texture = bytes
-                .and_then(|bytes| gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)).ok());
+            // The decode runs there too, at full size (this is the original,
+            // not a thumbnail) — so the header is checked first, or a small
+            // file declaring a huge image would decode to gigabytes.
+            let texture = gio::spawn_blocking(move || {
+                let bytes = loc.read(bundle::ASSET_MAX_BYTES)?;
+                if !preview::image_size_ok(&bytes) {
+                    return None;
+                }
+                gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)).ok()
+            })
+            .await
+            .ok()
+            .flatten();
             match texture {
                 Some(texture) => {
                     state.preview.clipboard().set_texture(&texture);
@@ -2889,7 +2933,7 @@ impl App {
             let item = gio::MenuItem::new(Some(&file_label(path)), None);
             item.set_action_and_target_value(
                 Some("win.open-recent"),
-                Some(&path.to_string_lossy().to_variant()),
+                Some(&path_variant(&path)),
             );
             self.recent_menu.append_item(&item);
         }
@@ -3244,9 +3288,14 @@ impl App {
         let (bx, by) = self
             .preview
             .window_to_buffer_coords(gtk4::TextWindowType::Widget, x as i32, y as i32);
-        let Some(iter) = self.preview.iter_at_location(bx, by) else {
-            return;
-        };
+        // Beside the text (margin, past a line's end) GTK has no character
+        // under the point; its own click handling has already put the
+        // preview's cursor on the nearest one, so go by that.
+        let preview = self.preview.buffer();
+        let iter = self
+            .preview
+            .iter_at_location(bx, by)
+            .unwrap_or_else(|| preview.iter_at_mark(&preview.get_insert()));
         let Some(source) = map.source_offset(iter.offset()) else {
             return;
         };
@@ -3482,7 +3531,9 @@ impl App {
         // one's highlighting carries over.
         self.reset_highlight();
         self.apply_highlight();
-        self.editor.grab_focus();
+        // Not the editor unconditionally: in view mode with the Preview panel
+        // off it is hidden, and focus would land nowhere.
+        self.focus_main();
     }
 
     /// The document kind decides the layout: markdown gets the panels and
@@ -3530,13 +3581,16 @@ impl App {
     }
 
     fn open_path(self: &Rc<Self>, path: &Path) {
-        self.open_path_inner(path, OpenTry::First);
+        self.open_path_inner(path, OpenTry::First, self.edit_seq.get());
     }
 
     /// Only the first try mounts the gvfs share a missing path lives on; the
     /// retry after mounting doesn't, so a share that comes up without the
     /// file reports the error instead of looping.
-    fn open_path_inner(self: &Rc<Self>, path: &Path, attempt: OpenTry) {
+    ///
+    /// `edits` is `edit_seq` as of the unsaved-changes check that let this
+    /// open go ahead; edits made after it are asked about again.
+    fn open_path_inner(self: &Rc<Self>, path: &Path, attempt: OpenTry, edits: u64) {
         // Classify and read on a worker thread: any stat or read can block
         // for minutes on an unreachable FUSE/network mount, which would
         // freeze the main loop. A stale completion (a newer open started
@@ -3580,30 +3634,19 @@ impl App {
                 return;
             }
             match loaded {
-                Ok((Ok((text, source, legacy, stamp)), _)) => {
-                    let imported = matches!(source, DocSource::Odt { .. });
-                    state.load_text(&text, source);
-                    state.disk_stamp.set(stamp);
-                    if imported {
-                        state.toast("Imported as Markdown — saving creates a new file");
+                Ok((Ok(opened), _)) => {
+                    if state.edit_seq.get() == edits {
+                        return state.finish_open(&path, opened);
                     }
-                    if let Some(encoding) = legacy {
-                        state.toast(&format!(
-                            "Not UTF-8 — read as {encoding}; saving converts it to UTF-8"
-                        ));
-                    }
-                    // Remembered view mode wins; without a memory the
-                    // open-in-view setting applies, and view mode is never
-                    // dropped on open.
-                    state.set_view_mode(state.view_mode_for(&path));
-                    // Memo cache files are reached through the browse
-                    // dialog; keeping them out of "Open Recent" stops it
-                    // filling with ~/.cache paths.
-                    if state.memo_doc_for(&path).is_none() {
-                        state.remember_recent(&path);
-                        state.update_recent_menu();
-                    }
-                    state.persist_settings();
+                    // Typed into the current document while the read ran:
+                    // replacing it now would throw that away unasked. A
+                    // guard already up (closing, say) drops this open.
+                    let s = state.clone();
+                    state.guard_unsaved(Box::new(move || {
+                        if s.open_seq.get() == seq {
+                            s.finish_open(&path, opened);
+                        }
+                    }));
                 }
                 Ok((Err(_), true))
                     if state.recent_files.borrow().contains(&path)
@@ -3623,7 +3666,7 @@ impl App {
                     // right now: bring the share up and open it after all.
                     if attempt == OpenTry::First
                         && err.kind() == std::io::ErrorKind::NotFound
-                        && state.mount_share(&path)
+                        && state.mount_share(&path, seq, edits)
                     {
                         return;
                     }
@@ -3634,13 +3677,44 @@ impl App {
         });
     }
 
+    /// Load what `open_path_inner` read into the window.
+    fn finish_open(
+        self: &Rc<Self>,
+        path: &Path,
+        (text, source, legacy, stamp): (String, DocSource, Option<&'static str>, Option<doc::DiskStamp>),
+    ) {
+        let imported = matches!(source, DocSource::Odt { .. });
+        self.load_text(&text, source);
+        self.disk_stamp.set(stamp);
+        if imported {
+            self.toast("Imported as Markdown — saving creates a new file");
+        }
+        if let Some(encoding) = legacy {
+            self.toast(&format!("Not UTF-8 — read as {encoding}; saving converts it to UTF-8"));
+        }
+        // Remembered view mode wins; without a memory the open-in-view
+        // setting applies, and view mode is never dropped on open.
+        self.set_view_mode(self.view_mode_for(path));
+        // Memo cache files are reached through the browse dialog; keeping
+        // them out of "Open Recent" stops it filling with ~/.cache paths.
+        if self.memo_doc_for(path).is_none() {
+            self.remember_recent(path);
+            self.update_recent_menu();
+        }
+        self.persist_settings();
+    }
+
     /// Mount the gvfs share a missing path lives on, then open it again.
     /// GTK's `MountOperation` supplies the password prompt, so this is the
     /// same thing that happens when the share's bookmark is clicked in
     /// Files — usually silent, since gvfs keeps the password in the keyring.
     /// Returns false when the path is not on a gvfs share, leaving the
     /// caller to report its error as before.
-    fn mount_share(self: &Rc<Self>, path: &Path) -> bool {
+    ///
+    /// `seq` is the open this mount belongs to: a mount can take as long as
+    /// a password prompt, and if another document was opened meanwhile the
+    /// share's file must not replace it.
+    fn mount_share(self: &Rc<Self>, path: &Path, seq: u64, edits: u64) -> bool {
         let Some(uri) = doc::gvfs_share_uri(path) else {
             return false;
         };
@@ -3654,9 +3728,10 @@ impl App {
             Some(&op),
             gio::Cancellable::NONE,
             move |result| match result {
-                Ok(()) => state.open_path_inner(&path, OpenTry::AfterMount),
+                _ if state.open_seq.get() != seq => {}
+                Ok(()) => state.open_path_inner(&path, OpenTry::AfterMount, edits),
                 Err(err) if err.matches(gio::IOErrorEnum::AlreadyMounted) => {
-                    state.open_path_inner(&path, OpenTry::AfterMount)
+                    state.open_path_inner(&path, OpenTry::AfterMount, edits)
                 }
                 // Dismissing the password dialog is an answer, not an error;
                 // FailedHandled means GTK has already shown one.
@@ -4066,6 +4141,10 @@ impl App {
         dialog.save(Some(&self.window), gio::Cancellable::NONE, move |result| {
             if let Some(path) = state.picked_path(result) {
                 if state.export_pack_to(&path) && rebind {
+                    // Recorded now, not when the reopen lands: closing the
+                    // window (`then`) would otherwise win that race.
+                    state.remember_recent(&path);
+                    state.update_recent_menu();
                     state.open_path(&path);
                     if let Some(then) = then {
                         then();
@@ -4220,11 +4299,16 @@ impl App {
         let (bx, by) = self
             .preview
             .window_to_buffer_coords(gtk4::TextWindowType::Widget, x as i32, y as i32);
-        let iter = self.preview.iter_at_location(bx, by)?;
-        // The point is on text when it falls inside the character nearest to
-        // it; a line end has no width, hence the floor of one pixel.
-        let rect = self.preview.iter_location(&iter);
-        if bx >= rect.x() && bx < rect.x() + rect.width().max(1) {
+        // GTK reports a point in the margin or past a line's end as "not
+        // over text" — exactly the case wanted here — so the line comes from
+        // the y coordinate instead, and must actually span it (below the
+        // last line `line_at_y` still answers with that line).
+        if self.preview.iter_at_location(bx, by).is_some() {
+            return None;
+        }
+        let (iter, top) = self.preview.line_at_y(by);
+        let (_, height) = self.preview.line_yrange(&iter);
+        if by < top || by >= top + height {
             return None;
         }
         let mut line_start = iter;
@@ -5630,6 +5714,19 @@ fn display_dir(dir: &Path) -> String {
     }
 }
 
+/// A path as an action target: its raw bytes, since a Linux file name need
+/// not be UTF-8 and a lossy string would name a different file.
+fn path_variant(path: &Path) -> glib::Variant {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().to_variant()
+}
+
+/// The path carried by a `path_variant` target.
+fn variant_path(variant: &glib::Variant) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    variant.get::<Vec<u8>>().map(|bytes| PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+}
+
 /// File name of `path` for use as a link label / asset name.
 fn file_label(path: &PathBuf) -> String {
     path.file_name()
@@ -5870,8 +5967,15 @@ fn md_filters() -> gio::ListStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{markdown_dest, markdown_label, pinned_first};
+    use super::{markdown_dest, markdown_label, path_variant, pinned_first, variant_path};
     use std::path::PathBuf;
+
+    #[test]
+    fn non_utf8_paths_survive_an_action_target() {
+        use std::os::unix::ffi::OsStringExt;
+        let path = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/caf\xe9.md".to_vec()));
+        assert_eq!(variant_path(&path_variant(&path)), Some(path));
+    }
 
     #[test]
     fn pinned_files_lead_in_pin_order_and_the_rest_keep_theirs() {

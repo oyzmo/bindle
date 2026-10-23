@@ -213,6 +213,23 @@ fn decode_thumbnail(source: &mut dyn std::io::Read) -> Option<Thumb> {
     })
 }
 
+/// Whether an encoded image declares at most `IMAGE_MAX_PIXELS`, read from
+/// its header without decoding any pixels — for callers that decode the
+/// original at full size (Copy Image). False when there is no readable header.
+pub fn image_size_ok(data: &[u8]) -> bool {
+    let loader = gdk_pixbuf::PixbufLoader::new();
+    let size = Rc::new(std::cell::Cell::new(None));
+    let seen = size.clone();
+    loader.connect_size_prepared(move |_, w, h| seen.set(Some(w as i64 * h as i64)));
+    for chunk in data.chunks(64 * 1024) {
+        if loader.write(chunk).is_err() || size.get().is_some() {
+            break;
+        }
+    }
+    let _ = loader.close();
+    size.get().is_some_and(|pixels| pixels <= IMAGE_MAX_PIXELS)
+}
+
 fn texture_from_bytes(data: &[u8]) -> Option<gdk::Texture> {
     if data.len() > REMOTE_MAX_BYTES {
         return None;
@@ -1629,11 +1646,14 @@ mod tests {
         png.extend_from_slice(&ihdr);
         png.extend_from_slice(&crc32(&ihdr).to_be_bytes());
         assert!(decode_thumbnail(&mut &png[..]).is_none());
+        assert!(!image_size_ok(&png));
+        assert!(!image_size_ok(b"not an image"));
         // A real image of ordinary size decodes, scaled to the preview width.
         let pixbuf = gdk_pixbuf::Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, true, 8, 1000, 500).unwrap();
         let png = pixbuf.save_to_bufferv("png", &[]).unwrap();
         let thumb = decode_thumbnail(&mut &png[..]).expect("decodes");
         assert_eq!((thumb.width, thumb.height), (IMAGE_MAX_WIDTH, 110));
+        assert!(image_size_ok(&png));
     }
 
     fn crc32(data: &[u8]) -> u32 {

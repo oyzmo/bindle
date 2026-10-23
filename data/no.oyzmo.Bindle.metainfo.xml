@@ -34,6 +34,16 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.23.3" date="2026-10-23">
+      <description>
+        <ul>
+          <li>Opening a file from a slow share no longer discards what you typed while it loaded</li>
+          <li>Closing an unsaved document with Save keeps it in Open Recent</li>
+          <li>Picking a line by double-clicking beside it in the preview now works; clicking past a line's end moves the editor cursor</li>
+          <li>Copy Image refuses oversized images and decodes off the main thread; pastes stay in the document they were made in</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.23.2" date="2026-10-23">
       <description>
         <p>Images inside TextPack and ODT files load off the main thread, so a pack on a dropped network share no longer freezes the window</p>
