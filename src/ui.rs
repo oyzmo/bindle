@@ -420,7 +420,9 @@ impl App {
                     let (lw, _) = layout.pixel_size();
                     cr.move_to((width - GUTTER_PAD - lw) as f64, (wy + above) as f64);
                     pangocairo::functions::show_layout(cr, &layout);
-                    if !iter.forward_line() {
+                    // False also when it lands on an empty last line (a file
+                    // ending in a newline) — that line still gets a number.
+                    if !iter.forward_line() && iter.line() == line {
                         break;
                     }
                 }
@@ -1812,33 +1814,44 @@ impl App {
 
     // --- Smart editing ---
 
-    /// Text of the cursor's line before the cursor, or None when a selection
-    /// is active (smart editing then stays out of the way).
-    fn line_before_cursor(&self) -> Option<String> {
+    /// Text of the cursor's line before and after the cursor, or None when
+    /// a selection is active (smart editing then stays out of the way).
+    fn line_around_cursor(&self) -> Option<(String, String)> {
         if self.buffer.has_selection() {
             return None;
         }
         let cursor = self.buffer.iter_at_mark(&self.buffer.get_insert());
-        let mut line_start = cursor.clone();
+        let mut line_start = cursor;
         line_start.set_line_offset(0);
-        Some(self.buffer.text(&line_start, &cursor, false).to_string())
+        let mut line_end = cursor;
+        if !line_end.ends_line() {
+            line_end.forward_to_line_end();
+        }
+        Some((
+            self.buffer.text(&line_start, &cursor, false).to_string(),
+            self.buffer.text(&cursor, &line_end, false).to_string(),
+        ))
     }
 
-    /// Delete everything on the cursor's line before the cursor.
-    fn delete_line_before_cursor(&self) {
+    /// Delete everything on the cursor's line before the cursor — or, with
+    /// `whole`, the line's entire text (its newline stays).
+    fn clear_line(&self, whole: bool) {
         self.buffer.begin_user_action();
         let mut cursor = self.buffer.iter_at_mark(&self.buffer.get_insert());
-        let mut line_start = cursor.clone();
+        let mut line_start = cursor;
         line_start.set_line_offset(0);
+        if whole && !cursor.ends_line() {
+            cursor.forward_to_line_end();
+        }
         self.buffer.delete(&mut line_start, &mut cursor);
         self.buffer.end_user_action();
     }
 
     fn handle_enter(&self) -> glib::Propagation {
-        let Some(before) = self.line_before_cursor() else {
+        let Some((before, after)) = self.line_around_cursor() else {
             return glib::Propagation::Proceed;
         };
-        match editor::on_enter(&before) {
+        match editor::on_enter(&before, &after) {
             editor::EnterAction::None => return glib::Propagation::Proceed,
             editor::EnterAction::Continue(text) => {
                 self.buffer.begin_user_action();
@@ -1853,22 +1866,23 @@ impl App {
                 self.buffer.place_cursor(&iter);
                 self.buffer.end_user_action();
             }
-            editor::EnterAction::StopEmpty => self.delete_line_before_cursor(),
+            editor::EnterAction::StopEmpty => self.clear_line(false),
+            editor::EnterAction::ClearLine => self.clear_line(true),
         }
         self.editor.scroll_mark_onscreen(&self.buffer.get_insert());
         glib::Propagation::Stop
     }
 
     fn handle_backspace(&self) -> glib::Propagation {
-        let Some(before) = self.line_before_cursor() else {
+        let Some((before, after)) = self.line_around_cursor() else {
             return glib::Propagation::Proceed;
         };
-        if editor::on_backspace(&before) {
-            self.delete_line_before_cursor();
-            glib::Propagation::Stop
-        } else {
-            glib::Propagation::Proceed
+        match editor::on_backspace(&before, &after) {
+            editor::BackspaceAction::None => return glib::Propagation::Proceed,
+            editor::BackspaceAction::ClearBefore => self.clear_line(false),
+            editor::BackspaceAction::ClearLine => self.clear_line(true),
         }
+        glib::Propagation::Stop
     }
 
     // --- Inserting ---
@@ -1924,12 +1938,14 @@ impl App {
     /// copying or staging the image as the document kind requires; None
     /// (with a toast) when that failed.
     fn image_markdown(&self, path: &Path) -> Option<(String, String)> {
-        let alt = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "image".to_string());
+        let alt = markdown_label(
+            &path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "image".to_string()),
+        );
         let source = self.source.borrow().clone();
-        let mut dest = match &source {
+        let dest = match &source {
             DocSource::Bundle { dir, .. } => {
                 match bundle::copy_into_assets(path, &dir.join("assets")) {
                     Ok(name) => format!("assets/{name}"),
@@ -1948,10 +1964,7 @@ impl App {
                 target.display().to_string()
             }
         };
-        if dest.contains(' ') {
-            dest = format!("<{dest}>");
-        }
-        Some((format!("![{alt}]({dest})"), alt))
+        Some((format!("![{alt}]({})", markdown_dest(&dest)), alt))
     }
 
     /// Ask for an image URL and insert `![alt](url)`.
@@ -2007,12 +2020,12 @@ impl App {
         let state = self.clone();
         dialog.open(Some(&self.window), gio::Cancellable::NONE, move |result| {
             if let Some(path) = state.picked_path(result) {
-                let name = file_label(&path);
+                let name = markdown_label(&file_label(&path));
                 let target = match state.source.borrow().preview_base() {
                     Some(dir) => relative_to(&dir, &path),
                     None => path.clone(),
                 };
-                let dest = wrap_spaces(target.display().to_string());
+                let dest = markdown_dest(&target.display().to_string());
                 state.insert_reference(
                     &format!("[{name}]({dest})"),
                     1,
@@ -2036,7 +2049,7 @@ impl App {
     }
 
     fn attach_file(&self, path: &Path) {
-        let name = file_label(&path.to_path_buf());
+        let name = markdown_label(&file_label(&path.to_path_buf()));
         let source = self.source.borrow().clone();
         let assets_dir = match &source {
             DocSource::Bundle { dir, .. } => dir.join("assets"),
@@ -2059,9 +2072,10 @@ impl App {
     }
 
     /// `[name](dest)` with the label preselected. The label stays the file's
-    /// own name even when the stored copy had to be renumbered.
+    /// own name even when the stored copy had to be renumbered. `name` is
+    /// already escaped (`markdown_label`).
     fn insert_attachment_link(&self, name: &str, dest: String) {
-        let dest = wrap_spaces(dest);
+        let dest = markdown_dest(&dest);
         self.insert_reference(&format!("[{name}]({dest})"), 1, name.chars().count() as i32);
     }
 
@@ -2182,7 +2196,7 @@ impl App {
 
     fn paste_image_reference(&self, dest: &str) {
         let alt = "image";
-        let markdown = format!("![{alt}]({})", wrap_spaces(dest.to_string()));
+        let markdown = format!("![{alt}]({})", markdown_dest(dest));
         self.paste_reference(&markdown, 2, alt.len() as i32);
     }
 
@@ -3015,13 +3029,21 @@ impl App {
                 None => return self.toast("Save the document first to resolve relative links"),
             }
         };
-        if !path.exists() {
-            return self.toast(&format!("Not found: {}", path.display()));
-        }
+        // No exists() check first: a stat on a dead share would hang the
+        // window. The launch fails asynchronously instead, and says so.
+        let state = self.clone();
         gtk4::FileLauncher::new(Some(&gio::File::for_path(&path))).launch(
             Some(&self.window),
             gio::Cancellable::NONE,
-            |_| {},
+            move |result| {
+                if let Err(err) = result {
+                    if err.matches(gio::IOErrorEnum::NotFound) {
+                        state.toast(&format!("Not found: {}", path.display()));
+                    } else if !err.matches(gtk4::DialogError::Dismissed) {
+                        state.toast(&format!("Could not open {}: {}", path.display(), err.message()));
+                    }
+                }
+            },
         );
     }
 
@@ -4325,7 +4347,9 @@ impl App {
                 cr.move_to((width - GUTTER_PAD - lw) as f64, top as f64);
                 pangocairo::functions::show_layout(cr, &layout);
             }
-            if !iter.forward_line() {
+            // As in the editor gutter: an empty last line still counts.
+            let line = iter.line();
+            if !iter.forward_line() && iter.line() == line {
                 break;
             }
         }
@@ -4701,6 +4725,11 @@ impl App {
             then();
             return;
         }
+        // One question at a time: a second close request (Alt+F4 again) or
+        // open while the dialog is up would stack another one over it.
+        if self.guard_active.get() {
+            return;
+        }
         let dialog = adw::AlertDialog::new(
             Some("Save Changes?"),
             Some("The document has unsaved changes."),
@@ -4729,6 +4758,9 @@ impl App {
     fn guard_unpushed(self: &Rc<Self>, then: Box<dyn FnOnce()>) {
         if !self.memo_unpushed.get() || self.memo_doc().is_none() {
             then();
+            return;
+        }
+        if self.guard_active.get() {
             return;
         }
         let dialog = adw::AlertDialog::new(
@@ -5177,11 +5209,18 @@ impl App {
         }
         let token = if append { browse.next_token.borrow().clone() } else { String::new() };
         let query = browse.query.borrow().clone();
+        let asked = query.clone();
         let browse = browse.clone();
         self.memos_call(
             move |server| memos::list(server, &token, &query),
             move |state, result| {
                 browse.loading.set(false);
+                // The search changed while this page was loading, and that
+                // request was turned away above: this page answers an old
+                // query, so fetch the current one instead of showing it.
+                if *browse.query.borrow() != asked {
+                    return state.memos_load_page(&browse, false);
+                }
                 browse.spinner.stop();
                 browse.spinner.set_visible(false);
                 browse.more.set_sensitive(true);
@@ -5539,7 +5578,6 @@ fn file_label(path: &PathBuf) -> String {
         .unwrap_or_else(|| "file".to_string())
 }
 
-/// File stem of `path` for use as an exported document's title.
 /// The printer's sheet as export geometry. GTK reports paper size already
 /// oriented, so landscape needs no transform here. Its margins are the
 /// printer's *unprintable* edges, which would put text at the very rim — so
@@ -5563,13 +5601,13 @@ fn page_geometry(setup: &gtk4::PageSetup) -> export::Page {
     .sane()
 }
 
+/// File stem of `path` for use as an exported document's title.
 fn file_stem_label(path: &Path) -> String {
     path.file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "Document".to_string())
 }
 
-/// True for link destinations handled by URI schemes rather than files.
 /// Copy `src` over `dest` without leaving `dest` half-written, like
 /// `doc::write_atomic` (including its write-in-place fallback).
 fn copy_atomic(src: &Path, dest: &Path) -> std::io::Result<()> {
@@ -5620,13 +5658,40 @@ fn escapes_folder(rel: &Path) -> bool {
     false
 }
 
+/// True for link destinations handled by URI schemes rather than files.
 fn external_link(dest: &str) -> bool {
     dest.contains("://") || dest.starts_with("mailto:") || dest.starts_with("tel:")
 }
 
-/// Wrap a markdown destination in <> when it contains spaces.
-fn wrap_spaces(dest: String) -> String {
-    if dest.contains(' ') { format!("<{dest}>") } else { dest }
+/// A file name as markdown link text: brackets and backslashes escaped,
+/// so `a]b.png` can't end the label early.
+fn markdown_label(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '\\' | '[' | ']') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// A path as a markdown link destination. Plain when it is safe bare;
+/// otherwise `<…>` (with `<`, `>` and `\` escaped), which is the form that
+/// allows spaces and unbalanced parentheses (`a)b.png`).
+fn markdown_dest(dest: &str) -> String {
+    if !dest.chars().any(|c| matches!(c, ' ' | '(' | ')' | '<' | '>' | '\\')) {
+        return dest.to_string();
+    }
+    let mut out = String::from("<");
+    for c in dest.chars() {
+        if matches!(c, '<' | '>' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('>');
+    out
 }
 
 /// Whether gdk-pixbuf can load `path`, by extension alone — a clipboard
@@ -5731,4 +5796,41 @@ fn md_filters() -> gio::ListStore {
     store.append(&markdown);
     store.append(&all);
     store
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{markdown_dest, markdown_label};
+    use pulldown_cmark::{Event, Parser, Tag};
+
+    /// (link text, destination) of the first image `markdown` parses to.
+    fn parsed(markdown: &str) -> Option<(String, String)> {
+        let mut events = Parser::new(markdown);
+        let dest = events.find_map(|e| match e {
+            Event::Start(Tag::Image { dest_url, .. }) => Some(dest_url.to_string()),
+            _ => None,
+        })?;
+        let text = events
+            .take_while(|e| !matches!(e, Event::End(_)))
+            .filter_map(|e| match e {
+                Event::Text(t) => Some(t.to_string()),
+                _ => None,
+            })
+            .collect();
+        Some((text, dest))
+    }
+
+    #[test]
+    fn awkward_file_names_survive_as_image_references() {
+        for (name, path) in [
+            ("plain", "assets/plain.png"),
+            ("a]b", "a)b.png"),
+            ("x [1", "dir/x [1.png"),
+            ("back\\slash", "odd<name>.png"),
+        ] {
+            let markdown = format!("![{}]({})", markdown_label(name), markdown_dest(path));
+            assert_eq!(parsed(&markdown), Some((name.to_string(), path.to_string())), "{markdown}");
+        }
+        assert_eq!(markdown_dest("assets/plain.png"), "assets/plain.png");
+    }
 }

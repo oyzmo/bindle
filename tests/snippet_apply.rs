@@ -27,7 +27,7 @@ fn table_leaves_cursor_on_last_row() {
     line_start.set_line_offset(0);
     let before = buffer.text(&line_start, &cursor, false).to_string();
     assert!(matches!(
-        editor::on_enter(&before),
+        editor::on_enter(&before, ""),
         editor::EnterAction::ContinueTable { .. }
     ));
 

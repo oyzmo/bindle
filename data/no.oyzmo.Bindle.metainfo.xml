@@ -34,6 +34,17 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.22.2" date="2026-10-23">
+      <description>
+        <ul>
+          <li>Ending a table with Enter or Backspace on an empty row clears the whole row</li>
+          <li>Line numbers include the empty last line of a file</li>
+          <li>Memos search no longer shows results for an earlier query</li>
+          <li>File names with brackets or parentheses insert as working links</li>
+          <li>Ctrl+click on a link to a missing file no longer stats it on the main thread</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.22.1" date="2026-10-23">
       <description>
         <ul>
