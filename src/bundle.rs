@@ -310,6 +310,22 @@ pub fn copy_into_assets(src: &Path, assets: &Path) -> io::Result<String> {
     Ok(name)
 }
 
+/// Write `bytes` as a new file named `name` (renumbered past existing ones)
+/// inside the `assets` directory, creating it if needed; returns the stored
+/// name. Nothing already there is ever overwritten.
+pub fn write_into_assets(name: &str, bytes: &[u8], assets: &Path) -> io::Result<String> {
+    fs::create_dir_all(assets)?;
+    let stored = unique_name(name, |candidate| fs::symlink_metadata(assets.join(candidate)).is_ok());
+    let target = assets.join(&stored);
+    let mut out = fs::OpenOptions::new().write(true).create_new(true).open(&target)?;
+    if let Err(err) = out.write_all(bytes) {
+        drop(out);
+        let _ = fs::remove_file(&target);
+        return Err(err);
+    }
+    Ok(stored)
+}
+
 /// Every entry name in a zip, prefix included.
 pub fn pack_entry_names(path: &Path) -> io::Result<Vec<String>> {
     let zip = ZipArchive::new(File::open(path)?).map_err(io::Error::other)?;
@@ -475,6 +491,18 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn pasted_bytes_never_overwrite_an_existing_asset() {
+        let dir = scratch("paste");
+        let assets = dir.join("assets");
+        assert_eq!(write_into_assets("shot.png", b"one", &assets).unwrap(), "shot.png");
+        let second = write_into_assets("shot.png", b"two", &assets).unwrap();
+        assert_ne!(second, "shot.png");
+        assert_eq!(fs::read(assets.join("shot.png")).unwrap(), b"one");
+        assert_eq!(fs::read(assets.join(&second)).unwrap(), b"two");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

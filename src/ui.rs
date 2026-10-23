@@ -189,6 +189,7 @@ pub struct App {
     preview_map: RefCell<preview::SourceMap>,
     /// Clickable link ranges of the current preview.
     preview_links: RefCell<Vec<preview::Link>>,
+    preview_images: RefCell<Vec<preview::Image>>,
     /// Task list checkboxes of the current preview.
     preview_checkboxes: RefCell<Vec<preview::Checkbox>>,
     /// Collapsible heading sections of the current preview.
@@ -773,6 +774,7 @@ impl App {
             preview_pending: RefCell::new(None),
             preview_map: RefCell::new(preview::SourceMap::default()),
             preview_links: RefCell::new(Vec::new()),
+            preview_images: RefCell::new(Vec::new()),
             preview_checkboxes: RefCell::new(Vec::new()),
             preview_sections: RefCell::new(Vec::new()),
             preview_table_rows: RefCell::new(Vec::new()),
@@ -1107,6 +1109,27 @@ impl App {
         });
         self.editor.add_controller(key);
 
+        // Pasting an image (a screenshot) or image files copied in Files
+        // stores them with the document, as inserting them would. A
+        // clipboard that also offers text keeps the ordinary text paste.
+        let state = self.clone();
+        self.editor.connect_paste_clipboard(move |view| {
+            if !state.doc_kind().is_markdown() {
+                return;
+            }
+            let clipboard = view.clipboard();
+            let formats = clipboard.formats();
+            if formats.contains_type(gdk::FileList::static_type()) {
+                view.stop_signal_emission_by_name("paste-clipboard");
+                state.paste_files(clipboard);
+            } else if formats.contains_type(gdk::Texture::static_type())
+                && !formats.contains_type(String::static_type())
+            {
+                view.stop_signal_emission_by_name("paste-clipboard");
+                state.paste_image(clipboard);
+            }
+        });
+
         // Editor cursor movement (clicks, arrow keys, selecting) keeps the
         // preview centered on the same spot, not just typing.
         let state = self.clone();
@@ -1158,16 +1181,41 @@ impl App {
         });
         self.preview.add_controller(click);
 
-        // Right-click on a link: save a copy of the referenced file.
+        // Right-click on an image: "Copy Image" (one popover, refilled per
+        // click, as in the Files panel). On a link: save a copy of the
+        // referenced file. An image inside a link gets the menu.
+        let image_menu = gio::Menu::new();
+        let image_popover = gtk4::PopoverMenu::from_model(Some(&image_menu));
+        image_popover.set_parent(&self.preview);
+        image_popover.set_has_arrow(false);
+        image_popover.set_halign(gtk4::Align::Start);
         let rclick = gtk4::GestureClick::new();
         rclick.set_button(gdk::BUTTON_SECONDARY);
         let state = self.clone();
         rclick.connect_pressed(move |_, _, x, y| {
-            if let Some(dest) = state.preview_offset_at(x, y).and_then(|o| state.preview_link_at(o)) {
+            let Some(offset) = state.preview_offset_at(x, y) else { return };
+            if let Some(dest) = state.preview_image_at(offset) {
+                image_menu.remove_all();
+                let item = gio::MenuItem::new(Some("_Copy Image"), None);
+                item.set_action_and_target_value(Some("win.copy-image"), Some(&dest.to_variant()));
+                image_menu.append_item(&item);
+                image_popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+                image_popover.popup();
+            } else if let Some(dest) = state.preview_link_at(offset) {
                 state.save_attachment_dialog(&dest);
             }
         });
         self.preview.add_controller(rclick);
+
+        // Ctrl+C on a preview selection that is just an image copies the
+        // image itself; anything else copies text as before.
+        let state = self.clone();
+        self.preview.connect_copy_clipboard(move |view| {
+            if let Some(dest) = state.selected_preview_image() {
+                view.stop_signal_emission_by_name("copy-clipboard");
+                state.copy_image(&dest);
+            }
+        });
 
         // Hand cursor and tooltip while hovering a link or checkbox in the preview.
         let motion = gtk4::EventControllerMotion::new();
@@ -1330,6 +1378,15 @@ impl App {
             };
             let s = state.clone();
             state.guard_unsaved(Box::new(move || s.open_path(&path)));
+        });
+        self.window.add_action(&action);
+
+        let action = gio::SimpleAction::new("copy-image", Some(glib::VariantTy::STRING));
+        let state = self.clone();
+        action.connect_activate(move |_, param| {
+            if let Some(dest) = param.and_then(|v| v.str()) {
+                state.copy_image(dest);
+            }
         });
         self.window.add_action(&action);
 
@@ -1854,6 +1911,15 @@ impl App {
     /// bundles get the image copied into `assets/`; packs stage the bytes in
     /// memory until the next save.
     fn insert_image_markdown(&self, path: &Path) {
+        if let Some((markdown, alt)) = self.image_markdown(path) {
+            self.insert_image_reference(&markdown, &alt);
+        }
+    }
+
+    /// The `![alt](dest)` reference for `path` and its alt text, after
+    /// copying or staging the image as the document kind requires; None
+    /// (with a toast) when that failed.
+    fn image_markdown(&self, path: &Path) -> Option<(String, String)> {
         let alt = path
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
@@ -1864,14 +1930,12 @@ impl App {
                 match bundle::copy_into_assets(path, &dir.join("assets")) {
                     Ok(name) => format!("assets/{name}"),
                     Err(err) => {
-                        return self.toast(&format!("Could not copy image into bundle: {err}"))
+                        self.toast(&format!("Could not copy image into bundle: {err}"));
+                        return None;
                     }
                 }
             }
-            DocSource::Pack { path: pack, info } => match self.stage_pack_asset(pack, info, path) {
-                Some(dest) => dest,
-                None => return,
-            },
+            DocSource::Pack { path: pack, info } => self.stage_pack_asset(pack, info, path)?,
             _ => {
                 let target = match source.preview_base() {
                     Some(dir) => relative_to(&dir, path),
@@ -1883,7 +1947,7 @@ impl App {
         if dest.contains(' ') {
             dest = format!("<{dest}>");
         }
-        self.insert_image_reference(&format!("![{alt}]({dest})"), &alt);
+        Some((format!("![{alt}]({dest})"), alt))
     }
 
     /// Ask for an image URL and insert `![alt](url)`.
@@ -2013,18 +2077,127 @@ impl App {
             }
         };
         let base = file_label(&file.to_path_buf());
+        let asset = bundle::AssetSource::File(file.to_path_buf());
+        Some(self.stage_asset(&base, asset, |key| entries.contains(&format!("{}{key}", info.prefix))))
+    }
+
+    /// Stage `asset` as `assets/<base>` until the next save and return that
+    /// reference, renumbered past names another staged asset or `exists`
+    /// (the container's own entries) already use.
+    fn stage_asset(&self, base: &str, asset: bundle::AssetSource, exists: impl Fn(&str) -> bool) -> String {
         let mut staged = self.staged_assets.borrow_mut();
-        let name = bundle::unique_name(&base, |candidate| {
+        let name = bundle::unique_name(base, |candidate| {
             let key = format!("assets/{candidate}");
-            match staged.get(&key) {
-                Some(bundle::AssetSource::File(p)) => !bundle::same_file(p, file),
-                Some(bundle::AssetSource::Bytes(_)) => true,
-                None => entries.contains(&format!("{}{key}", info.prefix)),
+            match (staged.get(&key), &asset) {
+                (Some(bundle::AssetSource::File(p)), bundle::AssetSource::File(file)) => {
+                    !bundle::same_file(p, file)
+                }
+                (Some(_), _) => true,
+                (None, _) => exists(&key),
             }
         });
         let key = format!("assets/{name}");
-        staged.insert(key.clone(), bundle::AssetSource::File(file.to_path_buf()));
-        Some(key)
+        staged.insert(key.clone(), asset);
+        key
+    }
+
+    /// Paste the clipboard's image, read asynchronously (the clipboard may
+    /// belong to another process), as a PNG stored with the document.
+    fn paste_image(self: &Rc<Self>, clipboard: gdk::Clipboard) {
+        let state = self.clone();
+        glib::spawn_future_local(async move {
+            match clipboard.read_texture_future().await {
+                Ok(Some(texture)) => state.store_pasted_image(&texture.save_to_png_bytes()),
+                Ok(None) => {}
+                Err(err) => state.toast(&format!("Could not paste the image: {err}")),
+            }
+        });
+    }
+
+    /// Files copied in a file manager: image files are inserted as images
+    /// (as Insert Image would). Anything else pastes the clipboard's text,
+    /// which is what the editor would have done.
+    fn paste_files(self: &Rc<Self>, clipboard: gdk::Clipboard) {
+        let state = self.clone();
+        glib::spawn_future_local(async move {
+            let files = clipboard
+                .read_value_future(gdk::FileList::static_type(), glib::Priority::DEFAULT)
+                .await
+                .ok()
+                .and_then(|value| value.get::<gdk::FileList>().ok())
+                .map(|list| list.files())
+                .unwrap_or_default();
+            let images: Vec<PathBuf> =
+                files.iter().filter_map(|f| f.path()).filter(|p| is_image_file(p)).collect();
+            if images.is_empty() {
+                if let Ok(Some(text)) = clipboard.read_text_future().await {
+                    let editable = state.editor.is_editable();
+                    state.buffer.delete_selection(true, editable);
+                    state.buffer.insert_interactive_at_cursor(&text, editable);
+                }
+                return;
+            }
+            let refs: Vec<(String, String)> =
+                images.iter().filter_map(|path| state.image_markdown(path)).collect();
+            if let [(markdown, alt)] = refs.as_slice() {
+                return state.paste_reference(markdown, 2, alt.chars().count() as i32);
+            }
+            let markdown = refs.iter().map(|(md, _)| md.as_str()).collect::<Vec<_>>().join("\n");
+            state.paste_reference(&markdown, markdown.chars().count() as i32, 0);
+        });
+    }
+
+    /// Store pasted PNG bytes where an inserted image of this document goes:
+    /// a plain file's or bundle's `assets/` directly; a pack, an imported
+    /// .odt or an unsaved document stage them in memory until it is saved
+    /// (Save As then writes them out, see `write_to`).
+    fn store_pasted_image(&self, png: &[u8]) {
+        let name = glib::DateTime::now_local()
+            .and_then(|now| now.format("pasted-%Y%m%d-%H%M%S.png"))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|_| "pasted.png".to_string());
+        let source = self.source.borrow().clone();
+        let assets_dir = match &source {
+            DocSource::Bundle { dir, .. } => dir.join("assets"),
+            DocSource::Plain(doc) => match doc.parent() {
+                Some(dir) => dir.join("assets"),
+                None => return self.toast("The document has no folder to store the image in"),
+            },
+            DocSource::Pack { path, info } => {
+                let entries = match bundle::pack_entry_names(path) {
+                    Ok(entries) => entries,
+                    Err(err) => return self.toast(&format!("Could not read the pack: {err}")),
+                };
+                let asset = bundle::AssetSource::Bytes(png.to_vec());
+                let dest = self.stage_asset(&name, asset, |key| {
+                    entries.contains(&format!("{}{key}", info.prefix))
+                });
+                return self.paste_image_reference(&dest);
+            }
+            DocSource::None | DocSource::Odt { .. } => {
+                let dest = self.stage_asset(&name, bundle::AssetSource::Bytes(png.to_vec()), |_| false);
+                return self.paste_image_reference(&dest);
+            }
+        };
+        match bundle::write_into_assets(&name, png, &assets_dir) {
+            Ok(stored) => self.paste_image_reference(&format!("assets/{stored}")),
+            Err(err) => self.toast(&format!("Could not store the image: {err}")),
+        }
+    }
+
+    fn paste_image_reference(&self, dest: &str) {
+        let alt = "image";
+        let markdown = format!("![{alt}]({})", wrap_spaces(dest.to_string()));
+        self.paste_reference(&markdown, 2, alt.len() as i32);
+    }
+
+    /// `insert_reference` replacing the selection, as a paste does — one
+    /// undo step for both.
+    fn paste_reference(&self, markdown: &str, sel_start: i32, sel_len: i32) {
+        self.buffer.begin_user_action();
+        self.buffer.delete_selection(true, self.editor.is_editable());
+        self.insert_reference(markdown, sel_start, sel_len);
+        self.buffer.end_user_action();
     }
 
     fn show_insert_popover(&self) {
@@ -2267,9 +2440,13 @@ impl App {
         let source = self.source.borrow().clone();
         let base = source.preview_base();
         // Pack and ODT assets are read lazily out of the zip (staged ones
-        // from memory), never extracted to disk.
+        // from memory), never extracted to disk. An unsaved document needs
+        // the loader too once it holds pasted images, which live only in
+        // memory until the first save.
         let pack_ctx = source.archive();
-        let loader = pack_ctx.as_ref().map(|(path, info)| {
+        let pasted = matches!(source, DocSource::None) && !self.staged_assets.borrow().is_empty();
+        let archive = pack_ctx.as_ref();
+        let loader = (archive.is_some() || pasted).then(|| {
             move |rel: &str| {
                 match self.staged_assets.borrow().get(rel) {
                     Some(bundle::AssetSource::Bytes(bytes)) => return Some(bytes.clone()),
@@ -2278,6 +2455,14 @@ impl App {
                     }
                     None => {}
                 }
+                let Some((path, info)) = archive else {
+                    // Nothing else of an unsaved document is relative.
+                    let path = Path::new(rel);
+                    return path
+                        .is_absolute()
+                        .then(|| bundle::read_file_capped(path, bundle::ASSET_MAX_BYTES))
+                        .flatten();
+                };
                 if let Some(bytes) = self.pack_bytes_cache.borrow().get(rel) {
                     return Some(bytes.clone());
                 }
@@ -2375,6 +2560,7 @@ impl App {
         }
         *self.preview_map.borrow_mut() = rendered.source_map;
         *self.preview_links.borrow_mut() = rendered.links;
+        *self.preview_images.borrow_mut() = rendered.images;
         *self.preview_checkboxes.borrow_mut() = rendered.checkboxes;
         *self.preview_sections.borrow_mut() = rendered.sections;
         *self.preview_table_rows.borrow_mut() = rendered.table_rows;
@@ -2481,6 +2667,48 @@ impl App {
             .iter()
             .find(|link| offset >= link.start && offset < link.end)
             .map(|link| link.dest.clone())
+    }
+
+    /// The reference of the image thumbnail at a preview char offset, if any.
+    fn preview_image_at(&self, offset: i32) -> Option<String> {
+        // Rendered in document order, so sorted by `offset`.
+        let images = self.preview_images.borrow();
+        let i = images.partition_point(|image| image.offset < offset);
+        images.get(i).filter(|image| image.offset == offset).map(|image| image.dest.clone())
+    }
+
+    /// The image the preview selection consists of: exactly one thumbnail,
+    /// give or take surrounding whitespace.
+    fn selected_preview_image(&self) -> Option<String> {
+        let buffer = self.preview.buffer();
+        let (start, end) = buffer.selection_bounds()?;
+        let images = self.preview_images.borrow();
+        let mut inside = images.iter().filter(|i| i.offset >= start.offset() && i.offset < end.offset());
+        let image = inside.next()?;
+        if inside.next().is_some() {
+            return None;
+        }
+        let text = buffer.slice(&start, &end, true);
+        text.chars().all(|c| c == '\u{FFFC}' || c.is_whitespace()).then(|| image.dest.clone())
+    }
+
+    /// Put the full-size original of an image reference on the clipboard —
+    /// not the preview's thumbnail. Web images are only held as thumbnails,
+    /// so they are refused rather than copied small.
+    fn copy_image(&self, dest: &str) {
+        if external_link(dest) {
+            return self.toast("Web images can't be copied; open the link instead");
+        }
+        let texture = self
+            .resolve_asset_bytes(dest)
+            .and_then(|bytes| gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)).ok());
+        match texture {
+            Some(texture) => {
+                self.preview.clipboard().set_texture(&texture);
+                self.toast("Image copied");
+            }
+            None => self.toast("Could not read the image"),
+        }
     }
 
     /// The task list checkbox glyph at a preview char offset, if any.
@@ -3497,14 +3725,21 @@ impl App {
         if !self.has_local_refs() {
             return self.save_as_markdown(then);
         }
-        let dialog = adw::AlertDialog::new(
-            Some("Keep Attached Files?"),
-            Some(
-                "This document references local images or attachments. \
-                 A plain markdown file will not contain them; \
-                 a TextPack keeps everything in one file.",
-            ),
-        );
+        // An unsaved document's only local assets are pasted images, and
+        // Markdown Only does keep those (see `write_pasted_images`).
+        let body = if matches!(*self.source.borrow(), DocSource::None)
+            && bundle::local_asset_dests(&self.text())
+                .iter()
+                .all(|d| self.staged_assets.borrow().contains_key(&bundle::decode_dest(d)))
+        {
+            "Pasted images are saved into an assets folder next to a markdown file; \
+             a TextPack keeps everything in one file."
+        } else {
+            "This document references local images or attachments. \
+             A plain markdown file will not contain them; \
+             a TextPack keeps everything in one file."
+        };
+        let dialog = adw::AlertDialog::new(Some("Keep Attached Files?"), Some(body));
         dialog.add_responses(&[
             ("cancel", "_Cancel"),
             ("md", "_Markdown Only"),
@@ -3556,6 +3791,9 @@ impl App {
 
     /// Write the buffer to a plain markdown file (Save As always saves plain).
     fn write_to(self: &Rc<Self>, path: &Path, then: Option<Box<dyn FnOnce()>>) {
+        if let Err(err) = self.write_pasted_images(path) {
+            return self.toast(&format!("Could not save the pasted images: {err}"));
+        }
         match doc::write_atomic(path, self.text().as_bytes()) {
             Ok(()) => {
                 let old_kind = self.doc_kind();
@@ -3585,6 +3823,53 @@ impl App {
             }
             Err(err) => self.toast(&format!("Could not save: {err}")),
         }
+    }
+
+    /// Before saving as plain markdown at `path`: write images that exist
+    /// only in memory (pasted into an unsaved document or a pack) into the
+    /// `assets/` folder beside it, where their `assets/…` references point.
+    /// A name already taken there is renumbered and the buffer's reference
+    /// follows it, as one undoable edit.
+    fn write_pasted_images(&self, path: &Path) -> std::io::Result<()> {
+        let pasted: Vec<(String, Vec<u8>)> = self
+            .staged_assets
+            .borrow()
+            .iter()
+            .filter_map(|(key, source)| match source {
+                bundle::AssetSource::Bytes(bytes) => Some((key.clone(), bytes.clone())),
+                bundle::AssetSource::File(_) => None,
+            })
+            .collect();
+        if pasted.is_empty() {
+            return Ok(());
+        }
+        let text = self.text().to_string();
+        let referenced: HashSet<String> =
+            bundle::local_asset_dests(&text).iter().map(|d| bundle::decode_dest(d)).collect();
+        let assets = path.parent().unwrap_or(Path::new(".")).join("assets");
+        let mut renames = Vec::new();
+        for (key, bytes) in pasted {
+            // A paste since deleted (or undone) leaves nothing behind.
+            if !referenced.contains(&key) {
+                continue;
+            }
+            let name = key.strip_prefix("assets/").unwrap_or(&key);
+            let stored = bundle::write_into_assets(name, &bytes, &assets)?;
+            if stored != name {
+                renames.push((key.clone(), stored));
+            }
+        }
+        let rewritten = bundle::rewrite_asset_dests(&text, &renames);
+        if rewritten != text {
+            let offset = self.buffer.iter_at_mark(&self.buffer.get_insert()).offset();
+            self.buffer.begin_user_action();
+            let (mut start, mut end) = self.buffer.bounds();
+            self.buffer.delete(&mut start, &mut end);
+            self.buffer.insert(&mut self.buffer.start_iter(), &rewritten);
+            self.buffer.end_user_action();
+            self.buffer.place_cursor(&self.buffer.iter_at_offset(offset));
+        }
+        Ok(())
     }
 
     // --- TextPack export ---
@@ -5192,6 +5477,17 @@ fn external_link(dest: &str) -> bool {
 /// Wrap a markdown destination in <> when it contains spaces.
 fn wrap_spaces(dest: String) -> String {
     if dest.contains(' ') { format!("<{dest}>") } else { dest }
+}
+
+/// Whether gdk-pixbuf can load `path`, by extension alone — a clipboard
+/// path may sit on a hung mount, so no stat or read on the main loop.
+fn is_image_file(path: &Path) -> bool {
+    let Some(ext) = path.extension().map(|e| e.to_string_lossy().to_lowercase()) else {
+        return false;
+    };
+    gtk4::gdk_pixbuf::Pixbuf::formats()
+        .iter()
+        .any(|format| format.extensions().iter().any(|e| e.as_str() == ext))
 }
 
 /// Express `target` relative to directory `base` (both absolute); falls back

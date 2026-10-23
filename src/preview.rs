@@ -352,6 +352,7 @@ struct Renderer<'a> {
     /// Links currently open (start preview offset, destination).
     open_links: Vec<(i32, String)>,
     links: Vec<Link>,
+    images: Vec<Image>,
     checkboxes: Vec<Checkbox>,
     /// Collapsible sections collected for the rendered headings.
     sections: Vec<Section>,
@@ -419,6 +420,14 @@ pub struct Link {
     /// Preview char range showing the link text.
     pub start: i32,
     pub end: i32,
+    pub dest: String,
+}
+
+/// A thumbnail in the rendered preview: the one object-replacement char
+/// holding it, and the image reference it shows (as written in the source).
+#[derive(Clone)]
+pub struct Image {
+    pub offset: i32,
     pub dest: String,
 }
 
@@ -618,8 +627,10 @@ impl<'a> Renderer<'a> {
                 // ends, so a thumbnail inserted now would land above the
                 // table (and drop the cell's alt text). Cells get the
                 // placeholder: an image can't sit in a monospace column anyway.
+                let at = self.buffer.end_iter().offset();
                 if self.table.is_none() && self.try_insert_image(&dest_url) {
                     self.in_rendered_image = true;
+                    self.images.push(Image { offset: at, dest: dest_url.to_string() });
                 } else {
                     self.insert("🖼 ");
                     self.tags.push("italic");
@@ -1222,6 +1233,8 @@ pub struct Rendered {
     pub source_map: SourceMap,
     /// Clickable link ranges in the preview.
     pub links: Vec<Link>,
+    /// Images shown as thumbnails, in document order.
+    pub images: Vec<Image>,
     /// Task list checkboxes, in document order.
     pub checkboxes: Vec<Checkbox>,
     /// Collapsible heading sections, in document order.
@@ -1275,6 +1288,7 @@ pub fn render_fitted(
         map: SourceMap::default(),
         open_links: Vec::new(),
         links: Vec::new(),
+        images: Vec::new(),
         checkboxes: Vec::new(),
         sections: Vec::new(),
         table_rows: Vec::new(),
@@ -1297,6 +1311,7 @@ pub fn render_fitted(
         saw_remote: renderer.saw_remote,
         source_map: renderer.map,
         links: renderer.links,
+        images: renderer.images,
         checkboxes: renderer.checkboxes,
         sections,
         table_rows: renderer.table_rows,
@@ -1322,6 +1337,7 @@ pub fn render_plain(buffer: &gtk4::TextBuffer, text: &str, wrap: bool) -> Render
         saw_remote: false,
         source_map: map,
         links: Vec::new(),
+        images: Vec::new(),
         checkboxes: Vec::new(),
         sections: Vec::new(),
         table_rows: Vec::new(),

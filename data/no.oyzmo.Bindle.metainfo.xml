@@ -34,6 +34,16 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.22.0" date="2026-10-23">
+      <description>
+        <p>Preview: right-click an image → Copy Image, or select it and press Ctrl+C, copies the full-size image</p>
+      </description>
+    </release>
+    <release version="1.21.0" date="2026-10-23">
+      <description>
+        <p>Paste images into markdown documents: stored in assets/, or kept in memory until the first save</p>
+      </description>
+    </release>
     <release version="1.20.1" date="2026-10-22">
       <description>
         <p>Preview: Ctrl+C copies a word selected there instead of going to the editor</p>
