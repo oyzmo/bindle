@@ -16,6 +16,7 @@ pub struct Settings {
     pub vpaned: i32,
     /// Position of the divider between the Files panel and the panels below.
     pub files_paned: i32,
+    #[serde(with = "path_json::opt")]
     pub last_file: Option<PathBuf>,
     /// Remote image policy: "ask" (per document), "always" or "never".
     pub remote_images: String,
@@ -65,9 +66,11 @@ pub struct Settings {
     /// DOC_STATE_MAX documents.
     pub doc_state: Vec<DocState>,
     /// Recently opened documents, most recent first, capped at RECENT_MAX.
+    #[serde(with = "path_json::list")]
     pub recent_files: Vec<PathBuf>,
     /// Files frozen in the Files panel: kept there whatever falls off
     /// `recent_files`, until unfrozen, removed, or found to be gone.
+    #[serde(with = "path_json::list")]
     pub frozen_files: Vec<PathBuf>,
 }
 
@@ -82,6 +85,7 @@ pub const DOC_STATE_MAX: usize = 200;
 #[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(default)]
 pub struct DocState {
+    #[serde(with = "path_json")]
     pub path: PathBuf,
     /// Collapsed section keys.
     pub collapsed: Vec<String>,
@@ -283,14 +287,23 @@ impl Settings {
     /// anything that doesn't.
     pub fn load() -> Settings {
         let path = path();
-        let Ok(text) = fs::read_to_string(&path) else {
-            return Settings::default();
+        let bad = path.with_extension("json.bad");
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                // Unreadable but present: the next save replaces it.
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    let _ = fs::copy(&path, &bad);
+                }
+                return Settings::default();
+            }
         };
-        if let Ok(settings) = serde_json::from_str(&text) {
+        if let Ok(settings) = serde_json::from_slice(&bytes) {
             return settings;
         }
-        let _ = fs::copy(&path, path.with_extension("json.bad"));
-        serde_json::from_str(&text).map(salvage).unwrap_or_default()
+        let _ = fs::copy(&path, &bad);
+        // Lossy only here: a stray non-UTF-8 byte costs the value it sits in.
+        serde_json::from_str(&String::from_utf8_lossy(&bytes)).map(salvage).unwrap_or_default()
     }
 
     pub fn save(&self) {
@@ -322,6 +335,75 @@ fn salvage(value: serde_json::Value) -> Settings {
     serde_json::from_value(Value::Object(good)).unwrap_or_default()
 }
 
+/// Paths as JSON strings, or as byte arrays when they are not UTF-8. A Linux
+/// file name need not be, and serde's own `PathBuf` impl refuses those —
+/// which failed the whole settings save for as long as one such file stayed
+/// in the recent list.
+mod path_json {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::path::{Path, PathBuf};
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        Text(String),
+        Bytes(Vec<u8>),
+    }
+
+    impl From<&Path> for Repr {
+        fn from(path: &Path) -> Repr {
+            match path.to_str() {
+                Some(s) => Repr::Text(s.to_string()),
+                None => Repr::Bytes(path.as_os_str().as_bytes().to_vec()),
+            }
+        }
+    }
+
+    impl From<Repr> for PathBuf {
+        fn from(repr: Repr) -> PathBuf {
+            match repr {
+                Repr::Text(s) => PathBuf::from(s),
+                Repr::Bytes(b) => PathBuf::from(OsString::from_vec(b)),
+            }
+        }
+    }
+
+    pub fn serialize<S: Serializer>(path: &Path, s: S) -> Result<S::Ok, S::Error> {
+        Repr::from(path).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<PathBuf, D::Error> {
+        Repr::deserialize(d).map(PathBuf::from)
+    }
+
+    pub mod opt {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(path: &Option<PathBuf>, s: S) -> Result<S::Ok, S::Error> {
+            path.as_deref().map(Repr::from).serialize(s)
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<PathBuf>, D::Error> {
+            Ok(Option::<Repr>::deserialize(d)?.map(PathBuf::from))
+        }
+    }
+
+    pub mod list {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(paths: &[PathBuf], s: S) -> Result<S::Ok, S::Error> {
+            s.collect_seq(paths.iter().map(|p| Repr::from(p.as_path())))
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<PathBuf>, D::Error> {
+            Ok(Vec::<Repr>::deserialize(d)?.into_iter().map(PathBuf::from).collect())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -351,6 +433,24 @@ mod tests {
         assert_eq!(settings.width, Settings::default().width);
         assert!(!settings.open_last);
         assert_eq!(settings.recent_files, [PathBuf::from("/c/a.md")]);
+    }
+
+    #[test]
+    fn non_utf8_paths_save_and_load_back() {
+        use std::os::unix::ffi::OsStringExt;
+        let odd = PathBuf::from(std::ffi::OsString::from_vec(b"/c/bl\xE5.md".to_vec()));
+        let plain = PathBuf::from("/c/a.md");
+        let mut settings = Settings::default();
+        settings.last_file = Some(odd.clone());
+        settings.recent_files = vec![odd.clone(), plain.clone()];
+        settings.doc_state = vec![DocState { path: odd.clone(), ..Default::default() }];
+        let json = serde_json::to_string(&settings).expect("serializes");
+        // UTF-8 paths keep their old, readable string form.
+        assert!(json.contains("\"/c/a.md\""));
+        let back: Settings = serde_json::from_str(&json).expect("parses");
+        assert_eq!(back.last_file, Some(odd.clone()));
+        assert_eq!(back.recent_files, [odd.clone(), plain]);
+        assert_eq!(back.doc_state[0].path, odd);
     }
 
     #[test]

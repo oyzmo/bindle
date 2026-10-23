@@ -86,10 +86,19 @@ impl DocKind {
 /// Never lossy UTF-8: that turns every non-ASCII byte of an old Latin-1
 /// file into U+FFFD, and the next save writes those over the original for
 /// good. Both fallbacks map every byte to a character, so nothing is lost.
+///
+/// A byte-order mark is dropped (Notepad writes one, and it would sit in
+/// front of the first heading); one that says UTF-16 decodes as UTF-16.
 pub fn read_text(path: &Path) -> io::Result<(String, Option<&'static str>)> {
     let bytes = fs::read(path)?;
+    if let Some(text) = utf16(&bytes) {
+        return Ok((normalize_newlines(text), Some("UTF-16")));
+    }
     let (text, legacy) = match String::from_utf8(bytes) {
-        Ok(s) => (s, None),
+        Ok(s) => match s.strip_prefix('\u{FEFF}') {
+            Some(rest) => (rest.to_string(), None),
+            None => (s, None),
+        },
         Err(err) => {
             let bytes = err.into_bytes();
             if DocKind::of(path) == DocKind::Nfo {
@@ -99,11 +108,31 @@ pub fn read_text(path: &Path) -> io::Result<(String, Option<&'static str>)> {
             }
         }
     };
+    Ok((normalize_newlines(text), legacy))
+}
+
+fn normalize_newlines(text: String) -> String {
     if text.contains('\r') {
-        Ok((text.replace("\r\n", "\n").replace('\r', "\n"), legacy))
+        text.replace("\r\n", "\n").replace('\r', "\n")
     } else {
-        Ok((text, legacy))
+        text
     }
+}
+
+/// `bytes` decoded as UTF-16 if they start with its byte-order mark and are
+/// valid UTF-16 after it; `None` sends them down the 8-bit paths instead.
+fn utf16(bytes: &[u8]) -> Option<String> {
+    let from: fn([u8; 2]) -> u16 = match bytes {
+        [0xFF, 0xFE, ..] => u16::from_le_bytes,
+        [0xFE, 0xFF, ..] => u16::from_be_bytes,
+        _ => return None,
+    };
+    let body = &bytes[2..];
+    if body.len() % 2 != 0 {
+        return None;
+    }
+    let units: Vec<u16> = body.chunks_exact(2).map(|c| from([c[0], c[1]])).collect();
+    String::from_utf16(&units).ok()
 }
 
 /// Replace `path` by writing a hidden sibling temp file with `write`,
@@ -138,7 +167,7 @@ pub fn replace_via_temp(
     if original.is_some() {
         options.mode(0o600);
     }
-    let mut file = options.open(&tmp).map_err(Replace::Unsupported)?;
+    let mut file = options.open(&tmp).map_err(Replace::refused)?;
     if let Some(perms) = original {
         let _ = file.set_permissions(perms);
     }
@@ -154,7 +183,7 @@ pub fn replace_via_temp(
     }
     if let Err(err) = fs::rename(&tmp, &target) {
         let _ = fs::remove_file(&tmp);
-        return Err(Replace::Unsupported(err));
+        return Err(Replace::refused(err));
     }
     Ok(())
 }
@@ -165,9 +194,36 @@ pub enum Replace {
     Failed(io::Error),
 }
 
+impl Replace {
+    /// The temp file or the rename was refused. Out of space is *not*
+    /// `Unsupported`: creating a file can fail with ENOSPC/EDQUOT too (no
+    /// free inodes, btrfs, tmpfs), and the in-place fallback would then
+    /// truncate the original before failing the same way.
+    fn refused(err: io::Error) -> Replace {
+        match err.kind() {
+            io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded => Replace::Failed(err),
+            _ => Replace::Unsupported(err),
+        }
+    }
+}
+
 /// `path` with symlinks resolved, or as given when it does not exist yet.
+/// A dangling symlink resolves to where it points, so writing creates the
+/// target and the link survives instead of being replaced by a plain file.
 fn resolve(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    if let Ok(real) = fs::canonicalize(path) {
+        return real;
+    }
+    let mut path = path.to_path_buf();
+    // Bounded like the kernel's own loop limit, so a link cycle ends.
+    for _ in 0..40 {
+        let Ok(target) = fs::read_link(&path) else { break };
+        path = match path.parent() {
+            Some(dir) => dir.join(target),
+            None => target,
+        };
+    }
+    path
 }
 
 /// Replace `path` with `data` without ever leaving it half-written: write a
@@ -246,8 +302,15 @@ pub fn wait_for_path(path: &Path) {
 /// existing path, so keys that merely narrow the location down are dropped.
 fn mount_spec_uri(dir: &str) -> Option<String> {
     let (kind, spec) = dir.split_once(':')?;
-    let fields: Vec<(&str, &str)> = spec.split(',').filter_map(|f| f.split_once('=')).collect();
-    let field = |key: &str| fields.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
+    // Values are URI-escaped in the spec (`/` as %2F, `:` as %3A, …).
+    let fields: Vec<(&str, String)> = spec
+        .split(',')
+        .filter_map(|f| f.split_once('='))
+        .map(|(k, v)| (k, glib::Uri::unescape_string(v, None).map_or_else(|| v.to_string(), String::from)))
+        .collect();
+    let field = |key: &str| fields.iter().find(|(k, _)| *k == key).map(|(_, v)| v.as_str());
+    // Escaped for a URI component; `;`, `:`, `@` and `/` are separators.
+    let part = |s: &str| glib::Uri::escape_string(s, Some("!$&'()*+="), true).to_string();
     let scheme = match kind {
         // One WebDAV backend, with TLS flagged in the spec instead of the type.
         "dav" | "davs" => {
@@ -265,10 +328,22 @@ fn mount_spec_uri(dir: &str) -> Option<String> {
     let host = field("host").or_else(|| field("server"))?;
     let mut uri = format!("{scheme}://");
     if let Some(user) = field("user") {
-        uri.push_str(user);
+        // SMB's `DOMAIN;user`, without which the mount asks again or fails.
+        if let Some(domain) = field("domain") {
+            uri.push_str(&part(domain));
+            uri.push(';');
+        }
+        uri.push_str(&part(user));
         uri.push('@');
     }
-    uri.push_str(host);
+    if host.contains(':') && !host.starts_with('[') {
+        // An IPv6 literal.
+        uri.push('[');
+        uri.push_str(host);
+        uri.push(']');
+    } else {
+        uri.push_str(host);
+    }
     if let Some(port) = field("port") {
         uri.push(':');
         uri.push_str(port);
@@ -277,10 +352,9 @@ fn mount_spec_uri(dir: &str) -> Option<String> {
     // A prefix means the mount was rooted below the server's own root; the
     // share (SMB) or volume (AFP) name plays the same part.
     if let Some(prefix) = field("prefix") {
-        let raw = glib::Uri::unescape_string(prefix, None)?;
-        uri.push_str(glib::Uri::escape_string(&raw, Some("/"), true).trim_start_matches('/'));
+        uri.push_str(glib::Uri::escape_string(prefix, Some("/"), true).trim_start_matches('/'));
     } else if let Some(name) = field("share").or_else(|| field("volume")) {
-        uri.push_str(name);
+        uri.push_str(&part(name));
     }
     Some(uri)
 }
@@ -384,6 +458,14 @@ mod tests {
             mount_spec_uri("smb-share:server=nas,share=media,user=bob").as_deref(),
             Some("smb://bob@nas/media")
         );
+        assert_eq!(
+            mount_spec_uri("smb-share:domain=WORK,server=nas,share=my%20files,user=bob").as_deref(),
+            Some("smb://WORK;bob@nas/my%20files")
+        );
+        assert_eq!(
+            mount_spec_uri("sftp:host=fe80%3A%3A1,port=22").as_deref(),
+            Some("sftp://[fe80::1]:22/")
+        );
         // Not a mount spec at all.
         assert_eq!(mount_spec_uri("Documents"), None);
         assert_eq!(mount_spec_uri("mtp:no-host=1"), None);
@@ -436,6 +518,40 @@ mod tests {
         assert_eq!(text, "blåbær €5 \u{81}");
         assert_eq!(legacy, Some("Windows-1252"));
         assert!(!text.contains('\u{FFFD}'));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn byte_order_marks() {
+        let dir = std::env::temp_dir().join(format!("bindle-bom-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.md");
+        fs::write(&path, b"\xEF\xBB\xBF# T\r\n").unwrap();
+        assert_eq!(read_text(&path).unwrap(), ("# T\n".to_string(), None));
+        let mut le = vec![0xFF, 0xFE];
+        le.extend("# blå\r\n".encode_utf16().flat_map(u16::to_le_bytes));
+        fs::write(&path, &le).unwrap();
+        assert_eq!(read_text(&path).unwrap(), ("# blå\n".to_string(), Some("UTF-16")));
+        let mut be = vec![0xFE, 0xFF];
+        be.extend("æ".encode_utf16().flat_map(u16::to_be_bytes));
+        fs::write(&path, &be).unwrap();
+        assert_eq!(read_text(&path).unwrap().0, "æ");
+        // Odd length is not UTF-16 after all: 8-bit fallback, nothing lost.
+        fs::write(&path, b"\xFF\xFEa").unwrap();
+        assert_eq!(read_text(&path).unwrap(), ("ÿþa".to_string(), Some("Windows-1252")));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn atomic_write_through_a_dangling_symlink_keeps_the_link() {
+        let dir = std::env::temp_dir().join(format!("bindle-dangling-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let link = dir.join("link.md");
+        std::os::unix::fs::symlink("real.md", &link).unwrap();
+        write_atomic(&link, b"new").unwrap();
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_to_string(dir.join("real.md")).unwrap(), "new");
         fs::remove_dir_all(&dir).unwrap();
     }
 

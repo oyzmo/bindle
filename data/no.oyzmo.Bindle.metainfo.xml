@@ -28,6 +28,17 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.24.1" date="2026-10-23">
+      <description>
+        <ul>
+          <li>Settings save again after opening a file whose name is not UTF-8</li>
+          <li>A full disk no longer risks truncating the file being saved</li>
+          <li>UTF-8 byte-order marks are dropped and UTF-16 files open correctly</li>
+          <li>Saving through a dangling symlink keeps the link</li>
+          <li>Network shares with a Windows domain or an IPv6 address reconnect</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.24.0" date="2026-10-23">
       <description>
         <p>Memos support removed: Bindle no longer talks to a Memos server or the keyring, and needs about 140 fewer crates to build</p>
