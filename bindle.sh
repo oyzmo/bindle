@@ -167,6 +167,20 @@ cleanup_build() {
     esac
 }
 
+# Maintainer only: dev/ is not in the source zip, so the menu shows this step
+# only in a checkout that has both scripts. GitHub gets the filtered copy of
+# master first (the release is tagged there), then the dist/ files; the release
+# script shows the notes and asks before publishing.
+github_scripts() {
+    [ -x "$SCRIPT_DIR/dev/push-github.sh" ] && [ -x "$SCRIPT_DIR/dev/release-github.sh" ]
+}
+
+release_github() {
+    bold "Pushing master to GitHub…"
+    "$SCRIPT_DIR/dev/push-github.sh" || { err "Push failed — nothing released."; return 1; }
+    "$SCRIPT_DIR/dev/release-github.sh"
+}
+
 uninstall_app() {
     bold "Uninstalling Bindle…"
     rm -f "$BIN_DIR/bindle" "$DESKTOP_DIR/$APP_ID.desktop" "$ICON_DIR/$APP_ID.svg" \
@@ -189,6 +203,7 @@ while true; do
     echo "  6) Remove template"
     echo "  7) Make distribution (source zip + flatpak → dist/)"
     echo "  8) Cleanup (delete temporary build files)"
+    github_scripts && echo "  9) Release newest version on GitHub (from dist/)"
     echo "  q) Quit"
     read -rp "Choose: " choice
     case "$choice" in
@@ -200,6 +215,7 @@ while true; do
         6) remove_template ;;
         7) make_distribution ;;
         8) cleanup_build ;;
+        9) if github_scripts; then release_github; else err "Unknown choice."; fi ;;
         q|Q) exit 0 ;;
         *) err "Unknown choice." ;;
     esac
