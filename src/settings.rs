@@ -91,6 +91,13 @@ pub struct DocState {
     pub collapsed: Vec<String>,
     /// The preview occupied the main pane when the document was last shown.
     pub view: bool,
+    /// Where the document was left: the editor cursor, and the first visible
+    /// line of the editor and of the preview, all as source char offsets —
+    /// text positions rather than pixels, so they survive a different
+    /// window width or font size.
+    pub cursor: i32,
+    pub editor_top: i32,
+    pub preview_top: i32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

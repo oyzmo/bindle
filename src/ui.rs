@@ -201,6 +201,9 @@ pub struct App {
     /// Per-document remembered state (folds, view mode), MRU-ordered,
     /// persisted in settings.
     doc_state: RefCell<Vec<DocState>>,
+    /// Source offset the next document-load render scrolls the preview's top
+    /// to, from the document's remembered position; taken by any render.
+    restore_preview_top: Cell<Option<i32>>,
     /// Recently opened documents, most recent first, persisted in settings.
     recent_files: RefCell<Vec<PathBuf>>,
     /// Generation counter for async opens; a completion whose sequence no
@@ -765,6 +768,7 @@ impl App {
             line_pick: Cell::new(None),
             collapsed: RefCell::new(HashSet::new()),
             doc_state: RefCell::new(settings.doc_state.clone()),
+            restore_preview_top: Cell::new(None),
             recent_files: RefCell::new(settings.recent_files.clone()),
             files_order: RefCell::new(settings.recent_files.clone()),
             frozen_files: RefCell::new(settings.frozen_files.clone()),
@@ -1294,6 +1298,7 @@ impl App {
         // Close: persist layout, confirm if there are unsaved changes.
         let state = self.clone();
         self.window.connect_close_request(move |_| {
+            state.remember_position();
             state.persist_settings();
             if state.modified.get() {
                 let destroy = state.clone();
@@ -2459,6 +2464,7 @@ impl App {
     /// deferred mark scroll visibly scans from the top on long documents
     /// while the fresh layout validates.
     fn render_preview(self: &Rc<Self>, keep_position: bool) {
+        let restore_top = self.restore_preview_top.take().filter(|_| !keep_position);
         let adj = self.preview.vadjustment();
         let restore = match (&adj, keep_position) {
             (Some(adj), true) => adj.value(),
@@ -2610,7 +2616,23 @@ impl App {
         self.remote_banner.set_revealed(
             rendered.saw_remote && policy == RemotePolicy::Ask && !self.doc_allows_remote.get(),
         );
-        if let Some(adj) = adj {
+        let restore_iter = restore_top
+            .and_then(|top| self.preview_map.borrow().preview_offset(top))
+            .filter(|&offset| offset > 0)
+            .map(|offset| {
+                let mut iter = live.iter_at_offset(offset);
+                iter.set_line_offset(0);
+                iter
+            });
+        if let Some(iter) = restore_iter {
+            // A remembered spot in a freshly loaded document: the layout is
+            // not validated yet, so this has to be a queued mark scroll.
+            if let Some(adj) = &adj {
+                adj.set_value(adj.lower());
+            }
+            let mark = self.preview_scroll_mark(&iter);
+            self.preview.scroll_to_mark(&mark, 0.0, true, 0.0, 0.0);
+        } else if let Some(adj) = adj {
             adj.set_value(restore);
             // Hold the position through the relayout: height revalidation can
             // clamp or shift the value between now and the next few paints,
@@ -3033,9 +3055,52 @@ impl App {
         let mut collapsed: Vec<String> = self.collapsed.borrow().iter().cloned().collect();
         collapsed.sort();
         let mut store = self.doc_state.borrow_mut();
-        store.retain(|d| d.path != path);
-        store.insert(0, DocState { path, collapsed, view: self.view_mode.get() });
+        // The position is only taken when the document is left
+        // (`remember_position`): right after a load the views have not been
+        // laid out yet and would report the top.
+        let old = store.iter().position(|d| d.path == path).map(|i| store.remove(i));
+        let (cursor, editor_top, preview_top) =
+            old.map_or((0, 0, 0), |d| (d.cursor, d.editor_top, d.preview_top));
+        store.insert(
+            0,
+            DocState { path, collapsed, view: self.view_mode.get(), cursor, editor_top, preview_top },
+        );
         store.truncate(DOC_STATE_MAX);
+    }
+
+    /// Record where the current document was left — cursor, and the first
+    /// visible line of the editor and the preview — so reopening it (from the
+    /// Files panel, or next session) comes back to the same spot. A view
+    /// that is not on screen keeps what was recorded before.
+    fn remember_position(&self) {
+        if !self.remember_folds.get() {
+            return;
+        }
+        self.sync_doc_state();
+        let Some(path) = self.source.borrow().container().map(Path::to_path_buf) else {
+            return;
+        };
+        let mut store = self.doc_state.borrow_mut();
+        let Some(doc) = store.iter_mut().find(|d| d.path == path) else {
+            return;
+        };
+        doc.cursor = self.buffer.iter_at_mark(&self.buffer.get_insert()).offset();
+        if self.editor.is_mapped() {
+            let rect = self.editor.visible_rect();
+            if let Some(iter) = self.editor.iter_at_location(rect.x(), rect.y()) {
+                doc.editor_top = iter.offset();
+            }
+        }
+        if self.preview.is_mapped() {
+            let rect = self.preview.visible_rect();
+            let top = self.preview.iter_at_location(rect.x(), rect.y()).map(|mut iter| {
+                iter.set_line_offset(0);
+                iter.offset()
+            });
+            if let Some(top) = top.and_then(|top| self.preview_map.borrow().source_offset(top)) {
+                doc.preview_top = top;
+            }
+        }
     }
 
     /// Open a link destination with the system default application.
@@ -3417,6 +3482,8 @@ impl App {
     // --- Document state ---
 
     fn load_text(self: &Rc<Self>, text: &str, source: DocSource) {
+        // Still the outgoing document's source and views.
+        self.remember_position();
         self.loading.set(true);
         // Toggling undo off clears the history of the previous document.
         self.buffer.set_enable_undo(false);
@@ -3430,6 +3497,7 @@ impl App {
         self.staged_assets.borrow_mut().clear();
         self.forget_asset_reads();
         preview::reset_loader_cache();
+        self.restore_position();
         {
             // Restore this document's remembered folds; unknown keys are
             // pruned by the next render.
@@ -3464,6 +3532,45 @@ impl App {
         // Not the editor unconditionally: in view mode with the Preview panel
         // off it is hidden, and focus would land nowhere.
         self.focus_main();
+    }
+
+    /// Put the cursor and the editor back where `remember_position` left this
+    /// document, and queue the preview's spot for the render that follows.
+    /// The cursor moves under `loading`, so it doesn't count as an edit or
+    /// make the preview follow it.
+    fn restore_position(&self) {
+        self.restore_preview_top.set(None);
+        let Some(path) = self.source.borrow().container().filter(|_| self.remember_folds.get())
+            .map(Path::to_path_buf)
+        else {
+            return;
+        };
+        let Some((cursor, editor_top, preview_top)) = self
+            .doc_state
+            .borrow()
+            .iter()
+            .find(|d| d.path == path)
+            .map(|d| (d.cursor, d.editor_top, d.preview_top))
+        else {
+            return;
+        };
+        let total = self.buffer.char_count();
+        self.loading.set(true);
+        self.buffer.place_cursor(&self.buffer.iter_at_offset(cursor.clamp(0, total)));
+        self.loading.set(false);
+        if editor_top > 0 && editor_top < total {
+            let mut iter = self.buffer.iter_at_offset(editor_top);
+            iter.set_line_offset(0);
+            let mark = match self.buffer.mark("restore-top") {
+                Some(mark) => {
+                    self.buffer.move_mark(&mark, &iter);
+                    mark
+                }
+                None => self.buffer.create_mark(Some("restore-top"), &iter, true),
+            };
+            self.editor.scroll_to_mark(&mark, 0.0, true, 0.0, 0.0);
+        }
+        self.restore_preview_top.set((preview_top > 0).then_some(preview_top));
     }
 
     /// The document kind decides the layout: markdown gets the panels and
