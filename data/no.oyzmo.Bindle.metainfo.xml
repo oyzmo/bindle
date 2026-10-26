@@ -28,6 +28,11 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.27.4" date="2026-10-26">
+      <description>
+        <p>Flatpak publishing moved to shared tools used by all oyzmo apps</p>
+      </description>
+    </release>
     <release version="1.27.3" date="2026-10-26">
       <description>
         <p>bindle.sh: release menu (bump, full release, publish flatpak updates, key backup)</p>

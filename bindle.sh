@@ -213,24 +213,11 @@ bump_version() {
 FLATPAK_SITE="${FLATPAK_SITE:-/mnt/mycode/flatpak}"
 
 publish_flatpak() {
-    if [ ! -d "$FLATPAK_SITE/.git" ]; then
+    if [ ! -x "$FLATPAK_SITE/tools/push.sh" ]; then
         err "No Flatpak site at $FLATPAK_SITE."
         return 1
     fi
-    git -C "$FLATPAK_SITE" fetch -q origin 2>/dev/null
-    local pending
-    pending="$(git -C "$FLATPAK_SITE" log --format='  %s' origin/master..master 2>/dev/null)"
-    if [ -z "$pending" ]; then
-        ok "flatpak.oyzmo.no is up to date — nothing new to publish."
-        return 0
-    fi
-    echo "  Not yet on flatpak.oyzmo.no:"
-    echo "$pending"
-    read -rp "Publish now? [y/N] " answer
-    [[ "$answer" == [yY]* ]] || { echo "  Cancelled."; return 0; }
-    git -C "$FLATPAK_SITE" push -q origin master || { err "Push to GitHub failed."; return 1; }
-    git -C "$FLATPAK_SITE" push -q nas master || err "Backup push to the NAS failed (GitHub is fine)."
-    ok "Published. GNOME Software shows the update within a few minutes."
+    "$FLATPAK_SITE/tools/push.sh"
 }
 
 # Everything after the bump: dist/ (which also publishes into the Flatpak
@@ -250,45 +237,10 @@ full_release() {
     fi
 }
 
-# The signing key exists only on this machine; if it is lost, no update can be
-# signed again and everyone has to reinstall. This keeps an exported copy in a
-# private repo on the NAS. Restore with: gpg --homedir <dir> --import <file>
-FLATPAK_KEYS="$HOME/.local/share/oyzmo-flatpak"
+# Exports the signing key into a private repo on the NAS (the site's
+# tools/backup-key.sh, shared with the other apps' menus).
 backup_key() {
-    local gnupg="$FLATPAK_KEYS/gnupg" dir="$FLATPAK_KEYS/backup"
-    local key=D7E0928E8C3C9F337EDB33C082C73A44E2040291 repo=oyzmo-flatpak-key
-    if ! gpg --homedir "$gnupg" --list-secret-keys "$key" >/dev/null 2>&1; then
-        err "No signing key in $gnupg."
-        return 1
-    fi
-    mkdir -p "$dir" && chmod 700 "$dir"
-    (umask 077; gpg --homedir "$gnupg" --armor --export-secret-keys "$key" \
-        > "$dir/oyzmo-flatpak-key.asc") || { err "Export failed."; return 1; }
-    cp "$gnupg/openpgp-revocs.d/$key.rev" "$dir/" 2>/dev/null
-    printf '%s\n' "Signing key for flatpak.oyzmo.no. Restore on a new machine with:" \
-        "  mkdir -p -m 700 $gnupg && gpg --homedir $gnupg --import oyzmo-flatpak-key.asc" \
-        > "$dir/README"
-    if [ ! -d "$dir/.git" ]; then
-        git -C "$dir" init -q -b master
-        git -C "$dir" config user.name oyzmo
-        git -C "$dir" config user.email 74640760+oyzmo@users.noreply.github.com
-        git -C "$dir" remote add nas "softserve:$repo.git"
-        # Private before the first push, so the key is never readable.
-        ssh softserve repo create "$repo" --private --hidden 2>/dev/null
-    fi
-    ssh softserve repo private "$repo" true || { err "Could not make $repo private — not pushing."; return 1; }
-    git -C "$dir" add -A
-    git -C "$dir" diff --cached --quiet || git -C "$dir" commit -q -m "Signing key backup"
-    git -C "$dir" push -q nas master || { err "Push to the NAS failed."; return 1; }
-    local check
-    check="$(mktemp -d /tmp/keycheck.XXXXXX)"
-    if git clone -q "softserve:$repo.git" "$check/r" && \
-            gpg --show-keys --with-colons "$check/r/oyzmo-flatpak-key.asc" 2>/dev/null | grep -q "$key"; then
-        ok "Key backed up to softserve:$repo.git (private) and verified."
-    else
-        err "The NAS copy did not verify."
-    fi
-    rm -rf "$check"
+    "$FLATPAK_SITE/tools/backup-key.sh"
 }
 
 uninstall_app() {
