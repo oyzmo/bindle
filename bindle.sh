@@ -192,6 +192,56 @@ uninstall_app() {
     echo "  (Settings in ~/.config/bindle are kept; delete that folder to remove them.)"
 }
 
+# Swap an installed Bindle flatpak for the newest bundle in dist/ (or next to
+# this script, where buildflatpak.sh puts it by default). GNOME Software only
+# offers "Open" for a bundle of an app that is already installed, so a newer
+# bundle never replaces the old one by double-clicking. Uninstalling keeps the
+# app's data (~/.var/app/$APP_ID).
+reinstall_flatpak() {
+    if ! command -v flatpak >/dev/null; then
+        err "flatpak not found."
+        return 1
+    fi
+    local bundle
+    local f
+    # Newest by file name — the folder path may hold dashes of its own.
+    bundle="$(for f in "$SCRIPT_DIR"/dist/bindle-*.flatpak "$SCRIPT_DIR"/bindle-*.flatpak; do
+        [ -f "$f" ] && printf '%s\t%s\n' "$(basename "$f")" "$f"
+    done | sort -V | tail -1 | cut -f2-)"
+    if [ -z "$bundle" ]; then
+        err "No bindle-*.flatpak found in dist/ — make one with option 7 first."
+        return 1
+    fi
+    # Installed per user, system-wide (what Software does) or both; a copy
+    # left in the other one would keep shadowing the new install.
+    local scope found=() version
+    for scope in user system; do
+        version="$(flatpak info --"$scope" "$APP_ID" 2>/dev/null | sed -n 's/^ *Version: //p')"
+        if flatpak info --"$scope" "$APP_ID" >/dev/null 2>&1; then
+            found+=("$scope")
+            echo "  Installed ($scope): ${version:-unknown version}"
+        fi
+    done
+    [ ${#found[@]} -eq 0 ] && echo "  Not installed yet."
+    echo "  New:  $(basename "$bundle")"
+    read -rp "Uninstall the old and install this one? [y/N] " answer
+    [[ "$answer" == [yY]* ]] || { echo "  Cancelled."; return 0; }
+    for scope in "${found[@]}"; do
+        bold "Uninstalling ($scope)…"
+        flatpak uninstall --"$scope" -y --noninteractive "$APP_ID" || { err "Uninstall failed."; return 1; }
+    done
+    # Back where it was; a first install goes per user, no password needed.
+    scope="user"
+    [ ${#found[@]} -eq 1 ] && scope="${found[0]}"
+    bold "Installing $(basename "$bundle") ($scope)…"
+    if flatpak install --"$scope" -y --noninteractive "$bundle"; then
+        ok "Installed $(flatpak info --"$scope" "$APP_ID" | sed -n 's/^ *Version: //p')."
+    else
+        err "Install failed."
+        return 1
+    fi
+}
+
 while true; do
     echo
     bold "── Bindle ───────────────────────────────"
@@ -204,6 +254,7 @@ while true; do
     echo "  7) Make distribution (source zip + flatpak → dist/)"
     echo "  8) Cleanup (delete temporary build files)"
     github_scripts && echo "  9) Release newest version on GitHub (from dist/)"
+    echo " 10) Replace installed flatpak with the newest one (from dist/)"
     echo "  q) Quit"
     read -rp "Choose: " choice
     case "$choice" in
@@ -216,6 +267,7 @@ while true; do
         7) make_distribution ;;
         8) cleanup_build ;;
         9) if github_scripts; then release_github; else err "Unknown choice."; fi ;;
+        10) reinstall_flatpak ;;
         q|Q) exit 0 ;;
         *) err "Unknown choice." ;;
     esac
