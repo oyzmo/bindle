@@ -28,6 +28,11 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.27.7" date="2026-10-26">
+      <description>
+        <p>GitHub release text shows the install command in its own code block</p>
+      </description>
+    </release>
     <release version="1.27.6" date="2026-10-26">
       <description>
         <p>Release scripts give up after 10 seconds, with a clear message, when GitHub can't be reached over SSH</p>
