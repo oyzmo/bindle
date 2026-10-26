@@ -29,10 +29,18 @@ A tiny Markdown editor for GNOME, written in Rust with GTK4 + Libadwaita. Create
 Grab the latest `.flatpak` bundle from [GitHub Releases](https://github.com/oyzmo/bindle/releases/latest) or [oyzmo.no/apps](https://oyzmo.no/apps) and install it:
 
 ```sh
-flatpak install bindle-1.27.1.flatpak
+flatpak install bindle-1.27.2.flatpak
 ```
 
 or just double-click it in GNOME Software. Works on any Linux desktop with Flatpak set up; the GNOME runtime is fetched automatically if you don't have it.
+
+Or install straight from the [oyzmo Flatpak repo](https://flatpak.oyzmo.no/):
+
+```sh
+flatpak install https://flatpak.oyzmo.no/bindle.flatpakref
+```
+
+Either way, new versions then show up in GNOME Software's Updates (or with `flatpak update`). A copy installed from a bundle older than 1.27.2 doesn't know where updates come from: uninstall it once and install again (your settings are kept).
 
 You can also build the Flatpak yourself from the included manifest:
 
@@ -45,8 +53,8 @@ flatpak-builder --user --install --force-clean build-dir no.oyzmo.Bindle.yml
 First download the source zip (`bindle-<version>-src.zip`) from [GitHub Releases](https://github.com/oyzmo/bindle/releases/latest) or [oyzmo.no/apps](https://oyzmo.no/apps) and unpack it:
 
 ```sh
-unzip bindle-1.27.1-src.zip
-cd bindle-1.27.1
+unzip bindle-1.27.2-src.zip
+cd bindle-1.27.2
 ```
 
 Then run the helper menu:

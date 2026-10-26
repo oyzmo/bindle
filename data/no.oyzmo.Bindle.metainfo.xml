@@ -28,6 +28,11 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.27.2" date="2026-10-26">
+      <description>
+        <p>Flatpak installs now get updates from flatpak.oyzmo.no, also in GNOME Software</p>
+      </description>
+    </release>
     <release version="1.27.1" date="2026-10-26">
       <description>
         <p>bindle.sh: menu option to replace an installed Bindle flatpak with the newest bundle</p>
