@@ -50,6 +50,8 @@ pub struct Settings {
     pub line_numbers: bool,
     /// Source line numbers in the preview's gutter.
     pub preview_line_numbers: bool,
+    /// A bar in the preview's margin beside the part the editor shows.
+    pub preview_viewport: bool,
     /// Long lines wrap in the editor (NFO/DIZ art never does).
     pub word_wrap: bool,
     /// Editor font size: "small", "normal", "large" or "xlarge".
@@ -271,6 +273,7 @@ impl Default for Settings {
             keyword_highlight: true,
             line_numbers: false,
             preview_line_numbers: false,
+            preview_viewport: true,
             word_wrap: true,
             editor_font: "normal".to_string(),
             preview_font: "normal".to_string(),

@@ -75,6 +75,24 @@ fn shoot(app: &adw::Application, path: Option<std::path::PathBuf>) {
             entry.set_text(&query);
         }
     }
+    // UISHOT_SCROLL=0.5 scrolls the focused view (the editor, normally)
+    // that far down its document after the action delay — for checking
+    // what follows editor scrolling.
+    if let Some(frac) = std::env::var("UISHOT_SCROLL").ok().and_then(|v| v.parse::<f64>().ok()) {
+        let app = app.clone();
+        let delay = env_ms("UISHOT_ACTION_DELAY", 0) + 200;
+        glib::timeout_add_local_once(Duration::from_millis(delay), move || {
+            if let Some(scroll) = app
+                .active_window()
+                .and_then(|w| GtkWindowExt::focus(&w))
+                .and_then(|w| w.ancestor(gtk4::ScrolledWindow::static_type()))
+                .and_then(|w| w.downcast::<gtk4::ScrolledWindow>().ok())
+            {
+                let adj = scroll.vadjustment();
+                adj.set_value(adj.lower() + frac * (adj.upper() - adj.lower() - adj.page_size()));
+            }
+        });
+    }
     let app = app.clone();
     // The shot waits out the action delay on top of its own, so raising one
     // never silently cuts off the other.

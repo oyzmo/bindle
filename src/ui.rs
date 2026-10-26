@@ -28,6 +28,9 @@ thread_local! {
 
 /// Horizontal padding on each side of the line numbers in the gutter.
 const GUTTER_PAD: i32 = 8;
+/// Width of the preview's viewport bar, and the space either side of it.
+const VIEWPORT_BAR: i32 = 4;
+const VIEWPORT_BAR_GAP: i32 = 3;
 
 /// Text width "Fit preview to width" fits into the panel, in ems of the
 /// chosen preview font — roughly a full reading line (~80 characters).
@@ -220,6 +223,10 @@ pub struct App {
     /// Set while a preview click moves the editor cursor, so the
     /// cursor-follow handler doesn't scroll the preview back.
     syncing_cursor: Cell<bool>,
+    /// Until this monotonic time (µs) editor scrolling doesn't drag the
+    /// preview along: the editor is scrolling to a spot picked in the
+    /// preview, which must stay where the user clicked it.
+    preview_leads_until: Cell<i64>,
     remote_policy: Cell<RemotePolicy>,
     /// Per-document consent to load remote images (reset on new/open).
     doc_allows_remote: Cell<bool>,
@@ -251,6 +258,9 @@ pub struct App {
     /// `preview_line_numbers` is on.
     preview_gutter: gtk4::DrawingArea,
     preview_line_numbers: Cell<bool>,
+    /// The viewport bar in the preview gutter: marks the preview lines
+    /// behind what the editor currently shows (`draw_viewport_bar`).
+    preview_viewport: Cell<bool>,
     /// Editor word wrap; overridden off for kinds that need exact line
     /// widths (`DocKind::wrap_lines`), never written back.
     word_wrap: Cell<bool>,
@@ -595,9 +605,10 @@ impl App {
         view_section.append(Some("Fit preview to wi_dth"), Some("win.preview-fit"));
         view_section.append(Some("Line _numbers"), Some("win.line-numbers"));
         view_section.append(Some("Line numbers in p_review"), Some("win.preview-line-numbers"));
+        view_section.append(Some("Show editor _position in preview"), Some("win.preview-viewport"));
         view_section.append(Some("_Word wrap"), Some("win.word-wrap"));
         view_section.append(Some("Highlight _keywords"), Some("win.keyword-highlight"));
-        view_section.append(Some("Preview follows _cursor"), Some("win.follow-cursor"));
+        view_section.append(Some("Preview follows _editor"), Some("win.follow-cursor"));
         menu.append_section(None, &view_section);
 
         let behavior_section = gio::Menu::new();
@@ -777,6 +788,7 @@ impl App {
             recent_menu,
             remember_folds: Cell::new(settings.remember_folds),
             syncing_cursor: Cell::new(false),
+            preview_leads_until: Cell::new(0),
             remote_policy: Cell::new(RemotePolicy::from_str(&settings.remote_images)),
             doc_allows_remote: Cell::new(false),
             color_scheme: Cell::new(ColorScheme::from_str(&settings.color_scheme)),
@@ -794,6 +806,7 @@ impl App {
             line_numbers: Cell::new(settings.line_numbers),
             preview_gutter: gtk4::DrawingArea::new(),
             preview_line_numbers: Cell::new(settings.preview_line_numbers),
+            preview_viewport: Cell::new(settings.preview_viewport),
             word_wrap: Cell::new(settings.word_wrap),
             editor_font: Cell::new(FontSize::from_str(&settings.editor_font)),
             preview_font: Cell::new(FontSize::from_str(&settings.preview_font)),
@@ -812,7 +825,7 @@ impl App {
         state.apply_panels();
         state.apply_fonts();
         state.apply_line_numbers(settings.line_numbers);
-        state.apply_preview_line_numbers(settings.preview_line_numbers);
+        state.apply_preview_gutter();
         state.apply_wrap();
         if settings.horizontal {
             state.apply_horizontal(true);
@@ -902,11 +915,18 @@ impl App {
             if state.line_numbers.get() {
                 state.gutter.queue_draw();
             }
+            if state.preview_viewport.get() {
+                state.preview_gutter.queue_draw();
+            }
+            state.sync_preview_to_editor();
         });
         let state = self.clone();
         adj.connect_changed(move |_| {
             if state.line_numbers.get() {
                 state.gutter.queue_draw();
+            }
+            if state.preview_viewport.get() {
+                state.preview_gutter.queue_draw();
             }
         });
 
@@ -951,6 +971,15 @@ impl App {
             }
         });
         self.preview_gutter.add_controller(click);
+        // The viewport bar shows only while the editor is on screen, which
+        // view mode and the panel toggles change without scrolling anything.
+        for signal in ["map", "unmap"] {
+            let gutter = self.preview_gutter.clone();
+            self.editor.connect_local(signal, false, move |_| {
+                gutter.queue_draw();
+                None
+            });
+        }
         // Resizing the window, the panes or the gutter changes the text
         // area's width, which tables are wrapped to.
         if let Some(adj) = self.preview.hadjustment() {
@@ -1525,7 +1554,22 @@ impl App {
             let enabled = !state.preview_line_numbers.get();
             action.set_state(&enabled.to_variant());
             state.preview_line_numbers.set(enabled);
-            state.apply_preview_line_numbers(enabled);
+            state.apply_preview_gutter();
+            state.persist_settings();
+        });
+        self.window.add_action(&action);
+
+        let action = gio::SimpleAction::new_stateful(
+            "preview-viewport",
+            None,
+            &self.preview_viewport.get().to_variant(),
+        );
+        let state = self.clone();
+        action.connect_activate(move |action, _| {
+            let enabled = !state.preview_viewport.get();
+            action.set_state(&enabled.to_variant());
+            state.preview_viewport.set(enabled);
+            state.apply_preview_gutter();
             state.persist_settings();
         });
         self.window.add_action(&action);
@@ -3277,6 +3321,7 @@ impl App {
                     self.syncing_cursor.set(false);
                     // Mirror the selection but keep focus on the preview, so
                     // Ctrl+C copies the word just selected there.
+                    self.preview_leads();
                     self.editor
                         .scroll_to_mark(&self.buffer.get_insert(), 0.0, true, 0.0, 0.5);
                     return;
@@ -3306,6 +3351,7 @@ impl App {
 
     /// Center the editor vertically on its cursor and focus it.
     fn center_editor_on_cursor(&self) {
+        self.preview_leads();
         self.editor
             .scroll_to_mark(&self.buffer.get_insert(), 0.0, true, 0.0, 0.5);
         self.editor.grab_focus();
@@ -4450,9 +4496,11 @@ impl App {
         self.gutter.queue_draw();
     }
 
-    /// Attach or detach the source-line gutter on the preview's left window.
-    fn apply_preview_line_numbers(&self, on: bool) {
-        if on {
+    /// Attach the preview gutter on the preview's left window while it has
+    /// anything to show — source line numbers, the viewport bar or both —
+    /// and detach it otherwise.
+    fn apply_preview_gutter(&self) {
+        if self.preview_line_numbers.get() || self.preview_viewport.get() {
             self.preview.set_gutter(gtk4::TextWindowType::Left, Some(&self.preview_gutter));
             self.update_preview_gutter();
         } else {
@@ -4460,16 +4508,138 @@ impl App {
         }
     }
 
-    /// Size the preview gutter to the widest source line number and redraw.
+    /// Size the preview gutter — the widest source line number, plus room
+    /// for the viewport bar at its left edge — and redraw.
     fn update_preview_gutter(&self) {
-        if !self.preview_line_numbers.get() {
+        let bar = if self.preview_viewport.get() { VIEWPORT_BAR + 2 * VIEWPORT_BAR_GAP } else { 0 };
+        let numbers = if self.preview_line_numbers.get() {
+            let digits = self.buffer.line_count().to_string().len().max(2);
+            let layout = self.preview.create_pango_layout(Some(&"8".repeat(digits)));
+            layout.pixel_size().0 + 2 * GUTTER_PAD - if bar > 0 { GUTTER_PAD } else { 0 }
+        } else {
+            0
+        };
+        if bar + numbers == 0 {
             return;
         }
-        let digits = self.buffer.line_count().to_string().len().max(2);
-        let layout = self.preview.create_pango_layout(Some(&"8".repeat(digits)));
-        let (w, _) = layout.pixel_size();
-        self.preview_gutter.set_content_width(w + 2 * GUTTER_PAD);
+        self.preview_gutter.set_content_width(bar + numbers);
         self.preview_gutter.queue_draw();
+    }
+
+    /// The preview's buffer-y range (top, bottom) behind what the editor
+    /// shows; None while the editor is out of sight. Each end is placed
+    /// within its source line by how far down that line the editor's edge
+    /// cuts, so the bar glides as the editor scrolls instead of jumping a
+    /// paragraph at a time.
+    fn viewport_yrange(&self) -> Option<(f64, f64)> {
+        if !self.editor.is_mapped() {
+            return None;
+        }
+        let rect = self.editor.visible_rect();
+        let top = self.preview_y_for_editor_y(rect.y())?;
+        let bottom = self.preview_y_for_editor_y(rect.y() + rect.height())?;
+        Some((top, bottom.max(top)))
+    }
+
+    /// Where the editor's buffer-y `y` falls in the preview: between the
+    /// preview spots of the source line under it and the next one.
+    fn preview_y_for_editor_y(&self, y: i32) -> Option<f64> {
+        let (line, line_top) = self.editor.line_at_y(y);
+        let (_, height) = self.editor.line_yrange(&line);
+        let frac = if height > 0 { ((y - line_top) as f64 / height as f64).clamp(0.0, 1.0) } else { 0.0 };
+        let a = self.preview_line_y(line.line())?;
+        let b = self.preview_line_y(line.line() + 1).unwrap_or(a).max(a);
+        Some(a as f64 + frac * (b - a) as f64)
+    }
+
+    /// The preview buffer-y where source line `line` starts showing: through
+    /// the source map, or by recorded row for table lines, whose padded
+    /// columns the map can't place. Past the last line, the preview's end.
+    /// A folded section's body has no height, so its lines all land on the
+    /// heading's fold.
+    fn preview_line_y(&self, line: i32) -> Option<i32> {
+        let live = self.preview.buffer();
+        if line >= self.buffer.line_count() {
+            let (y, h) = self.preview.line_yrange(&live.end_iter());
+            return Some(y + h);
+        }
+        let source = self.buffer.iter_at_line(line)?;
+        let row = self.preview_table_rows.borrow().iter().find_map(|r| {
+            let s = r.source?;
+            (self.buffer.iter_at_offset(s).line() + r.separator as i32 == line).then_some(r.start)
+        });
+        let offset = match row {
+            Some(start) => start,
+            None => self.preview_map.borrow().preview_offset(source.offset())?,
+        };
+        let iter = live.iter_at_offset(offset.clamp(0, live.char_count()));
+        Some(self.preview.iter_location(&iter).y())
+    }
+
+    /// Scroll the preview along with the editor ("Preview follows editor"),
+    /// keeping the viewport bar in sight: the bar sits as far down the
+    /// preview as the editor is scrolled down the document, so both reach
+    /// top and bottom together. A bar taller than the preview slides the
+    /// same way, from its top edge showing to its bottom edge showing.
+    fn sync_preview_to_editor(&self) {
+        if !self.follow_cursor.get()
+            || self.loading.get()
+            || !self.preview_visible()
+            || glib::monotonic_time() < self.preview_leads_until.get()
+        {
+            return;
+        }
+        let Some((top, bottom)) = self.viewport_yrange() else {
+            return;
+        };
+        let Some(adj) = self.preview.vadjustment() else {
+            return;
+        };
+        let editor = self.editor_scroll.vadjustment();
+        let span = editor.upper() - editor.lower() - editor.page_size();
+        let f = if span > 0.0 { ((editor.value() - editor.lower()) / span).clamp(0.0, 1.0) } else { 0.0 };
+        let target = top - f * (adj.page_size() - (bottom - top));
+        // Buffer y and adjustment value differ by the view's margins, so
+        // move by the difference rather than assigning the target.
+        let delta = target - self.preview.visible_rect().y() as f64;
+        let value = (adj.value() + delta).clamp(adj.lower(), adj.upper() - adj.page_size());
+        if (value - adj.value()).abs() >= 1.0 {
+            adj.set_value(value);
+        }
+    }
+
+    /// Hold off `sync_preview_to_editor` while the editor scrolls to a spot
+    /// picked in the preview.
+    fn preview_leads(&self) {
+        self.preview_leads_until.set(glib::monotonic_time() + 400_000);
+    }
+
+    /// Paint the viewport bar at the gutter's left edge, rounded, in the
+    /// palette's link colour. A sliver still shows where a fold collapses
+    /// the range to nothing.
+    fn draw_viewport_bar(&self, cr: &gtk4::cairo::Context, height: i32) {
+        let Some((top, bottom)) = self.viewport_yrange() else {
+            return;
+        };
+        let (_, top) = self.preview.buffer_to_window_coords(gtk4::TextWindowType::Left, 0, top.round() as i32);
+        let (_, bottom) = self.preview.buffer_to_window_coords(gtk4::TextWindowType::Left, 0, bottom.round() as i32);
+        let bottom = bottom.max(top + VIEWPORT_BAR);
+        if bottom < 0 || top > height {
+            return;
+        }
+        let colors = theme::tags(self.theme.get(), adw::StyleManager::default().is_dark());
+        let Ok(color) = gdk::RGBA::parse(colors.link) else {
+            return;
+        };
+        cr.set_source_rgba(color.red() as f64, color.green() as f64, color.blue() as f64, 0.7);
+        let (x, w) = (VIEWPORT_BAR_GAP as f64, VIEWPORT_BAR as f64);
+        let (y0, y1) = (top.max(-w as i32) as f64, bottom.min(height + w as i32) as f64);
+        let r = w / 2.0;
+        cr.new_sub_path();
+        cr.arc(x + r, y0 + r, r, std::f64::consts::PI, 0.0);
+        cr.arc(x + r, y1 - r, r, 0.0, std::f64::consts::PI);
+        cr.close_path();
+        let _ = cr.fill();
     }
 
     /// Paint the preview gutter: each visible preview line gets the number
@@ -4479,6 +4649,12 @@ impl App {
     /// with headings drawn larger; on a row much taller than the number (an
     /// image) it sits at the top instead.
     fn draw_preview_gutter(&self, area: &gtk4::DrawingArea, cr: &gtk4::cairo::Context, width: i32, height: i32) {
+        if self.preview_viewport.get() {
+            self.draw_viewport_bar(cr, height);
+        }
+        if !self.preview_line_numbers.get() {
+            return;
+        }
         let view = &self.preview;
         let live = view.buffer();
         let picked = live.tag_table().lookup("line-pick");
@@ -4932,6 +5108,7 @@ impl App {
             ("show-preview", enabled),
             ("view-mode", enabled),
             ("preview-line-numbers", enabled),
+            ("preview-viewport", enabled),
             ("preview-fit", enabled),
             ("word-wrap", kind.wrap_lines()),
         ] {
@@ -5001,6 +5178,7 @@ impl App {
             keyword_highlight: self.keyword_highlight.get(),
             line_numbers: self.line_numbers.get(),
             preview_line_numbers: self.preview_line_numbers.get(),
+            preview_viewport: self.preview_viewport.get(),
             word_wrap: self.word_wrap.get(),
             editor_font: self.editor_font.get().as_str().to_string(),
             preview_font: self.preview_font.get().as_str().to_string(),
