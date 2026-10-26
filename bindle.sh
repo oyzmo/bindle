@@ -181,6 +181,116 @@ release_github() {
     "$SCRIPT_DIR/dev/release-github.sh"
 }
 
+current_version() {
+    sed -n 's/^version = "\(.*\)"/\1/p' "$SCRIPT_DIR/Cargo.toml" | head -1
+}
+
+# bump.sh plus a commit of just the files it touches, so the release steps
+# after it (which clone master) see the new version.
+bump_version() {
+    local level notes=() note
+    echo "  Now at $(current_version)."
+    read -rp "Bump which part? [p]atch (fixes) / [m]inor (features) / ma[j]or: " level
+    case "$level" in
+        p|P|patch) level=patch ;;
+        m|M|minor) level=minor ;;
+        j|J|major) level=major ;;
+        *) echo "  Cancelled."; return 0 ;;
+    esac
+    echo "  What changed? One short line per note; an empty line ends."
+    while read -rp "  note: " note && [ -n "$note" ]; do
+        notes+=("$note")
+    done
+    [ ${#notes[@]} -gt 0 ] || { err "At least one note is needed."; return 1; }
+    "$SCRIPT_DIR/bump.sh" "$level" "${notes[@]}" || return 1
+    git -C "$SCRIPT_DIR" commit -q -m "Bindle $(current_version)" -- \
+        Cargo.toml Cargo.lock README.md data/$APP_ID.metainfo.xml \
+        && ok "Committed Bindle $(current_version)."
+}
+
+# The oyzmo Flatpak site that buildflatpak.sh publishes into; pushing it to
+# GitHub is what makes the update appear in GNOME Software.
+FLATPAK_SITE="${FLATPAK_SITE:-/mnt/mycode/flatpak}"
+
+publish_flatpak() {
+    if [ ! -d "$FLATPAK_SITE/.git" ]; then
+        err "No Flatpak site at $FLATPAK_SITE."
+        return 1
+    fi
+    git -C "$FLATPAK_SITE" fetch -q origin 2>/dev/null
+    local pending
+    pending="$(git -C "$FLATPAK_SITE" log --format='  %s' origin/master..master 2>/dev/null)"
+    if [ -z "$pending" ]; then
+        ok "flatpak.oyzmo.no is up to date — nothing new to publish."
+        return 0
+    fi
+    echo "  Not yet on flatpak.oyzmo.no:"
+    echo "$pending"
+    read -rp "Publish now? [y/N] " answer
+    [[ "$answer" == [yY]* ]] || { echo "  Cancelled."; return 0; }
+    git -C "$FLATPAK_SITE" push -q origin master || { err "Push to GitHub failed."; return 1; }
+    git -C "$FLATPAK_SITE" push -q nas master || err "Backup push to the NAS failed (GitHub is fine)."
+    ok "Published. GNOME Software shows the update within a few minutes."
+}
+
+# Everything after the bump: dist/ (which also publishes into the Flatpak
+# site), NAS backup, flatpak.oyzmo.no, GitHub release.
+full_release() {
+    if ! git -C "$SCRIPT_DIR" diff --quiet HEAD; then
+        err "There are uncommitted changes — commit them first, a release is built from master."
+        return 1
+    fi
+    bold "Full release of Bindle $(current_version)"
+    make_distribution || { err "Stopped: the distribution failed."; return 1; }
+    bold "Backing up to the NAS…"
+    git -C "$SCRIPT_DIR" push -q nas master || err "NAS push failed — continuing."
+    publish_flatpak || err "flatpak.oyzmo.no was not updated."
+    if github_scripts; then
+        release_github || err "The GitHub release failed (see above)."
+    fi
+}
+
+# The signing key exists only on this machine; if it is lost, no update can be
+# signed again and everyone has to reinstall. This keeps an exported copy in a
+# private repo on the NAS. Restore with: gpg --homedir <dir> --import <file>
+FLATPAK_KEYS="$HOME/.local/share/oyzmo-flatpak"
+backup_key() {
+    local gnupg="$FLATPAK_KEYS/gnupg" dir="$FLATPAK_KEYS/backup"
+    local key=D7E0928E8C3C9F337EDB33C082C73A44E2040291 repo=oyzmo-flatpak-key
+    if ! gpg --homedir "$gnupg" --list-secret-keys "$key" >/dev/null 2>&1; then
+        err "No signing key in $gnupg."
+        return 1
+    fi
+    mkdir -p "$dir" && chmod 700 "$dir"
+    (umask 077; gpg --homedir "$gnupg" --armor --export-secret-keys "$key" \
+        > "$dir/oyzmo-flatpak-key.asc") || { err "Export failed."; return 1; }
+    cp "$gnupg/openpgp-revocs.d/$key.rev" "$dir/" 2>/dev/null
+    printf '%s\n' "Signing key for flatpak.oyzmo.no. Restore on a new machine with:" \
+        "  mkdir -p -m 700 $gnupg && gpg --homedir $gnupg --import oyzmo-flatpak-key.asc" \
+        > "$dir/README"
+    if [ ! -d "$dir/.git" ]; then
+        git -C "$dir" init -q -b master
+        git -C "$dir" config user.name oyzmo
+        git -C "$dir" config user.email 74640760+oyzmo@users.noreply.github.com
+        git -C "$dir" remote add nas "softserve:$repo.git"
+        # Private before the first push, so the key is never readable.
+        ssh softserve repo create "$repo" --private --hidden 2>/dev/null
+    fi
+    ssh softserve repo private "$repo" true || { err "Could not make $repo private — not pushing."; return 1; }
+    git -C "$dir" add -A
+    git -C "$dir" diff --cached --quiet || git -C "$dir" commit -q -m "Signing key backup"
+    git -C "$dir" push -q nas master || { err "Push to the NAS failed."; return 1; }
+    local check
+    check="$(mktemp -d /tmp/keycheck.XXXXXX)"
+    if git clone -q "softserve:$repo.git" "$check/r" && \
+            gpg --show-keys --with-colons "$check/r/oyzmo-flatpak-key.asc" 2>/dev/null | grep -q "$key"; then
+        ok "Key backed up to softserve:$repo.git (private) and verified."
+    else
+        err "The NAS copy did not verify."
+    fi
+    rm -rf "$check"
+}
+
 uninstall_app() {
     bold "Uninstalling Bindle…"
     rm -f "$BIN_DIR/bindle" "$DESKTOP_DIR/$APP_ID.desktop" "$ICON_DIR/$APP_ID.svg" \
@@ -251,10 +361,16 @@ while true; do
     echo "  4) Uninstall"
     echo "  5) Install “New Document” template (Files right-click)"
     echo "  6) Remove template"
-    echo "  7) Make distribution (source zip + flatpak → dist/)"
     echo "  8) Cleanup (delete temporary build files)"
-    github_scripts && echo "  9) Release newest version on GitHub (from dist/)"
     echo " 10) Replace installed flatpak with the newest one (from dist/)"
+    bold "── Release (in this order) ──────────────"
+    echo " 11) Bump version (asks for notes, commits)"
+    echo " 13) Full release: 7 → NAS → 12 → 9 in one go"
+    echo "     or step by step:"
+    echo "  7)   Make distribution (source zip + flatpak → dist/ and the Flatpak site)"
+    echo " 12)   Publish flatpak updates (flatpak.oyzmo.no → GNOME Software)"
+    github_scripts && echo "  9)   Release newest version on GitHub (from dist/)"
+    echo " 14) Back up the flatpak signing key to the NAS (after the key changes)"
     echo "  q) Quit"
     read -rp "Choose: " choice
     case "$choice" in
@@ -268,6 +384,10 @@ while true; do
         8) cleanup_build ;;
         9) if github_scripts; then release_github; else err "Unknown choice."; fi ;;
         10) reinstall_flatpak ;;
+        11) bump_version ;;
+        12) publish_flatpak ;;
+        13) full_release ;;
+        14) backup_key ;;
         q|Q) exit 0 ;;
         *) err "Unknown choice." ;;
     esac
