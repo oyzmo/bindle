@@ -28,6 +28,11 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.27.5" date="2026-10-26">
+      <description>
+        <p>Build scripts stop when the Flatpak signing key is missing, and find the Flatpak site from the desktop too</p>
+      </description>
+    </release>
     <release version="1.27.4" date="2026-10-26">
       <description>
         <p>Flatpak publishing moved to shared tools used by all oyzmo apps</p>

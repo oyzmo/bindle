@@ -209,12 +209,18 @@ bump_version() {
 }
 
 # The oyzmo Flatpak site that buildflatpak.sh publishes into; pushing it to
-# GitHub is what makes the update appear in GNOME Software.
-FLATPAK_SITE="${FLATPAK_SITE:-/mnt/mycode/flatpak}"
+# GitHub is what makes the update appear in GNOME Software. It lives in the
+# root of the shared code folder: /mnt/mycode on the VM, ~/Code on the desktop
+# (the same share), told apart by where this script is. FLATPAK_SITE overrides.
+case "$SCRIPT_DIR/" in
+    /mnt/mycode/*)   FLATPAK_SITE="${FLATPAK_SITE:-/mnt/mycode/flatpak}" ;;
+    "$HOME"/Code/*)  FLATPAK_SITE="${FLATPAK_SITE:-$HOME/Code/flatpak}" ;;
+    *)               FLATPAK_SITE="${FLATPAK_SITE:-}" ;;
+esac
 
 publish_flatpak() {
     if [ ! -x "$FLATPAK_SITE/tools/push.sh" ]; then
-        err "No Flatpak site at $FLATPAK_SITE."
+        err "No oyzmo Flatpak site here (looked for /mnt/mycode/flatpak or ~/Code/flatpak)."
         return 1
     fi
     "$FLATPAK_SITE/tools/push.sh"
@@ -240,6 +246,7 @@ full_release() {
 # Exports the signing key into a private repo on the NAS (the site's
 # tools/backup-key.sh, shared with the other apps' menus).
 backup_key() {
+    [ -x "$FLATPAK_SITE/tools/backup-key.sh" ] || { err "No oyzmo Flatpak site here."; return 1; }
     "$FLATPAK_SITE/tools/backup-key.sh"
 }
 

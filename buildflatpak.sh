@@ -7,7 +7,8 @@
 # tools/publish.sh: signed into its OSTree repo, which GitHub Pages serves as
 # flatpak.oyzmo.no, and the bundle carries that address so an installed copy
 # gets its updates from there. The site is committed locally; pushing it live
-# is bindle.sh's "Publish flatpak updates". Without either, a plain bundle.
+# is bindle.sh's "Publish flatpak updates". Where there is no site, a plain
+# bundle; where there is one but no key, it stops before building.
 set -u
 
 APP_ID="no.oyzmo.Bindle"
@@ -19,8 +20,15 @@ OUT_DIR="${BINDLE_OUT_DIR:-$SCRIPT_DIR}"
 # The checkout may live on a FUSE mount that silently truncates direct
 # writes (0-byte files) — bundle to a real filesystem first, then copy in.
 STAGE_DIR="$HOME/.cache/bindle"
-FLATPAK_SITE="${FLATPAK_SITE:-/mnt/mycode/flatpak}"
-FLATPAK_GNUPG="${FLATPAK_GNUPG:-$HOME/.local/share/oyzmo-flatpak/gnupg}"
+# The oyzmo Flatpak site lives in the root of the shared code folder: that is
+# /mnt/mycode on the VM and ~/Code on the desktop (the same share), told apart
+# by where this script is. FLATPAK_SITE overrides. Anywhere else — someone
+# else's checkout — there is no site and the bundle is a plain one.
+case "$SCRIPT_DIR/" in
+    /mnt/mycode/*)   FLATPAK_SITE="${FLATPAK_SITE:-/mnt/mycode/flatpak}" ;;
+    "$HOME"/Code/*)  FLATPAK_SITE="${FLATPAK_SITE:-$HOME/Code/flatpak}" ;;
+    *)               FLATPAK_SITE="${FLATPAK_SITE:-}" ;;
+esac
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 ok()   { printf '\033[32m✔ %s\033[0m\n' "$*"; }
@@ -34,6 +42,14 @@ fi
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$SCRIPT_DIR/Cargo.toml" | head -1)"
 OUT="bindle-${VERSION:-unknown}.flatpak"
 
+# With the site present, publishing is not optional: check the key and tools
+# before the long build rather than quietly making a bundle without updates.
+publish=0
+if [ -n "$FLATPAK_SITE" ] && [ -d "$FLATPAK_SITE" ]; then
+    "$FLATPAK_SITE/tools/publish.sh" --check || exit 1
+    publish=1
+fi
+
 bold "Building $APP_ID $VERSION…"
 if ! flatpak-builder --user --repo="$SCRIPT_DIR/repo" --force-clean \
         "$SCRIPT_DIR/build-dir" "$MANIFEST"; then
@@ -42,14 +58,14 @@ if ! flatpak-builder --user --repo="$SCRIPT_DIR/repo" --force-clean \
 fi
 
 mkdir -p "$OUT_DIR" || exit 1
-if [ -x "$FLATPAK_SITE/tools/publish.sh" ] && [ -d "$FLATPAK_GNUPG" ]; then
+if [ "$publish" = 1 ]; then
     # publish.sh bundles via a real filesystem and checks the copy itself.
     "$FLATPAK_SITE/tools/publish.sh" "$SCRIPT_DIR/repo" "$APP_ID" Bindle "$VERSION" \
         "$OUT_DIR/$OUT" || exit 1
     exit 0
 fi
 
-echo "No $FLATPAK_SITE or signing key — building an unpublished bundle."
+echo "No oyzmo Flatpak site here — building an unpublished bundle."
 bold "Creating $OUT…"
 mkdir -p "$STAGE_DIR"
 if ! flatpak build-bundle "$SCRIPT_DIR/repo" "$STAGE_DIR/$OUT" "$APP_ID"; then
