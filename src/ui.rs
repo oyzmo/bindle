@@ -573,7 +573,6 @@ impl App {
         file_section.append(Some("_Print…"), Some("win.print"));
         menu.append_section(None, &file_section);
 
-
         let view_section = gio::Menu::new();
         let appearance_menu = gio::Menu::new();
         appearance_menu.append(Some("Follow system"), Some("win.color-scheme::system"));
@@ -590,33 +589,43 @@ impl App {
         panels_menu.append(Some("Show _Preview panel"), Some("win.show-preview"));
         panels_menu.append(Some("_Horizontal layout"), Some("win.horizontal"));
         view_section.append_submenu(Some("Panel_s"), &panels_menu);
+        // Editor and Preview each get their own submenu, so an option says
+        // which half of the window it affects by where it lives.
+        let editor_menu = gio::Menu::new();
         let font_menu = gio::Menu::new();
         font_menu.append(Some("Small"), Some("win.editor-font::small"));
         font_menu.append(Some("Normal"), Some("win.editor-font::normal"));
         font_menu.append(Some("Large"), Some("win.editor-font::large"));
         font_menu.append(Some("Extra large"), Some("win.editor-font::xlarge"));
-        view_section.append_submenu(Some("Editor _font size"), &font_menu);
+        editor_menu.append_section(Some("Font size"), &font_menu);
+        let editor_options = gio::Menu::new();
+        editor_options.append(Some("Line _numbers"), Some("win.line-numbers"));
+        editor_options.append(Some("_Word wrap"), Some("win.word-wrap"));
+        editor_options.append(Some("Highlight _keywords"), Some("win.keyword-highlight"));
+        editor_menu.append_section(None, &editor_options);
+        view_section.append_submenu(Some("E_ditor"), &editor_menu);
+        let preview_menu = gio::Menu::new();
         let preview_font_menu = gio::Menu::new();
         preview_font_menu.append(Some("Small"), Some("win.preview-font::small"));
         preview_font_menu.append(Some("Normal"), Some("win.preview-font::normal"));
         preview_font_menu.append(Some("Large"), Some("win.preview-font::large"));
         preview_font_menu.append(Some("Extra large"), Some("win.preview-font::xlarge"));
-        view_section.append_submenu(Some("Preview f_ont size"), &preview_font_menu);
-        view_section.append(Some("Fit preview to wi_dth"), Some("win.preview-fit"));
-        view_section.append(Some("Line _numbers"), Some("win.line-numbers"));
-        view_section.append(Some("Line numbers in p_review"), Some("win.preview-line-numbers"));
-        view_section.append(Some("Show editor _position in preview"), Some("win.preview-viewport"));
-        view_section.append(Some("_Word wrap"), Some("win.word-wrap"));
-        view_section.append(Some("Highlight _keywords"), Some("win.keyword-highlight"));
-        view_section.append(Some("Preview follows _editor"), Some("win.follow-cursor"));
-        menu.append_section(None, &view_section);
-
-        let behavior_section = gio::Menu::new();
+        preview_font_menu.append(Some("Fit to wi_dth"), Some("win.preview-fit"));
+        preview_menu.append_section(Some("Font size"), &preview_font_menu);
+        let preview_options = gio::Menu::new();
+        preview_options.append(Some("Line _numbers"), Some("win.preview-line-numbers"));
+        preview_options.append(Some("Show editor _position"), Some("win.preview-viewport"));
+        preview_options.append(Some("_Follow editor"), Some("win.follow-cursor"));
         let remote_menu = gio::Menu::new();
         remote_menu.append(Some("Ask per document"), Some("win.remote-images::ask"));
         remote_menu.append(Some("Always load"), Some("win.remote-images::always"));
         remote_menu.append(Some("Never load"), Some("win.remote-images::never"));
-        behavior_section.append_submenu(Some("_Web Images"), &remote_menu);
+        preview_options.append_submenu(Some("_Web images"), &remote_menu);
+        preview_menu.append_section(None, &preview_options);
+        view_section.append_submenu(Some("Prev_iew"), &preview_menu);
+        menu.append_section(None, &view_section);
+
+        let behavior_section = gio::Menu::new();
         behavior_section.append(Some("Open files in _view mode"), Some("win.open-in-view"));
         behavior_section.append(Some("Open _last file at launch"), Some("win.open-last"));
         behavior_section.append(Some("_Remember document state"), Some("win.remember-folds"));
