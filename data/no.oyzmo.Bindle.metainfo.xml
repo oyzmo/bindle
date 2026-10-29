@@ -42,6 +42,26 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.32.0" date="2026-10-29">
+      <description>
+        <p>Preview menu: open images in a separate window or inside the main window</p>
+      </description>
+    </release>
+    <release version="1.31.1" date="2026-10-29">
+      <description>
+        <p>Only one image viewer: another image replaces the open one</p>
+      </description>
+    </release>
+    <release version="1.31.0" date="2026-10-29">
+      <description>
+        <p>Image viewer opens in its own resizable window, at least 640×480</p>
+      </description>
+    </release>
+    <release version="1.30.0" date="2026-10-29">
+      <description>
+        <p>Image viewer: the wheel zooms about the pointer, middle click fits, smoother panning</p>
+      </description>
+    </release>
     <release version="1.29.0" date="2026-10-29">
       <description>
         <p>Click an image in the preview to view it full size</p>

@@ -21,6 +21,7 @@ use crate::settings::{
 };
 use crate::snippets::{self, Snippet};
 use crate::theme;
+use crate::viewer;
 
 thread_local! {
     static STATE: RefCell<Option<Rc<App>>> = const { RefCell::new(None) };
@@ -269,6 +270,7 @@ pub struct App {
     /// "Fit preview to width": the preview font (and images) shrink with the
     /// panel so a reading line keeps its full-size words — see `fit_scale`.
     preview_fit: Cell<bool>,
+    image_window: Cell<bool>,
     /// The scale the preview font was last applied at.
     preview_scale: Cell<f64>,
     /// Pending debounced re-fit after a width change, if any.
@@ -616,6 +618,7 @@ impl App {
         preview_options.append(Some("Line _numbers"), Some("win.preview-line-numbers"));
         preview_options.append(Some("Show editor _position"), Some("win.preview-viewport"));
         preview_options.append(Some("_Follow editor"), Some("win.follow-cursor"));
+        preview_options.append(Some("Open images in a separate _window"), Some("win.image-window"));
         let remote_menu = gio::Menu::new();
         remote_menu.append(Some("Ask per document"), Some("win.remote-images::ask"));
         remote_menu.append(Some("Always load"), Some("win.remote-images::always"));
@@ -820,6 +823,7 @@ impl App {
             editor_font: Cell::new(FontSize::from_str(&settings.editor_font)),
             preview_font: Cell::new(FontSize::from_str(&settings.preview_font)),
             preview_fit: Cell::new(settings.preview_fit),
+            image_window: Cell::new(settings.image_window),
             preview_scale: Cell::new(1.0),
             fit_pending: Cell::new(None),
             font_provider,
@@ -1653,6 +1657,20 @@ impl App {
             action.set_state(&choice.to_variant());
             state.preview_font.set(FontSize::from_str(&choice));
             state.apply_fonts();
+            state.persist_settings();
+        });
+        self.window.add_action(&action);
+
+        let action = gio::SimpleAction::new_stateful(
+            "image-window",
+            None,
+            &self.image_window.get().to_variant(),
+        );
+        let state = self.clone();
+        action.connect_activate(move |action, _| {
+            let enabled = !state.image_window.get();
+            action.set_state(&enabled.to_variant());
+            state.image_window.set(enabled);
             state.persist_settings();
         });
         self.window.add_action(&action);
@@ -2887,92 +2905,22 @@ impl App {
         });
     }
 
-    /// Show an image's full-size original in a dialog: fitted to the
-    /// window at first, a click (or the header button) toggles actual size,
-    /// where dragging pans.
+    /// Show an image's full-size original in the viewer dialog.
     fn view_image(self: &Rc<Self>, dest: &str) {
+        let separate = self.image_window.get();
+        if separate && viewer::raise(dest) {
+            return;
+        }
         let state = self.clone();
+        let shown = dest.to_string();
         let title = dest.rsplit('/').next().unwrap_or(dest).to_string();
         let title = bundle::decode_dest(&title);
         self.load_original(dest, move |texture| {
             let Some(texture) = texture else {
                 return state.toast("Could not read the image");
             };
-            state.image_dialog(&texture, &title).present(Some(&state.window));
+            viewer::show(&texture, &title, &shown, &state.window, separate);
         });
-    }
-
-    fn image_dialog(&self, texture: &gdk::Texture, title: &str) -> adw::Dialog {
-        let picture = gtk4::Picture::for_paintable(texture);
-        picture.set_content_fit(gtk4::ContentFit::ScaleDown);
-        picture.set_can_shrink(true);
-        let scroller = gtk4::ScrolledWindow::new();
-        scroller.set_child(Some(&picture));
-
-        let zoom = gtk4::Button::new();
-        let header = adw::HeaderBar::new();
-        header.pack_start(&zoom);
-        let toolbar = adw::ToolbarView::new();
-        toolbar.add_top_bar(&header);
-        toolbar.set_content(Some(&scroller));
-
-        // Fitted, the picture shrinks into the scroller; at actual size it
-        // refuses to, so the scroller scrolls.
-        let set_fit = {
-            let (picture, zoom) = (picture.clone(), zoom.clone());
-            move |fit: bool| {
-                picture.set_can_shrink(fit);
-                picture.set_cursor_from_name(Some(if fit { "zoom-in" } else { "grab" }));
-                zoom.set_icon_name(if fit { "zoom-original-symbolic" } else { "zoom-fit-best-symbolic" });
-                zoom.set_tooltip_text(Some(if fit { "Actual Size" } else { "Fit to Window" }));
-            }
-        };
-        set_fit(true);
-        let toggle = {
-            let (picture, set_fit) = (picture.clone(), set_fit.clone());
-            move || set_fit(!picture.can_shrink())
-        };
-        zoom.connect_clicked({
-            let toggle = toggle.clone();
-            move |_| toggle()
-        });
-
-        // One drag gesture does both: a press that barely moves is a click
-        // (toggle the zoom), anything more pans at actual size.
-        let drag = gtk4::GestureDrag::new();
-        let origin = Rc::new(Cell::new((0.0, 0.0)));
-        drag.connect_drag_begin({
-            let (scroller, origin) = (scroller.clone(), origin.clone());
-            move |_, _, _| origin.set((scroller.hadjustment().value(), scroller.vadjustment().value()))
-        });
-        drag.connect_drag_update({
-            let (scroller, picture, origin) = (scroller.clone(), picture.clone(), origin.clone());
-            move |_, dx, dy| {
-                if !picture.can_shrink() {
-                    let (x, y) = origin.get();
-                    scroller.hadjustment().set_value(x - dx);
-                    scroller.vadjustment().set_value(y - dy);
-                }
-            }
-        });
-        drag.connect_drag_end(move |_, dx, dy| {
-            if dx.hypot(dy) < 4.0 {
-                toggle();
-            }
-        });
-        picture.add_controller(drag);
-
-        // Open at the image's own size, up to most of the window.
-        let max_w = (self.window.width() as f64 * 0.9) as i32;
-        let max_h = (self.window.height() as f64 * 0.9) as i32 - 48;
-        let (w, h) = (texture.width().max(1) as f64, texture.height().max(1) as f64);
-        let scale = (max_w as f64 / w).min(max_h as f64 / h).min(1.0);
-        let dialog = adw::Dialog::new();
-        dialog.set_title(title);
-        dialog.set_content_width(((w * scale) as i32).max(360));
-        dialog.set_content_height(((h * scale) as i32 + 48).max(240));
-        dialog.set_child(Some(&toolbar));
-        dialog
     }
 
     /// The task list checkbox glyph at a preview char offset, if any.
@@ -5325,6 +5273,7 @@ impl App {
             editor_font: self.editor_font.get().as_str().to_string(),
             preview_font: self.preview_font.get().as_str().to_string(),
             preview_fit: self.preview_fit.get(),
+            image_window: self.image_window.get(),
             show_files: self.show_files.get(),
             show_insert: self.show_insert.get(),
             show_preview: self.show_preview.get(),

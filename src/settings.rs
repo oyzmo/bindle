@@ -61,6 +61,9 @@ pub struct Settings {
     /// Shrink the preview's font (and images) so a full-width reading line
     /// fits the panel — an overview of the whole document's look.
     pub preview_fit: bool,
+    /// "View Image" opens a free, resizable window rather than a dialog
+    /// inside the main window.
+    pub image_window: bool,
     /// Remember per-document state (collapsed sections, view mode) across
     /// sessions. JSON key kept from when it covered folds only.
     pub remember_folds: bool,
@@ -278,6 +281,7 @@ impl Default for Settings {
             editor_font: "normal".to_string(),
             preview_font: "normal".to_string(),
             preview_fit: false,
+            image_window: true,
             remember_folds: true,
             doc_state: Vec::new(),
             recent_files: Vec::new(),

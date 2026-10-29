@@ -10,3 +10,4 @@ pub mod settings;
 pub mod snippets;
 pub mod theme;
 pub mod ui;
+pub mod viewer;
