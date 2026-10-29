@@ -282,7 +282,7 @@ fn load_local(path: PathBuf, known: Option<SystemTime>, refresh: Option<Rc<dyn F
 
 /// Read `url` into memory, giving up past `REMOTE_MAX_BYTES` rather than
 /// buffering a response of any size first and checking afterwards.
-async fn fetch_capped(url: &str) -> Option<Vec<u8>> {
+pub async fn fetch_capped(url: &str) -> Option<Vec<u8>> {
     let stream = gio::File::for_uri(url).read_future(glib::Priority::DEFAULT).await.ok()?;
     let mut data = Vec::new();
     loop {

@@ -1186,6 +1186,13 @@ impl App {
                     state.toggle_fold(key);
                     return;
                 }
+                // A click on an image opens the full-size original.
+                if n_press == 1 {
+                    if let Some(dest) = state.preview_image_at(offset) {
+                        state.view_image(&dest);
+                        return;
+                    }
+                }
             }
             let state = state.clone();
             glib::idle_add_local_once(move || state.sync_editor_to_preview(x, y));
@@ -1207,6 +1214,9 @@ impl App {
             let Some(offset) = state.preview_offset_at(x, y) else { return };
             if let Some(dest) = state.preview_image_at(offset) {
                 image_menu.remove_all();
+                let item = gio::MenuItem::new(Some("_View Image"), None);
+                item.set_action_and_target_value(Some("win.view-image"), Some(&dest.to_variant()));
+                image_menu.append_item(&item);
                 let item = gio::MenuItem::new(Some("_Copy Image"), None);
                 item.set_action_and_target_value(Some("win.copy-image"), Some(&dest.to_variant()));
                 image_menu.append_item(&item);
@@ -1240,6 +1250,11 @@ impl App {
                 } else {
                     "Click to check"
                 }));
+                return;
+            }
+            if offset.and_then(|o| state.preview_image_at(o)).is_some() {
+                state.preview.set_cursor_from_name(Some("zoom-in"));
+                state.preview.set_tooltip_text(Some("Click to enlarge"));
                 return;
             }
             let link = offset.and_then(|o| state.preview_link_at(o));
@@ -1394,6 +1409,15 @@ impl App {
         action.connect_activate(move |_, param| {
             if let Some(dest) = param.and_then(|v| v.str()) {
                 state.copy_image(dest);
+            }
+        });
+        self.window.add_action(&action);
+
+        let action = gio::SimpleAction::new("view-image", Some(glib::VariantTy::STRING));
+        let state = self.clone();
+        action.connect_activate(move |_, param| {
+            if let Some(dest) = param.and_then(|v| v.str()) {
+                state.view_image(dest);
             }
         });
         self.window.add_action(&action);
@@ -2576,11 +2600,7 @@ impl App {
             }
         });
         let policy = self.remote_policy.get();
-        let allow = match policy {
-            RemotePolicy::Always => true,
-            RemotePolicy::Ask => self.doc_allows_remote.get(),
-            RemotePolicy::Never => false,
-        };
+        let allow = self.remote_allowed();
         // Render into a scratch buffer (sharing the tag table) and splice
         // only the differing region into the live one: untouched lines keep
         // their layout, so re-rendering can't make the view blink.
@@ -2814,32 +2834,145 @@ impl App {
         if external_link(dest) {
             return self.toast("Web images can't be copied; open the link instead");
         }
-        let Some(loc) = self.asset_loc(dest) else {
-            return self.toast("Could not read the image");
-        };
         let state = self.clone();
+        self.load_original(dest, move |texture| match texture {
+            Some(texture) => {
+                state.preview.clipboard().set_texture(&texture);
+                state.toast("Image copied");
+            }
+            None => state.toast("Could not read the image"),
+        });
+    }
+
+    /// Whether this document may fetch web images: the persisted policy,
+    /// with per-document consent in Ask mode.
+    fn remote_allowed(&self) -> bool {
+        match self.remote_policy.get() {
+            RemotePolicy::Always => true,
+            RemotePolicy::Ask => self.doc_allows_remote.get(),
+            RemotePolicy::Never => false,
+        }
+    }
+
+    /// Decode the full-size original of an image reference — local, staged,
+    /// in a pack, or (with consent) on the web — and hand it to `then`.
+    ///
+    /// The read and decode run off the main loop: the document may live on
+    /// a share that hangs, and the original can be up to `ASSET_MAX_BYTES`.
+    /// The decode is at full size (this is the original, not a thumbnail),
+    /// so the header is checked first, or a small file declaring a huge
+    /// image would decode to gigabytes.
+    fn load_original(self: &Rc<Self>, dest: &str, then: impl FnOnce(Option<gdk::Texture>) + 'static) {
+        fn decode(bytes: Vec<u8>) -> Option<gdk::Texture> {
+            if !preview::image_size_ok(&bytes) {
+                return None;
+            }
+            gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)).ok()
+        }
+        let remote = external_link(dest).then(|| dest.to_string()).filter(|_| self.remote_allowed());
+        let loc = if remote.is_some() { None } else { self.asset_loc(dest) };
         glib::spawn_future_local(async move {
-            // The decode runs there too, at full size (this is the original,
-            // not a thumbnail) — so the header is checked first, or a small
-            // file declaring a huge image would decode to gigabytes.
-            let texture = gio::spawn_blocking(move || {
-                let bytes = loc.read(bundle::ASSET_MAX_BYTES)?;
-                if !preview::image_size_ok(&bytes) {
-                    return None;
+            let bytes = match (remote, loc) {
+                (Some(url), _) => preview::fetch_capped(&url).await,
+                (None, Some(loc)) => {
+                    gio::spawn_blocking(move || loc.read(bundle::ASSET_MAX_BYTES)).await.ok().flatten()
                 }
-                gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)).ok()
-            })
-            .await
-            .ok()
-            .flatten();
-            match texture {
-                Some(texture) => {
-                    state.preview.clipboard().set_texture(&texture);
-                    state.toast("Image copied");
+                (None, None) => None,
+            };
+            let texture = match bytes {
+                Some(bytes) => gio::spawn_blocking(move || decode(bytes)).await.ok().flatten(),
+                None => None,
+            };
+            then(texture);
+        });
+    }
+
+    /// Show an image's full-size original in a dialog: fitted to the
+    /// window at first, a click (or the header button) toggles actual size,
+    /// where dragging pans.
+    fn view_image(self: &Rc<Self>, dest: &str) {
+        let state = self.clone();
+        let title = dest.rsplit('/').next().unwrap_or(dest).to_string();
+        let title = bundle::decode_dest(&title);
+        self.load_original(dest, move |texture| {
+            let Some(texture) = texture else {
+                return state.toast("Could not read the image");
+            };
+            state.image_dialog(&texture, &title).present(Some(&state.window));
+        });
+    }
+
+    fn image_dialog(&self, texture: &gdk::Texture, title: &str) -> adw::Dialog {
+        let picture = gtk4::Picture::for_paintable(texture);
+        picture.set_content_fit(gtk4::ContentFit::ScaleDown);
+        picture.set_can_shrink(true);
+        let scroller = gtk4::ScrolledWindow::new();
+        scroller.set_child(Some(&picture));
+
+        let zoom = gtk4::Button::new();
+        let header = adw::HeaderBar::new();
+        header.pack_start(&zoom);
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&header);
+        toolbar.set_content(Some(&scroller));
+
+        // Fitted, the picture shrinks into the scroller; at actual size it
+        // refuses to, so the scroller scrolls.
+        let set_fit = {
+            let (picture, zoom) = (picture.clone(), zoom.clone());
+            move |fit: bool| {
+                picture.set_can_shrink(fit);
+                picture.set_cursor_from_name(Some(if fit { "zoom-in" } else { "grab" }));
+                zoom.set_icon_name(if fit { "zoom-original-symbolic" } else { "zoom-fit-best-symbolic" });
+                zoom.set_tooltip_text(Some(if fit { "Actual Size" } else { "Fit to Window" }));
+            }
+        };
+        set_fit(true);
+        let toggle = {
+            let (picture, set_fit) = (picture.clone(), set_fit.clone());
+            move || set_fit(!picture.can_shrink())
+        };
+        zoom.connect_clicked({
+            let toggle = toggle.clone();
+            move |_| toggle()
+        });
+
+        // One drag gesture does both: a press that barely moves is a click
+        // (toggle the zoom), anything more pans at actual size.
+        let drag = gtk4::GestureDrag::new();
+        let origin = Rc::new(Cell::new((0.0, 0.0)));
+        drag.connect_drag_begin({
+            let (scroller, origin) = (scroller.clone(), origin.clone());
+            move |_, _, _| origin.set((scroller.hadjustment().value(), scroller.vadjustment().value()))
+        });
+        drag.connect_drag_update({
+            let (scroller, picture, origin) = (scroller.clone(), picture.clone(), origin.clone());
+            move |_, dx, dy| {
+                if !picture.can_shrink() {
+                    let (x, y) = origin.get();
+                    scroller.hadjustment().set_value(x - dx);
+                    scroller.vadjustment().set_value(y - dy);
                 }
-                None => state.toast("Could not read the image"),
             }
         });
+        drag.connect_drag_end(move |_, dx, dy| {
+            if dx.hypot(dy) < 4.0 {
+                toggle();
+            }
+        });
+        picture.add_controller(drag);
+
+        // Open at the image's own size, up to most of the window.
+        let max_w = (self.window.width() as f64 * 0.9) as i32;
+        let max_h = (self.window.height() as f64 * 0.9) as i32 - 48;
+        let (w, h) = (texture.width().max(1) as f64, texture.height().max(1) as f64);
+        let scale = (max_w as f64 / w).min(max_h as f64 / h).min(1.0);
+        let dialog = adw::Dialog::new();
+        dialog.set_title(title);
+        dialog.set_content_width(((w * scale) as i32).max(360));
+        dialog.set_content_height(((h * scale) as i32 + 48).max(240));
+        dialog.set_child(Some(&toolbar));
+        dialog
     }
 
     /// The task list checkbox glyph at a preview char offset, if any.
