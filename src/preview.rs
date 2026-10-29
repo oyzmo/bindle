@@ -1291,7 +1291,7 @@ fn paintable_at(buffer: &gtk4::TextBuffer, offset: i32) -> Option<gdk::Paintable
 /// the diff below: counting them would make every collapsed section — or
 /// every search hit — look changed on each render and re-splice the rest of
 /// the document for nothing. Both are re-applied after the splice anyway.
-const OVERLAY_TAGS: [&str; 4] = ["hidden", "find-match", "find-current", "line-pick"];
+const OVERLAY_TAGS: [&str; 5] = ["hidden", "find-match", "find-current", "line-pick", "line-hover"];
 
 /// Spread a pointer across all 64 bits, so XORing tag identities together
 /// yields a signature that distinguishes different sets of tags.

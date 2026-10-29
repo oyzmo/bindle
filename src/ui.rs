@@ -200,6 +200,8 @@ pub struct App {
     /// Source char range selected from the line-number gutter; mirrored in
     /// the preview by the `line-pick` tag until the selection changes.
     line_pick: Cell<Option<(i32, i32)>>,
+    /// Preview line shaded by `line-hover` (char range, newline excluded).
+    line_hover: Cell<Option<(i32, i32)>>,
     /// Keys of collapsed sections (seeded from `fold_state` on load).
     collapsed: RefCell<HashSet<String>>,
     /// Per-document remembered state (folds, view mode), MRU-ordered,
@@ -262,6 +264,8 @@ pub struct App {
     /// The viewport bar in the preview gutter: marks the preview lines
     /// behind what the editor currently shows (`draw_viewport_bar`).
     preview_viewport: Cell<bool>,
+    /// Hover hints in the preview (links, checkboxes, images, line picks).
+    preview_tooltips: Cell<bool>,
     /// Editor word wrap; overridden off for kinds that need exact line
     /// widths (`DocKind::wrap_lines`), never written back.
     word_wrap: Cell<bool>,
@@ -479,6 +483,14 @@ impl App {
                 .paragraph_background("#7fa07a59")
                 .build(),
         );
+        // The line a click beside the text would pick, under the pointer:
+        // a fainter shade of the same, so the target shows before the click.
+        preview_buffer.tag_table().add(
+            &gtk4::TextTag::builder()
+                .name("line-hover")
+                .paragraph_background("#7fa07a2e")
+                .build(),
+        );
         let preview = gtk4::TextView::with_buffer(&preview_buffer);
         preview.set_editable(false);
         preview.set_cursor_visible(false);
@@ -619,6 +631,7 @@ impl App {
         preview_options.append(Some("Show editor _position"), Some("win.preview-viewport"));
         preview_options.append(Some("_Follow editor"), Some("win.follow-cursor"));
         preview_options.append(Some("Open images in a separate _window"), Some("win.image-window"));
+        preview_options.append(Some("Show _tooltips"), Some("win.preview-tooltips"));
         let remote_menu = gio::Menu::new();
         remote_menu.append(Some("Ask per document"), Some("win.remote-images::ask"));
         remote_menu.append(Some("Always load"), Some("win.remote-images::always"));
@@ -789,6 +802,7 @@ impl App {
             preview_table_rows: RefCell::new(Vec::new()),
             preview_table_cols: Cell::new(None),
             line_pick: Cell::new(None),
+            line_hover: Cell::new(None),
             collapsed: RefCell::new(HashSet::new()),
             doc_state: RefCell::new(settings.doc_state.clone()),
             restore_preview_top: Cell::new(None),
@@ -819,6 +833,7 @@ impl App {
             preview_gutter: gtk4::DrawingArea::new(),
             preview_line_numbers: Cell::new(settings.preview_line_numbers),
             preview_viewport: Cell::new(settings.preview_viewport),
+            preview_tooltips: Cell::new(settings.preview_tooltips),
             word_wrap: Cell::new(settings.word_wrap),
             editor_font: Cell::new(FontSize::from_str(&settings.editor_font)),
             preview_font: Cell::new(FontSize::from_str(&settings.preview_font)),
@@ -1159,14 +1174,20 @@ impl App {
         // Deferred to an idle so the preview TextView has already handled the
         // press (double-click word selection in particular). Beside a line
         // instead of on it, a double-click picks that line as the gutter
-        // does, and Shift+click extends the pick.
+        // does, and Shift+click extends the pick; a triple-click — GTK's own
+        // line selection — picks it from anywhere on the line.
         let click = gtk4::GestureClick::new();
         click.set_button(gdk::BUTTON_PRIMARY);
         let state = self.clone();
         click.connect_pressed(move |gesture, n_press, x, y| {
             let shift = gesture.current_event_state().contains(gdk::ModifierType::SHIFT_MASK);
             let beside = state.preview_line_beside(x, y);
-            if let Some(lines) = beside.filter(|_| shift || n_press == 2) {
+            let lines = match n_press {
+                3 => state.preview_line_at(x, y, false).and_then(|(a, b)| state.preview_source_lines(a, b)),
+                2 => beside,
+                _ => beside.filter(|_| shift),
+            };
+            if let Some(lines) = lines {
                 let state = state.clone();
                 glib::idle_add_local_once(move || state.pick_from_preview(lines, shift));
                 return;
@@ -1246,10 +1267,19 @@ impl App {
         let motion = gtk4::EventControllerMotion::new();
         let state = self.clone();
         motion.connect_motion(move |_, x, y| {
+            if let Some((start, end)) = state.preview_line_at(x, y, true) {
+                if state.preview_source_lines(start, end).is_some() {
+                    state.set_line_hover(Some((start, end)));
+                    state.preview.set_cursor_from_name(Some("default"));
+                    state.set_preview_tip(Some("Triple-click the line to pick it, Shift+click to extend"));
+                    return;
+                }
+            }
+            state.set_line_hover(None);
             let offset = state.preview_offset_at(x, y);
             if let Some(checkbox) = offset.and_then(|o| state.preview_checkbox_at(o)) {
                 state.preview.set_cursor_from_name(Some("pointer"));
-                state.preview.set_tooltip_text(Some(if checkbox.checked {
+                state.set_preview_tip(Some(if checkbox.checked {
                     "Click to uncheck"
                 } else {
                     "Click to check"
@@ -1258,7 +1288,7 @@ impl App {
             }
             if offset.and_then(|o| state.preview_image_at(o)).is_some() {
                 state.preview.set_cursor_from_name(Some("zoom-in"));
-                state.preview.set_tooltip_text(Some("Click to enlarge"));
+                state.set_preview_tip(Some("Click to enlarge"));
                 return;
             }
             let link = offset.and_then(|o| state.preview_link_at(o));
@@ -1272,8 +1302,10 @@ impl App {
                     format!("Ctrl+click to open, right-click to save a copy — {dest}")
                 }
             });
-            state.preview.set_tooltip_text(tip.as_deref());
+            state.set_preview_tip(tip.as_deref());
         });
+        let state = self.clone();
+        motion.connect_leave(move |_| state.set_line_hover(None));
         self.preview.add_controller(motion);
 
         // Banner "Load": allow remote images for this document only.
@@ -1607,6 +1639,23 @@ impl App {
             action.set_state(&enabled.to_variant());
             state.preview_viewport.set(enabled);
             state.apply_preview_gutter();
+            state.persist_settings();
+        });
+        self.window.add_action(&action);
+
+        let action = gio::SimpleAction::new_stateful(
+            "preview-tooltips",
+            None,
+            &self.preview_tooltips.get().to_variant(),
+        );
+        let state = self.clone();
+        action.connect_activate(move |action, _| {
+            let enabled = !state.preview_tooltips.get();
+            action.set_state(&enabled.to_variant());
+            state.preview_tooltips.set(enabled);
+            if !enabled {
+                state.preview.set_tooltip_text(None);
+            }
             state.persist_settings();
         });
         self.window.add_action(&action);
@@ -2698,6 +2747,8 @@ impl App {
         *self.preview_checkboxes.borrow_mut() = rendered.checkboxes;
         *self.preview_sections.borrow_mut() = rendered.sections;
         *self.preview_table_rows.borrow_mut() = rendered.table_rows;
+        // The text under a hover may have moved; the next motion redraws it.
+        self.set_line_hover(None);
         // The splice dropped the pick's tag wherever it replaced text.
         if self.line_pick.get().is_some() {
             self.apply_line_pick();
@@ -4457,6 +4508,13 @@ impl App {
     /// past its end — rather than on it. A preview line is a whole paragraph,
     /// list item or table row, so it may stand for several source lines.
     fn preview_line_beside(&self, x: f64, y: f64) -> Option<(i32, i32)> {
+        let (start, end) = self.preview_line_at(x, y, true)?;
+        self.preview_source_lines(start, end)
+    }
+
+    /// The char range (newline excluded) of the preview line at widget point
+    /// (`x`, `y`); with `beside_only`, only when the point is beside its text.
+    fn preview_line_at(&self, x: f64, y: f64, beside_only: bool) -> Option<(i32, i32)> {
         let (bx, by) = self
             .preview
             .window_to_buffer_coords(gtk4::TextWindowType::Widget, x as i32, y as i32);
@@ -4464,7 +4522,7 @@ impl App {
         // over text" — exactly the case wanted here — so the line comes from
         // the y coordinate instead, and must actually span it (below the
         // last line `line_at_y` still answers with that line).
-        if self.preview.iter_at_location(bx, by).is_some() {
+        if beside_only && self.preview.iter_at_location(bx, by).is_some() {
             return None;
         }
         let (iter, top) = self.preview.line_at_y(by);
@@ -4478,7 +4536,33 @@ impl App {
         if !line_end.ends_line() {
             line_end.forward_to_line_end();
         }
-        self.preview_source_lines(line_start.offset(), line_end.offset())
+        Some((line_start.offset(), line_end.offset()))
+    }
+
+    /// Show a hover hint on the preview, unless tooltips are switched off.
+    fn set_preview_tip(&self, tip: Option<&str>) {
+        self.preview.set_tooltip_text(tip.filter(|_| self.preview_tooltips.get()));
+    }
+
+    /// Shade the preview line a click beside the text would pick (None
+    /// clears it). Only one line at a time, so only it is re-laid out.
+    fn set_line_hover(&self, range: Option<(i32, i32)>) {
+        if self.line_hover.get() == range {
+            return;
+        }
+        self.line_hover.set(range);
+        let live = self.preview.buffer();
+        let Some(tag) = live.tag_table().lookup("line-hover") else { return };
+        // Removed where it actually lies: a render since may have moved it.
+        let mut start = live.start_iter();
+        if start.has_tag(&tag) || start.forward_to_tag_toggle(Some(&tag)) {
+            let mut end = start;
+            end.forward_to_tag_toggle(Some(&tag));
+            live.remove_tag(&tag, &start, &end);
+        }
+        if let Some((a, b)) = range {
+            live.apply_tag(&tag, &live.iter_at_offset(a), &live.iter_at_offset(b + 1));
+        }
     }
 
     /// The source lines (first, last) behind the preview line spanning
@@ -5269,6 +5353,7 @@ impl App {
             line_numbers: self.line_numbers.get(),
             preview_line_numbers: self.preview_line_numbers.get(),
             preview_viewport: self.preview_viewport.get(),
+            preview_tooltips: self.preview_tooltips.get(),
             word_wrap: self.word_wrap.get(),
             editor_font: self.editor_font.get().as_str().to_string(),
             preview_font: self.preview_font.get().as_str().to_string(),

@@ -52,6 +52,8 @@ pub struct Settings {
     pub preview_line_numbers: bool,
     /// A bar in the preview's margin beside the part the editor shows.
     pub preview_viewport: bool,
+    /// Hover hints in the preview (links, checkboxes, images, line picks).
+    pub preview_tooltips: bool,
     /// Long lines wrap in the editor (NFO/DIZ art never does).
     pub word_wrap: bool,
     /// Editor font size: "small", "normal", "large" or "xlarge".
@@ -277,6 +279,7 @@ impl Default for Settings {
             line_numbers: false,
             preview_line_numbers: false,
             preview_viewport: true,
+            preview_tooltips: true,
             word_wrap: true,
             editor_font: "normal".to_string(),
             preview_font: "normal".to_string(),
