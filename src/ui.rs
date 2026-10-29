@@ -304,9 +304,29 @@ fn apply_color_scheme(scheme: ColorScheme) {
     });
 }
 
+/// Switch GTK ≥ 4.16 from its "automatic" font rendering to "manual" (the
+/// desktop's own hinting settings, as GTK 4.14 always did). Automatic mode
+/// clips the top row off flat-topped glyphs (P, U, T, F…) at some sizes — the
+/// preview's Large 11.5pt monospace, 10.125pt sans, and more in a sweep
+/// (`dev/clip/`) — and no size rule avoids it, since which sizes break depends
+/// on the font. Manual mode rendered every size from 5 to 20pt cleanly.
+/// The property doesn't exist on 4.14, hence the lookup.
+pub fn fix_font_rendering() {
+    if let Some(settings) = gtk4::Settings::default() {
+        let manual = settings
+            .find_property("gtk-font-rendering")
+            .and_then(|pspec| glib::EnumClass::with_type(pspec.value_type()))
+            .and_then(|class| class.to_value_by_nick("manual"));
+        if let Some(manual) = manual {
+            settings.set_property_from_value("gtk-font-rendering", &manual);
+        }
+    }
+}
+
 pub fn load_css() {
     // Fractional pt sizes on purpose: at integer-pixel sizes (12pt = 16px)
     // GTK's hinted glyph rendering clips the top strokes of T/F glyphs.
+    // (Only part of the story — see `fix_font_rendering`.)
     // Env override kept for examples/uishot.rs rendering experiments.
     let editor_size = std::env::var("BINDLE_EDITOR_FONT").unwrap_or_else(|_| "12.5pt".into());
     let css = format!("
@@ -1269,7 +1289,10 @@ impl App {
         motion.connect_motion(move |_, x, y| {
             if let Some((start, end)) = state.preview_line_at(x, y, true) {
                 if state.preview_source_lines(start, end).is_some() {
-                    state.set_line_hover(Some((start, end)));
+                    // Shaded only where the preview is the main view: in the
+                    // side panel the shade just flickers along under the
+                    // pointer on its way to the editor.
+                    state.set_line_hover(state.view_mode.get().then_some((start, end)));
                     state.preview.set_cursor_from_name(Some("default"));
                     state.set_preview_tip(Some("Triple-click the line to pick it, Shift+click to extend"));
                     return;
@@ -3585,6 +3608,7 @@ impl App {
                 action.set_state(&view.to_variant());
             }
         }
+        self.set_line_hover(None);
         self.apply_view_mode(view);
     }
 

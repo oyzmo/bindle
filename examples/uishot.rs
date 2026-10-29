@@ -14,7 +14,10 @@ fn main() -> glib::ExitCode {
         .application_id("no.oyzmo.Bindle.Uishot")
         .flags(gio::ApplicationFlags::HANDLES_OPEN)
         .build();
-    app.connect_startup(|_| ui::load_css());
+    app.connect_startup(|_| {
+        ui::fix_font_rendering();
+        ui::load_css();
+    });
     app.connect_activate(|app| shoot(app, None));
     app.connect_open(|app, files, _| {
         shoot(app, files.first().and_then(|f| f.path()));

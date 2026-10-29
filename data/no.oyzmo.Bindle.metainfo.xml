@@ -42,6 +42,16 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.34.2" date="2026-10-29">
+      <description>
+        <p>Hover shading of preview lines only when the preview is the main view</p>
+      </description>
+    </release>
+    <release version="1.34.1" date="2026-10-29">
+      <description>
+        <p>Fixed the top edge of some letters being cut off at certain font sizes</p>
+      </description>
+    </release>
     <release version="1.34.0" date="2026-10-29">
       <description>
         <ul>

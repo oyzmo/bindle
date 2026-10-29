@@ -49,6 +49,7 @@ fn main() -> glib::ExitCode {
         .build();
 
     app.connect_startup(|app| {
+        ui::fix_font_rendering();
         ui::load_css();
         let accels: [(&str, &[&str]); 10] = [
             ("win.new", &["<Control>n"]),
