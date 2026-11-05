@@ -42,6 +42,11 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.35.1" date="2026-11-05">
+      <description>
+        <p>bindle.sh can install the Flatpak from flatpak.oyzmo.no, and uninstall it</p>
+      </description>
+    </release>
     <release version="1.35.0" date="2026-11-05">
       <description>
         <p>Files panel keeps 50 recent documents, opens about 10 rows tall and scrolls to the open one; Open Recent still lists 10</p>

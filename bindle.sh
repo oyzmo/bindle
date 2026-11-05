@@ -15,6 +15,7 @@ SYMBOLIC_DIR="$HOME/.local/share/icons/hicolor/symbolic/apps"
 # Same layout the Flatpak uses (/app/share/licenses/$FLATPAK_ID): the GPL
 # licence and the third-party attribution notices must travel with the app.
 LICENSE_DIR="$HOME/.local/share/licenses/$APP_ID"
+FLATPAK_REF="https://flatpak.oyzmo.no/bindle.flatpakref"
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 ok()   { printf '\033[32m✔ %s\033[0m\n' "$*"; }
@@ -261,6 +262,40 @@ uninstall_app() {
     echo "  (Settings in ~/.config/bindle are kept; delete that folder to remove them.)"
 }
 
+# Install from flatpak.oyzmo.no, the way anyone else gets it: the remote is
+# added with its signing key, and GNOME Software keeps it up to date.
+install_flatpak() {
+    command -v flatpak >/dev/null || { err "flatpak not found."; return 1; }
+    local scope
+    for scope in user system; do
+        if flatpak info --"$scope" "$APP_ID" >/dev/null 2>&1; then
+            echo "  Already installed ($scope), from $(flatpak info --"$scope" "$APP_ID" | sed -n 's/^ *Origin: //p')."
+            echo "  Update with: flatpak update $APP_ID  — or use 10 to swap in the newest bundle from dist/."
+            return 0
+        fi
+    done
+    bold "Installing Bindle from flatpak.oyzmo.no…"
+    if flatpak install --user -y --noninteractive --from "$FLATPAK_REF"; then
+        ok "Installed $(flatpak info --user "$APP_ID" | sed -n 's/^ *Version: //p'). Updates arrive through GNOME Software."
+    else
+        err "Install failed."
+        return 1
+    fi
+}
+
+# Uninstalling keeps the app's data (~/.var/app/$APP_ID).
+uninstall_flatpak() {
+    command -v flatpak >/dev/null || { err "flatpak not found."; return 1; }
+    local scope removed=0
+    for scope in user system; do
+        if flatpak info --"$scope" "$APP_ID" >/dev/null 2>&1; then
+            flatpak uninstall --"$scope" -y --noninteractive "$APP_ID" || { err "Uninstall ($scope) failed."; return 1; }
+            removed=1
+        fi
+    done
+    [ "$removed" -eq 1 ] && ok "Flatpak removed (settings in ~/.var/app/$APP_ID are kept)." || echo "  The flatpak is not installed."
+}
+
 # Swap an installed Bindle flatpak for the newest bundle in dist/ (or next to
 # this script, where buildflatpak.sh puts it by default). GNOME Software only
 # offers "Open" for a bundle of an app that is already installed, so a newer
@@ -321,7 +356,10 @@ while true; do
     echo "  5) Install “New Document” template (Files right-click)"
     echo "  6) Remove template"
     echo "  8) Cleanup (delete temporary build files)"
+    bold "── Flatpak ──────────────────────────────"
+    echo " 15) Install flatpak (from flatpak.oyzmo.no, updates via GNOME Software)"
     echo " 10) Replace installed flatpak with the newest one (from dist/)"
+    echo " 16) Uninstall flatpak (keeps settings)"
     bold "── Release (in this order) ──────────────"
     echo " 11) Bump version (asks for notes, commits)"
     echo " 13) Full release: 7 → NAS → 12 → 9 in one go"
@@ -347,6 +385,8 @@ while true; do
         12) publish_flatpak ;;
         13) full_release ;;
         14) backup_key ;;
+        15) install_flatpak ;;
+        16) uninstall_flatpak ;;
         q|Q) exit 0 ;;
         *) err "Unknown choice." ;;
     esac

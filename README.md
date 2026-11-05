@@ -29,7 +29,7 @@ A tiny Markdown editor for GNOME, written in Rust with GTK4 + Libadwaita. Create
 Grab the latest `.flatpak` bundle from [GitHub Releases](https://github.com/oyzmo/bindle/releases/latest) or [oyzmo.no/apps](https://oyzmo.no/apps) and install it:
 
 ```sh
-flatpak install bindle-1.35.0.flatpak
+flatpak install bindle-1.35.1.flatpak
 ```
 
 or just double-click it in GNOME Software. Works on any Linux desktop with Flatpak set up; the GNOME runtime is fetched automatically if you don't have it.
@@ -53,8 +53,8 @@ flatpak-builder --user --install --force-clean build-dir no.oyzmo.Bindle.yml
 First download the source zip (`bindle-<version>-src.zip`) from [GitHub Releases](https://github.com/oyzmo/bindle/releases/latest) or [oyzmo.no/apps](https://oyzmo.no/apps) and unpack it:
 
 ```sh
-unzip bindle-1.35.0-src.zip
-cd bindle-1.35.0
+unzip bindle-1.35.1-src.zip
+cd bindle-1.35.1
 ```
 
 Then run the helper menu:
@@ -63,7 +63,7 @@ Then run the helper menu:
 ./bindle.sh
 ```
 
-It can install the build dependencies (dnf/apt/pacman/zypper), compile a release build, install the app into your GNOME desktop (`~/.local`, with icon and desktop entry), and uninstall it again.
+It can install the build dependencies (dnf/apt/pacman/zypper), compile a release build, install the app into your GNOME desktop (`~/.local`, with icon and desktop entry), and uninstall it again. It can also install the Flatpak from flatpak.oyzmo.no (so GNOME Software keeps it updated) or remove it.
 
 Manual build: `cargo build --release` (needs GTK4 ≥ 4.14 and Libadwaita ≥ 1.5 development headers).
 
