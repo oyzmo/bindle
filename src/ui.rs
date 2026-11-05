@@ -17,7 +17,7 @@ use crate::odf;
 use crate::preview;
 use crate::settings::{
     ColorScheme, DocState, FontSize, RemotePolicy, Settings, Theme, DOC_STATE_MAX,
-    RECENT_MAX,
+    RECENT_MAX, RECENT_MENU_MAX,
 };
 use crate::snippets::{self, Snippet};
 use crate::theme;
@@ -138,6 +138,9 @@ pub struct App {
     /// Recent documents, one click to open: the sidebar's top slot, so its
     /// rows stay put when a non-markdown file hides the panels below.
     files_panel: gtk4::Box,
+    files_scroll: gtk4::ScrolledWindow,
+    /// The Files divider has been sized to `FILES_ROWS` rows (persisted).
+    files_fitted: Cell<bool>,
     /// Rows mirror `files_order` by index.
     files_list: gtk4::ListBox,
     /// The Files panel's own order: `recent_files` as it stood at launch
@@ -791,6 +794,8 @@ impl App {
             editor_scroll,
             preview_scroll,
             files_panel,
+            files_scroll,
+            files_fitted: Cell::new(settings.files_fitted),
             files_list,
             top_panel,
             bottom_panel,
@@ -883,6 +888,7 @@ impl App {
             state.sidebar.set_position(settings.files_paned);
             state.lower.set_position(settings.vpaned);
         }
+        state.fit_files_panel();
         apply_color_scheme(state.color_scheme.get());
         state.apply_theme();
         // Each theme has a light and a dark set, so the palette has to be
@@ -1773,6 +1779,10 @@ impl App {
             action.set_state(&shown.to_variant());
             state.show_files.set(shown);
             state.apply_panels();
+            if shown {
+                state.fit_files_panel();
+                state.scroll_to_current_file();
+            }
             state.persist_settings();
         });
         self.window.add_action(&action);
@@ -3092,7 +3102,7 @@ impl App {
     /// fails with a toast instead.
     fn update_recent_menu(&self) {
         self.recent_menu.remove_all();
-        for path in self.recent_files.borrow().iter() {
+        for path in self.recent_files.borrow().iter().take(RECENT_MENU_MAX) {
             let item = gio::MenuItem::new(Some(&file_label(path)), None);
             item.set_action_and_target_value(
                 Some("win.open-recent"),
@@ -3207,6 +3217,82 @@ impl App {
             Some(row) => self.files_list.select_row(Some(&row)),
             None => self.files_list.unselect_all(),
         }
+        self.scroll_to_current_file();
+    }
+
+    /// Scroll the Files panel just far enough to show the selected row —
+    /// never when it is already in view, so clicking a row moves nothing.
+    /// Waits on the frame clock, since a freshly rebuilt list has no row
+    /// positions until GTK has laid it out.
+    fn scroll_to_current_file(&self) {
+        let list = self.files_list.clone();
+        let scroll = self.files_scroll.clone();
+        let panel = self.files_panel.clone();
+        let tries = Cell::new(0);
+        self.files_list.add_tick_callback(move |_, _| {
+            tries.set(tries.get() + 1);
+            let Some(row) = list.selected_row() else { return glib::ControlFlow::Break };
+            if !row.is_mapped() || row.height() == 0 {
+                return if tries.get() < 30 && panel.is_visible() {
+                    glib::ControlFlow::Continue
+                } else {
+                    glib::ControlFlow::Break
+                };
+            }
+            if let Some(bounds) = row.compute_bounds(&list) {
+                let adj = scroll.vadjustment();
+                let top = bounds.y() as f64;
+                let bottom = top + bounds.height() as f64;
+                if top < adj.value() {
+                    adj.set_value(top);
+                } else if bottom > adj.value() + adj.page_size() {
+                    adj.set_value(bottom - adj.page_size());
+                }
+            }
+            glib::ControlFlow::Break
+        });
+    }
+
+    /// Size the Files panel to `FILES_ROWS` rows, once per install (and once
+    /// for settings from before the history grew to 50). Measured from real
+    /// rows, so it follows the font; capped at half the sidebar so Insert
+    /// and Preview keep room. Vertical layout only — in the horizontal one
+    /// the divider is a width. With no rows yet it waits for a later launch.
+    fn fit_files_panel(self: &Rc<Self>) {
+        if self.files_fitted.get() || !self.show_files.get() || self.horizontal.get() {
+            return;
+        }
+        let state = self.clone();
+        let tries = Cell::new(0);
+        self.sidebar.add_tick_callback(move |_, _| {
+            tries.set(tries.get() + 1);
+            let first = state.files_list.row_at_index(0);
+            let ready = first.as_ref().is_some_and(|r| r.height() > 0)
+                && state.files_scroll.height() > 0;
+            let Some(first) = first.filter(|_| ready) else {
+                return if tries.get() < 60 { glib::ControlFlow::Continue } else { glib::ControlFlow::Break };
+            };
+            // Row pitch includes any spacing between rows, which the row's
+            // own height does not.
+            let mut n = 1;
+            while state.files_list.row_at_index(n).is_some() {
+                n += 1;
+            }
+            let pitch = state
+                .files_list
+                .row_at_index(1)
+                .and_then(|second| second.compute_bounds(&first))
+                .map_or(first.height(), |b| b.y() as i32);
+            let (_, natural, _, _) = state.files_list.measure(gtk4::Orientation::Vertical, -1);
+            let padding = (natural - n * pitch).max(0);
+            let header = state.files_panel.height() - state.files_scroll.height();
+            let want = header + padding + FILES_ROWS * pitch;
+            let cap = state.sidebar.height() / 2;
+            state.sidebar.set_position(want.min(cap).max(120));
+            state.files_fitted.set(true);
+            state.persist_settings();
+            glib::ControlFlow::Break
+        });
     }
 
     /// Re-stamp after writing the document ourselves.
@@ -5364,6 +5450,7 @@ impl App {
             hpaned: self.hpaned.position(),
             vpaned: self.lower.position(),
             files_paned: self.sidebar.position(),
+            files_fitted: self.files_fitted.get(),
             last_file: self.source.borrow().container().map(Path::to_path_buf),
             remote_images: self.remote_policy.get().as_str().to_string(),
             color_scheme: self.color_scheme.get().as_str().to_string(),
@@ -5596,6 +5683,9 @@ fn relative_to(base: &Path, target: &Path) -> PathBuf {
 
 /// A small dim heading above each sidebar panel, optionally followed by a
 /// lighter hint (e.g. the panel's keyboard shortcut).
+/// Rows the Files panel shows before the user resizes it; the rest scroll.
+const FILES_ROWS: i32 = 10;
+
 fn section(
     title: &str,
     hint: Option<&str>,

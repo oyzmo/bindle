@@ -16,6 +16,10 @@ pub struct Settings {
     pub vpaned: i32,
     /// Position of the divider between the Files panel and the panels below.
     pub files_paned: i32,
+    /// `files_paned` has been sized to show `ui::FILES_ROWS` rows. False on
+    /// a fresh install and in settings from before 1.35, so both get the
+    /// fit once; after that the user's own divider position stands.
+    pub files_fitted: bool,
     #[serde(with = "path_json::opt")]
     pub last_file: Option<PathBuf>,
     /// Remote image policy: "ask" (per document), "always" or "never".
@@ -81,8 +85,12 @@ pub struct Settings {
     pub frozen_files: Vec<PathBuf>,
 }
 
-/// Documents in the "Open Recent" menu.
-pub const RECENT_MAX: usize = 10;
+/// Documents kept in the recent history, which the Files panel shows.
+pub const RECENT_MAX: usize = 50;
+
+/// Of those, the ones the "Open Recent" menu lists: a menu taller than the
+/// screen is no use.
+pub const RECENT_MENU_MAX: usize = 10;
 
 /// Documents to keep state for; the oldest entries fall off.
 pub const DOC_STATE_MAX: usize = 200;
@@ -262,6 +270,7 @@ impl Default for Settings {
             hpaned: 300,
             vpaned: 320,
             files_paned: 200,
+            files_fitted: false,
             last_file: None,
             remote_images: "ask".to_string(),
             color_scheme: "system".to_string(),

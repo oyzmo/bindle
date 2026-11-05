@@ -42,6 +42,11 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.35.0" date="2026-11-05">
+      <description>
+        <p>Files panel keeps 50 recent documents, opens about 10 rows tall and scrolls to the open one; Open Recent still lists 10</p>
+      </description>
+    </release>
     <release version="1.34.2" date="2026-10-29">
       <description>
         <p>Hover shading of preview lines only when the preview is the main view</p>
