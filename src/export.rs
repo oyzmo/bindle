@@ -262,7 +262,15 @@ fn escape_markup(text: &str) -> String {
     glib::markup_escape_text(text).to_string()
 }
 
+/// Decode an image for PDF export and printing. Refused past
+/// `preview::IMAGE_MAX_PIXELS` from the header, as the preview does: a small
+/// PNG declaring 30000×30000 would otherwise allocate gigabytes on the main
+/// loop (and twice more re-encoding it), and the caller's placeholder is
+/// the better answer.
 pub(crate) fn pixbuf_from_bytes(bytes: &[u8]) -> Option<gdk_pixbuf::Pixbuf> {
+    if !crate::preview::image_size_ok(bytes) {
+        return None;
+    }
     let stream = gio::MemoryInputStream::from_bytes(&glib::Bytes::from(bytes));
     gdk_pixbuf::Pixbuf::from_stream(&stream, gio::Cancellable::NONE).ok()
 }

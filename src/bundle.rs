@@ -68,7 +68,9 @@ pub struct PackInfo {
     /// Every entry name in the zip, prefix included, as of opening or the
     /// last save — what a newly staged asset must not collide with. Kept
     /// here so staging never has to re-read the pack on the main loop.
-    pub entries: Vec<String>,
+    /// Shared, since the info is cloned for every asset read and a pack
+    /// can hold many entries.
+    pub entries: std::sync::Arc<Vec<String>>,
 }
 
 pub fn is_bundle(path: &Path) -> bool {
@@ -92,7 +94,7 @@ fn is_text_name(name: &str) -> bool {
 ///
 /// With more than one candidate the order of `TEXT_NAMES` decides, not the
 /// directory listing's, and only a regular file counts.
-pub fn open_bundle(dir: &Path) -> io::Result<(String, String, Option<&'static str>)> {
+pub fn open_bundle(dir: &Path) -> io::Result<(String, String, Option<String>)> {
     // Listed first so a missing bundle stays `NotFound` (ui.rs reads that
     // as an unmounted share).
     let names: Vec<String> =
@@ -110,7 +112,7 @@ pub fn open_bundle(dir: &Path) -> io::Result<(String, String, Option<&'static st
 /// Read the markdown of a .textpack zip: (text, entry location, legacy
 /// encoding). Decoded like a plain file (`doc::decode_text`): a pack made
 /// on Windows has CRLF lines or Windows-1252 text as often as a bundle.
-pub fn open_pack(path: &Path) -> io::Result<(String, PackInfo, Option<&'static str>)> {
+pub fn open_pack(path: &Path) -> io::Result<(String, PackInfo, Option<String>)> {
     let mut zip = ZipArchive::new(File::open(path)?).map_err(io::Error::other)?;
     let names: Vec<String> = zip.file_names().map(String::from).collect();
     let mut best: Option<PackInfo> = None;
@@ -125,11 +127,11 @@ pub fn open_pack(path: &Path) -> io::Result<(String, PackInfo, Option<&'static s
             && full.matches('/').count() <= 1
             && best.as_ref().is_none_or(|b| prefix.len() < b.prefix.len())
         {
-            best = Some(PackInfo { prefix, text_name: base.to_string(), entries: Vec::new() });
+            best = Some(PackInfo { prefix, text_name: base.to_string(), entries: Default::default() });
         }
     }
     let mut info = best.ok_or_else(|| io::Error::other("no text.md in the textpack"))?;
-    info.entries = names;
+    info.entries = std::sync::Arc::new(names);
     let mut entry = zip
         .by_name(&format!("{}{}", info.prefix, info.text_name))
         .map_err(io::Error::other)?;
@@ -141,7 +143,7 @@ pub fn open_pack(path: &Path) -> io::Result<(String, PackInfo, Option<&'static s
     if bytes.len() as u64 > TEXT_MAX_BYTES {
         return Err(io::Error::other("the pack's text entry is unreasonably large"));
     }
-    let (text, legacy) = crate::doc::decode_text(bytes, crate::doc::DocKind::of(Path::new(&info.text_name)));
+    let (text, legacy) = crate::doc::decode_text(bytes, crate::doc::DocKind::of(Path::new(&info.text_name)))?;
     Ok((text, info, legacy))
 }
 
@@ -166,9 +168,10 @@ pub fn read_asset(path: &Path, info: &PackInfo, rel: &str, max: u64) -> Option<V
 /// Rewrite a pack with new text and any staged assets. Atomic: unchanged
 /// entries are raw-copied into a temp file that then replaces the original,
 /// via `doc::replace_via_temp` so a symlinked pack stays a symlink and a
-/// private one stays private. Unlike a plain file there is no write-in-place
-/// fallback: the new pack is built *from* the old one, so truncating it first
-/// would destroy the source mid-copy. Returns the entry names now in it.
+/// private one stays private. Where that is refused, `replace_or_in_place`
+/// builds the new pack in memory before writing it in place: it is built
+/// *from* the old one, so truncating first would destroy the source
+/// mid-copy. Returns the entry names now in it.
 pub fn save_pack(
     path: &Path,
     info: &PackInfo,
@@ -177,7 +180,8 @@ pub fn save_pack(
 ) -> io::Result<Vec<String>> {
     let mut old = ZipArchive::new(File::open(path)?).map_err(io::Error::other)?;
     let mut names: Vec<String> = Vec::new();
-    let result = crate::doc::replace_via_temp(path, |file| {
+    crate::doc::replace_or_in_place(path, |file| {
+        names.clear();
         let mut writer = ZipWriter::new(file);
         let opts = SimpleFileOptions::default();
         let text_full = format!("{}{}", info.prefix, info.text_name);
@@ -203,15 +207,14 @@ pub fn save_pack(
         }
         writer.finish().map_err(io::Error::other)?;
         Ok(())
-    });
-    match result {
-        Ok(()) => Ok(names),
-        Err(crate::doc::Replace::Unsupported(e) | crate::doc::Replace::Failed(e)) => Err(e),
-    }
+    })?;
+    Ok(names)
 }
 
-/// Write a fresh .textpack containing `text` and `assets` (file name, content).
-pub fn export_pack(dest: &Path, text: &str, assets: &[(String, AssetSource)]) -> io::Result<()> {
+/// Write a fresh .textpack containing `text` and `assets` (file name,
+/// content). Returns how the pack is laid out, so a window that switches to
+/// editing it needs no read back.
+pub fn export_pack(dest: &Path, text: &str, assets: &[(String, AssetSource)]) -> io::Result<PackInfo> {
     let stem = dest
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
@@ -219,7 +222,7 @@ pub fn export_pack(dest: &Path, text: &str, assets: &[(String, AssetSource)]) ->
     let prefix = format!("{stem}.textbundle/");
     // Through `replace_via_temp` like pack saves: overwriting an existing
     // pack keeps a symlink a symlink and a private file private.
-    let result = crate::doc::replace_via_temp(dest, |file| {
+    crate::doc::replace_or_in_place(dest, |file| {
         let mut writer = ZipWriter::new(file);
         let opts = SimpleFileOptions::default();
         writer.start_file(format!("{prefix}info.json"), opts).map_err(io::Error::other)?;
@@ -234,11 +237,10 @@ pub fn export_pack(dest: &Path, text: &str, assets: &[(String, AssetSource)]) ->
         }
         writer.finish().map_err(io::Error::other)?;
         Ok(())
-    });
-    match result {
-        Ok(()) => Ok(()),
-        Err(crate::doc::Replace::Unsupported(e) | crate::doc::Replace::Failed(e)) => Err(e),
-    }
+    })?;
+    let mut entries = vec![format!("{prefix}info.json"), format!("{prefix}text.md")];
+    entries.extend(assets.iter().map(|(name, _)| format!("{prefix}assets/{name}")));
+    Ok(PackInfo { prefix, text_name: "text.md".to_string(), entries: std::sync::Arc::new(entries) })
 }
 
 /// Write a pack attachment to a read-only temp file for viewing (`scope`
@@ -249,9 +251,76 @@ pub fn export_pack(dest: &Path, text: &str, assets: &[(String, AssetSource)]) ->
 ///
 /// The copies live in the user's own runtime directory, not the shared
 /// `/tmp`: there another local user could plant a symlink under the
-/// predictable name and have the write land wherever it points.
+/// predictable name and have the write land wherever it points. That
+/// directory is RAM shared with the session's sockets, so a large attachment
+/// goes to the (equally private) cache directory instead, and every copy is
+/// removed again: this instance's on quit (`remove_own_attachments`),
+/// leftovers of instances that died at the next start (`sweep_attachments`).
 pub fn extract_readonly_temp(scope: &str, rel: &str, bytes: &[u8]) -> io::Result<PathBuf> {
-    extract_readonly_into(&gtk4::glib::user_runtime_dir(), scope, rel, bytes)
+    let root = if bytes.len() > TMPFS_ATTACHMENT_MAX {
+        gtk4::glib::user_cache_dir().join("bindle")
+    } else {
+        gtk4::glib::user_runtime_dir()
+    };
+    extract_readonly_into(&instance_dir(&root)?, scope, rel, bytes)
+}
+
+/// Attachments larger than this are extracted to the cache directory rather
+/// than the tmpfs runtime directory.
+const TMPFS_ATTACHMENT_MAX: usize = 32 << 20;
+
+/// This process's attachment directory under `root`, and the lock that tells
+/// other instances it is alive (a held lock, not a PID: a Flatpak instance's
+/// PIDs live in their own namespace).
+static INSTANCES: std::sync::Mutex<Vec<(PathBuf, File)>> = std::sync::Mutex::new(Vec::new());
+
+fn attachments_in(root: &Path) -> PathBuf {
+    root.join("bindle-attachments")
+}
+
+fn instance_dir(root: &Path) -> io::Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut instances = INSTANCES.lock().unwrap_or_else(|e| e.into_inner());
+    let parent = attachments_in(root);
+    if let Some((dir, _)) = instances.iter().find(|(dir, _)| dir.parent() == Some(parent.as_path())) {
+        return Ok(dir.clone());
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let dir = parent.join(format!("{}-{stamp}", std::process::id()));
+    fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+    let lock = File::create(dir.join(".lock"))?;
+    lock.try_lock().map_err(io::Error::other)?;
+    instances.push((dir.clone(), lock));
+    Ok(dir)
+}
+
+/// Remove attachment copies left by instances that are no longer running
+/// (and the pre-1.36 per-pack folders), in both places they can be.
+pub fn sweep_attachments() {
+    for root in [gtk4::glib::user_runtime_dir(), gtk4::glib::user_cache_dir().join("bindle")] {
+        sweep_attachments_in(&root);
+    }
+}
+
+fn sweep_attachments_in(root: &Path) {
+    let Ok(entries) = fs::read_dir(attachments_in(root)) else { return };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let alive = File::open(dir.join(".lock")).is_ok_and(|lock| lock.try_lock().is_err());
+        if !alive {
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+}
+
+/// Remove this instance's attachment copies (on quit).
+pub fn remove_own_attachments() {
+    let mut instances = INSTANCES.lock().unwrap_or_else(|e| e.into_inner());
+    for (dir, _lock) in instances.drain(..) {
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
 
 fn extract_readonly_into(root: &Path, scope: &str, rel: &str, bytes: &[u8]) -> io::Result<PathBuf> {
@@ -260,7 +329,7 @@ fn extract_readonly_into(root: &Path, scope: &str, rel: &str, bytes: &[u8]) -> i
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "attachment".to_string());
-    let dir = root.join("bindle-attachments").join(scope);
+    let dir = root.join(scope);
     fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
     let path = dir.join(name);
     // A previous extraction: replace it rather than write through it.
@@ -672,7 +741,7 @@ mod tests {
         let dir = scratch("extract");
         let victim = dir.join("victim.txt");
         fs::write(&victim, b"keep me").unwrap();
-        let scope_dir = dir.join("bindle-attachments").join("s");
+        let scope_dir = dir.join("s");
         fs::create_dir_all(&scope_dir).unwrap();
         std::os::unix::fs::symlink(&victim, scope_dir.join("a.pdf")).unwrap();
         let path = extract_readonly_into(&dir, "s", "assets/a.pdf", b"attachment").unwrap();
@@ -683,6 +752,23 @@ mod tests {
         extract_readonly_into(&dir, "s", "assets/a.pdf", b"again").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"again");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_sweep_removes_only_dead_instances_attachments() {
+        let root = scratch("sweep");
+        let mine = instance_dir(&root).unwrap();
+        extract_readonly_into(&mine, "s", "assets/a.pdf", b"live").unwrap();
+        let dead = attachments_in(&root).join("1-1");
+        extract_readonly_into(&dead, "s", "assets/b.pdf", b"stale").unwrap();
+        File::create(dead.join(".lock")).unwrap();
+        let old_layout = attachments_in(&root).join("0123456789abcdef");
+        extract_readonly_into(&old_layout, "", "c.pdf", b"old").unwrap();
+        sweep_attachments_in(&root);
+        assert!(mine.join("s/a.pdf").exists());
+        assert!(!dead.exists());
+        assert!(!old_layout.exists());
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

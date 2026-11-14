@@ -80,40 +80,76 @@ impl DocKind {
 /// Read a document as text: UTF-8, falling back to CP437 for .nfo files
 /// (the traditional encoding of their box-drawing art) and Windows-1252 for
 /// anything else. CRLF/CR line endings are normalized to LF; saving writes
-/// UTF-8 with LF back. The second value names the legacy encoding used, if
-/// any, so the caller can say that saving will convert the file.
+/// UTF-8 with LF back. The second value is a notice for the user when saving
+/// will change the file beyond the edits (legacy encoding, CRLF, BOM) — a
+/// one-typo fix to a Windows file rewrites every line, so it must not be
+/// silent.
 ///
 /// Never lossy UTF-8: that turns every non-ASCII byte of an old Latin-1
 /// file into U+FFFD, and the next save writes those over the original for
 /// good. Both fallbacks map every byte to a character, so nothing is lost.
 ///
 /// A byte-order mark is dropped (Notepad writes one, and it would sit in
-/// front of the first heading); one that says UTF-16 decodes as UTF-16.
-pub fn read_text(path: &Path) -> io::Result<(String, Option<&'static str>)> {
-    Ok(decode_text(fs::read(path)?, DocKind::of(path)))
+/// front of the first heading); one that says UTF-16 decodes as UTF-16, and
+/// so does BOM-less UTF-16 recognised by its NUL pattern. Anything else with
+/// a NUL byte is refused as not text: GTK will not take a NUL into a buffer
+/// (debug glib panics, release GTK drops the whole insert), so it would open
+/// as an empty document that the next save writes over the file.
+pub fn read_text(path: &Path) -> io::Result<(String, Option<String>)> {
+    decode_text(fs::read(path)?, DocKind::of(path))
 }
 
 /// `read_text` for bytes already in hand (a pack's text entry): `kind`
 /// picks the 8-bit fallback, CP437 for NFO art, Windows-1252 otherwise.
-pub fn decode_text(bytes: Vec<u8>, kind: DocKind) -> (String, Option<&'static str>) {
-    if let Some(text) = utf16(&bytes) {
-        return (normalize_newlines(text), Some("UTF-16"));
-    }
-    let (text, legacy) = match String::from_utf8(bytes) {
-        Ok(s) => match s.strip_prefix('\u{FEFF}') {
-            Some(rest) => (rest.to_string(), None),
-            None => (s, None),
-        },
-        Err(err) => {
-            let bytes = err.into_bytes();
-            if kind == DocKind::Nfo {
-                (cp437(&bytes), Some("CP437"))
-            } else {
-                (cp1252(&bytes), Some("Windows-1252"))
+pub fn decode_text(bytes: Vec<u8>, kind: DocKind) -> io::Result<(String, Option<String>)> {
+    // BOM-less UTF-16 of plain ASCII is valid UTF-8 (NUL is a character
+    // there), so the NUL pattern is checked before trying UTF-8.
+    let utf16 = utf16(&bytes).or_else(|| bytes.contains(&0).then(|| utf16_without_bom(&bytes)).flatten());
+    let (text, encoding, bom) = if let Some(text) = utf16 {
+        (text, Some("UTF-16"), false)
+    } else {
+        match String::from_utf8(bytes) {
+            Ok(s) => match s.strip_prefix('\u{FEFF}') {
+                Some(rest) => (rest.to_string(), None, true),
+                None => (s, None, false),
+            },
+            Err(err) => {
+                let bytes = err.into_bytes();
+                if kind == DocKind::Nfo {
+                    (cp437(&bytes), Some("CP437"), false)
+                } else {
+                    (cp1252(&bytes), Some("Windows-1252"), false)
+                }
             }
         }
     };
-    (normalize_newlines(text), legacy)
+    if text.contains('\0') {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "it contains NUL bytes — not a text file"));
+    }
+    let crlf = text.contains('\r');
+    Ok((normalize_newlines(text), conversion_notice(encoding, crlf, bom)))
+}
+
+/// What saving will change, for the open toast; `None` when nothing.
+fn conversion_notice(encoding: Option<&str>, crlf: bool, bom: bool) -> Option<String> {
+    let mut found = Vec::new();
+    let mut becomes = Vec::new();
+    if let Some(encoding) = encoding {
+        found.push(format!("{encoding} text"));
+        becomes.push("UTF-8");
+    }
+    if crlf {
+        found.push("CRLF line endings".to_string());
+        becomes.push("LF");
+    }
+    if bom {
+        found.push("a byte-order mark".to_string());
+        becomes.push("no byte-order mark");
+    }
+    if found.is_empty() {
+        return None;
+    }
+    Some(format!("Read {}; saving writes {}", found.join(" and "), becomes.join(" and ")))
 }
 
 fn normalize_newlines(text: String) -> String {
@@ -132,11 +168,34 @@ fn utf16(bytes: &[u8]) -> Option<String> {
         [0xFE, 0xFF, ..] => u16::from_be_bytes,
         _ => return None,
     };
-    let body = &bytes[2..];
-    if body.len() % 2 != 0 {
+    decode_utf16(&bytes[2..], from)
+}
+
+/// UTF-16 without a byte-order mark, recognised by the NUL high bytes of
+/// mostly-Latin text: at least a third of the code units have a zero byte on
+/// one side, and (almost) none on the other.
+fn utf16_without_bom(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 2 || !bytes.len().is_multiple_of(2) {
         return None;
     }
-    let units: Vec<u16> = body.chunks_exact(2).map(|c| from([c[0], c[1]])).collect();
+    let units = bytes.len() / 2;
+    let zeros = |side: usize| bytes.as_chunks::<2>().0.iter().filter(|c| c[side] == 0).count();
+    let (even, odd) = (zeros(0), zeros(1));
+    let from: fn([u8; 2]) -> u16 = if odd * 3 >= units && even * 20 <= units {
+        u16::from_le_bytes
+    } else if even * 3 >= units && odd * 20 <= units {
+        u16::from_be_bytes
+    } else {
+        return None;
+    };
+    decode_utf16(bytes, from)
+}
+
+fn decode_utf16(body: &[u8], from: fn([u8; 2]) -> u16) -> Option<String> {
+    let (pairs, []) = body.as_chunks::<2>() else {
+        return None;
+    };
+    let units: Vec<u16> = pairs.iter().map(|&pair| from(pair)).collect();
     String::from_utf16(&units).ok()
 }
 
@@ -148,6 +207,17 @@ fn utf16(bytes: &[u8]) -> Option<String> {
 /// readable by others while it is being written. A chmod the filesystem
 /// refuses leaves it owner-only: narrower than before, never wider.
 ///
+/// A rename needs only write access to the *folder* and makes a new inode,
+/// so three cases are refused rather than silently changed: a file without
+/// owner write permission is `Failed` (PermissionDenied — saving over a
+/// read-only file must not just happen); a hard-linked file, or one owned by
+/// someone else, is `Unsupported`, so callers with an in-place path use it
+/// (the other link keeps up to date, the owner stays the owner). The group is
+/// copied where the system allows it.
+///
+/// The temp name carries no PID, so a save killed midway leaves a temp the
+/// next save of the same file reclaims instead of one that stays for good.
+///
 /// `Unsupported` means the location refused the temp file or the rename
 /// (some gvfs backends), and the original is untouched; `Failed` is an error
 /// writing the temp file, such as a full disk.
@@ -155,16 +225,27 @@ pub fn replace_via_temp(
     path: &Path,
     write: impl FnOnce(&mut fs::File) -> io::Result<()>,
 ) -> Result<(), Replace> {
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let target = resolve(path);
     let Some(name) = target.file_name() else {
         return Err(Replace::Unsupported(io::Error::other("not a file path")));
     };
     let mut tmp_name = std::ffi::OsString::from(".");
     tmp_name.push(name);
-    tmp_name.push(format!(".{}.tmp", std::process::id()));
+    tmp_name.push(".bindle-tmp");
     let tmp = target.with_file_name(tmp_name);
-    let original = fs::metadata(&target).ok().map(|m| m.permissions());
+    let original = fs::metadata(&target).ok();
+    if let Some(meta) = &original {
+        if meta.permissions().readonly() {
+            return Err(Replace::Failed(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the file is read-only",
+            )));
+        }
+        if meta.nlink() > 1 {
+            return Err(Replace::Unsupported(io::Error::other("the file has other hard links")));
+        }
+    }
     // A stale temp from a crashed save would keep its old mode: start fresh.
     let _ = fs::remove_file(&tmp);
     let mut options = fs::OpenOptions::new();
@@ -173,8 +254,18 @@ pub fn replace_via_temp(
         options.mode(0o600);
     }
     let mut file = options.open(&tmp).map_err(Replace::refused)?;
-    if let Some(perms) = original {
-        let _ = file.set_permissions(perms);
+    if let Some(meta) = &original {
+        // The temp is ours; if the original is not, replacing it would take
+        // it from its owner. Write in place instead.
+        if file.metadata().is_ok_and(|m| m.uid() != meta.uid()) {
+            drop(file);
+            let _ = fs::remove_file(&tmp);
+            return Err(Replace::Unsupported(io::Error::other("the file belongs to another user")));
+        }
+        if file.metadata().is_ok_and(|m| m.gid() != meta.gid()) {
+            let _ = std::os::unix::fs::fchown(&file, None, Some(meta.gid()));
+        }
+        let _ = file.set_permissions(meta.permissions());
     }
     let written = write(&mut file).and_then(|_| match file.sync_all() {
         // FUSE filesystems may not implement fsync; the rename still helps.
@@ -191,6 +282,31 @@ pub fn replace_via_temp(
         return Err(Replace::refused(err));
     }
     Ok(())
+}
+
+/// Anything `replace_or_in_place` can write a file's content into.
+pub trait WriteSeek: io::Write + io::Seek {}
+impl<T: io::Write + io::Seek> WriteSeek for T {}
+
+/// `replace_via_temp`, and where that is refused (a backend without temp
+/// files or rename, a hard-linked file, someone else's file) the content is
+/// built in memory first and then written over the file in place — so a
+/// writer that reads the original while writing (a pack rebuilt from the old
+/// archive) has finished reading before anything is truncated. `write` runs
+/// again for the second attempt and must start from scratch each time.
+pub fn replace_or_in_place(
+    path: &Path,
+    mut write: impl FnMut(&mut dyn WriteSeek) -> io::Result<()>,
+) -> io::Result<()> {
+    match replace_via_temp(path, |file| write(file)) {
+        Ok(()) => Ok(()),
+        Err(Replace::Failed(err)) => Err(err),
+        Err(Replace::Unsupported(_)) => {
+            let mut buf = io::Cursor::new(Vec::new());
+            write(&mut buf)?;
+            fs::write(resolve(path), buf.into_inner())
+        }
+    }
 }
 
 /// Why `replace_via_temp` failed; see there.
@@ -521,7 +637,7 @@ mod tests {
         fs::write(&path, bytes).unwrap();
         let (text, legacy) = read_text(&path).unwrap();
         assert_eq!(text, "blåbær €5 \u{81}");
-        assert_eq!(legacy, Some("Windows-1252"));
+        assert_eq!(legacy.as_deref(), Some("Read Windows-1252 text; saving writes UTF-8"));
         assert!(!text.contains('\u{FFFD}'));
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -532,18 +648,86 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("a.md");
         fs::write(&path, b"\xEF\xBB\xBF# T\r\n").unwrap();
-        assert_eq!(read_text(&path).unwrap(), ("# T\n".to_string(), None));
+        let notice = "Read CRLF line endings and a byte-order mark; saving writes LF and no byte-order mark";
+        assert_eq!(read_text(&path).unwrap(), ("# T\n".to_string(), Some(notice.to_string())));
         let mut le = vec![0xFF, 0xFE];
         le.extend("# blå\r\n".encode_utf16().flat_map(u16::to_le_bytes));
         fs::write(&path, &le).unwrap();
-        assert_eq!(read_text(&path).unwrap(), ("# blå\n".to_string(), Some("UTF-16")));
+        let notice = "Read UTF-16 text and CRLF line endings; saving writes UTF-8 and LF";
+        assert_eq!(read_text(&path).unwrap(), ("# blå\n".to_string(), Some(notice.to_string())));
         let mut be = vec![0xFE, 0xFF];
         be.extend("æ".encode_utf16().flat_map(u16::to_be_bytes));
         fs::write(&path, &be).unwrap();
         assert_eq!(read_text(&path).unwrap().0, "æ");
         // Odd length is not UTF-16 after all: 8-bit fallback, nothing lost.
         fs::write(&path, b"\xFF\xFEa").unwrap();
-        assert_eq!(read_text(&path).unwrap(), ("ÿþa".to_string(), Some("Windows-1252")));
+        let notice = "Read Windows-1252 text; saving writes UTF-8";
+        assert_eq!(read_text(&path).unwrap(), ("ÿþa".to_string(), Some(notice.to_string())));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn plain_utf8_with_lf_needs_no_notice() {
+        assert_eq!(decode_text(b"# T\n".to_vec(), DocKind::Markdown).unwrap(), ("# T\n".to_string(), None));
+    }
+
+    #[test]
+    fn nul_bytes_are_refused_unless_they_are_bomless_utf16() {
+        // A binary file under a text name: GTK would drop the whole insert.
+        let err = decode_text(b"PK\x03\x04\x00\x00junk\xFF".to_vec(), DocKind::Text).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // Valid UTF-8 with a NUL in it is still not text for GTK.
+        assert!(decode_text(b"a\0b".to_vec(), DocKind::Text).is_err());
+        let le: Vec<u8> = "key = blå\n".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let (text, notice) = decode_text(le, DocKind::Toml).unwrap();
+        assert_eq!(text, "key = blå\n");
+        assert_eq!(notice.as_deref(), Some("Read UTF-16 text; saving writes UTF-8"));
+        let be: Vec<u8> = "abc".encode_utf16().flat_map(u16::to_be_bytes).collect();
+        assert_eq!(decode_text(be, DocKind::Text).unwrap().0, "abc");
+    }
+
+    #[test]
+    fn atomic_write_refuses_a_read_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("bindle-ro-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("locked.md");
+        fs::write(&path, "old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+        let err = write_atomic(&path, b"new").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "old");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn atomic_write_keeps_hard_links_by_writing_in_place() {
+        let dir = std::env::temp_dir().join(format!("bindle-hardlink-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.md");
+        fs::write(&path, "old").unwrap();
+        fs::hard_link(&path, dir.join("b.md")).unwrap();
+        write_atomic(&path, b"new").unwrap();
+        assert_eq!(fs::read_to_string(dir.join("b.md")).unwrap(), "new");
+        // The in-place fallback also serves writers that read the original.
+        replace_or_in_place(&path, |w| w.write_all(b"newer")).unwrap();
+        assert_eq!(fs::read_to_string(dir.join("b.md")).unwrap(), "newer");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_stale_temp_from_a_killed_save_is_reclaimed() {
+        let dir = std::env::temp_dir().join(format!("bindle-stale-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("doc.md");
+        fs::write(&path, "old").unwrap();
+        fs::write(dir.join(".doc.md.bindle-tmp"), "half a save").unwrap();
+        write_atomic(&path, b"new").unwrap();
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
         fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -51,6 +51,8 @@ fn main() -> glib::ExitCode {
     app.connect_startup(|app| {
         ui::fix_font_rendering();
         ui::load_css();
+        // Opened pack attachments of instances that did not quit cleanly.
+        bindle::bundle::sweep_attachments();
         let accels: [(&str, &[&str]); 10] = [
             ("win.new", &["<Control>n"]),
             ("win.print", &["<Control>p"]),
@@ -70,6 +72,7 @@ fn main() -> glib::ExitCode {
             app.set_accels_for_action(action, keys);
         }
     });
+    app.connect_shutdown(|_| bindle::bundle::remove_own_attachments());
     app.connect_activate(|app| ui::present(app, None));
     app.connect_open(|app, files, _| {
         let path = files.first().and_then(|f| f.path());

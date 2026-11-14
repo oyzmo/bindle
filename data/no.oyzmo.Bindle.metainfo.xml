@@ -42,6 +42,23 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.35.2" date="2026-11-14">
+      <description>
+        <ul>
+          <li>Files with NUL bytes refuse to open instead of loading empty; BOM-less UTF-16 is recognised</li>
+          <li>Opening tells you when saving converts CRLF line endings or drops a byte-order mark</li>
+          <li>Saving never silently replaces a read-only file, breaks a hard link or takes a file from its owner</li>
+          <li>Save as TextPack rebinds at once, so typing meanwhile no longer goes into the old file</li>
+          <li>A vanished attachment no longer blocks every save of a TextPack</li>
+          <li>Exporting a TextPack asks about symlinks that point outside the document's folder</li>
+          <li>PDF export and printing refuse images too large to decode safely</li>
+          <li>TextPack images decode off the main loop; opened attachments are cleaned up</li>
+          <li>Ctrl+B, Ctrl+I and Ctrl+Space are off in non-markdown files</li>
+          <li>Several instances no longer erase each other's recent files and pins</li>
+          <li>Faster editor scrolling with the viewport bar, find in long documents and attaching big files</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.35.1" date="2026-11-05">
       <description>
         <p>bindle.sh can install the Flatpak from flatpak.oyzmo.no, and uninstall it</p>

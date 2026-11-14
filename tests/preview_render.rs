@@ -431,7 +431,8 @@ fn images_in_table_cells_stay_in_their_cell() {
     let pixbuf = gtk4::gdk_pixbuf::Pixbuf::new(gtk4::gdk_pixbuf::Colorspace::Rgb, false, 8, 16, 16)
         .expect("pixbuf");
     let png = pixbuf.save_to_bufferv("png", &[]).expect("png");
-    let loader = move |dest: &str| (dest == "pic.png").then(|| gtk4::glib::Bytes::from(&png[..]));
+    let texture = gtk4::gdk::Texture::from_bytes(&gtk4::glib::Bytes::from(&png[..])).expect("texture");
+    let loader = move |dest: &str| (dest == "pic.png").then(|| texture.clone());
 
     let markdown = "Intro\n\n| Pic | Name |\n| - | - |\n| ![cat](pic.png) | Tom |\n";
     preview::render(&buffer, markdown, None, false, None, Some(&loader));

@@ -46,7 +46,7 @@ fn textpack_roundtrip() {
     let (text, info, _) = bundle::open_pack(&pack).unwrap();
     assert_eq!(text, "# Changed\n");
     // What a save reports is what a fresh open of the pack finds.
-    let mut reopened = info.entries.clone();
+    let mut reopened = (*info.entries).clone();
     saved.sort();
     reopened.sort();
     assert_eq!(saved, reopened);
@@ -146,7 +146,7 @@ fn a_legacy_pack_with_a_duplicate_entry_opens_decoded_and_saves() {
 
     let (text, info, legacy) = bundle::open_pack(&pack).unwrap();
     assert_eq!(text, "blåbær\n");
-    assert_eq!(legacy, Some("Windows-1252"));
+    assert!(legacy.is_some_and(|n| n.contains("Windows-1252")));
     // zip's reader already keeps one entry per name, so a save never meets
     // the duplicate (the writer would refuse it).
     assert_eq!(info.entries.iter().filter(|n| *n == "assets/a.png").count(), 1);

@@ -1864,8 +1864,9 @@ impl OdtWriter<'_> {
             .then(|| (self.resolve)(&dest))
             .flatten()
             .and_then(|bytes| {
-                let pixbuf = export::pixbuf_from_bytes(&bytes)?;
-                let (w, h) = (pixbuf.width(), pixbuf.height());
+                // Only the size is needed, so it comes from the header: no
+                // decode, and the bytes are embedded as they are.
+                let (w, h) = crate::preview::image_dimensions(&bytes)?;
                 (w > 0 && h > 0).then_some((bytes, w, h))
             });
         let Some((bytes, w, h)) = embedded else {
@@ -1933,16 +1934,12 @@ pub fn write_odt(path: &Path, title: &str, text: &str, content: Content) -> Resu
             (body, Vec::new())
         }
     };
-    match crate::doc::replace_via_temp(path, |file| write_package(file, title, &body, &pictures)) {
-        Ok(()) => Ok(()),
-        Err(crate::doc::Replace::Unsupported(err) | crate::doc::Replace::Failed(err)) => {
-            Err(err.to_string())
-        }
-    }
+    crate::doc::replace_or_in_place(path, |file| write_package(file, title, &body, &pictures))
+        .map_err(|err| err.to_string())
 }
 
 fn write_package(
-    dest: &mut File,
+    dest: &mut dyn crate::doc::WriteSeek,
     title: &str,
     body: &str,
     pictures: &[(String, &'static str, Vec<u8>)],

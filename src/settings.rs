@@ -95,6 +95,56 @@ pub const RECENT_MENU_MAX: usize = 10;
 /// Documents to keep state for; the oldest entries fall off.
 pub const DOC_STATE_MAX: usize = 200;
 
+/// The paths in this instance's lists as of its last save: the base of the
+/// merge `Settings::merge_lists` does when several instances share the file.
+#[derive(Clone, Default)]
+pub struct ListBase {
+    recent: Vec<PathBuf>,
+    frozen: Vec<PathBuf>,
+    doc_state: Vec<PathBuf>,
+}
+
+impl ListBase {
+    pub fn of(settings: &Settings) -> ListBase {
+        ListBase {
+            recent: settings.recent_files.clone(),
+            frozen: settings.frozen_files.clone(),
+            doc_state: settings.doc_state.iter().map(|d| d.path.clone()).collect(),
+        }
+    }
+}
+
+/// `ours`, followed by the entries of `disk` this instance neither has nor
+/// dropped since `base` — another instance's additions survive, and what
+/// this one removed stays removed.
+fn merge_list<T>(ours: Vec<T>, disk: Vec<T>, base: &[PathBuf], key: impl Fn(&T) -> &PathBuf) -> Vec<T> {
+    let mut merged = ours;
+    for item in disk {
+        let path = key(&item);
+        if !base.contains(path) && !merged.iter().any(|m| key(m) == path) {
+            merged.push(item);
+        }
+    }
+    merged
+}
+
+impl Settings {
+    /// Fold in the list-valued fields another instance wrote to `disk` since
+    /// this one last saved (`base`). Each instance holds its own launch-time
+    /// copy of the history, pins and document state, and writing the whole
+    /// struct used to erase whatever the other had recorded.
+    pub fn merge_lists(&mut self, disk: Settings, base: &ListBase) {
+        self.recent_files =
+            merge_list(std::mem::take(&mut self.recent_files), disk.recent_files, &base.recent, |p| p);
+        self.recent_files.truncate(RECENT_MAX);
+        self.frozen_files =
+            merge_list(std::mem::take(&mut self.frozen_files), disk.frozen_files, &base.frozen, |p| p);
+        self.doc_state =
+            merge_list(std::mem::take(&mut self.doc_state), disk.doc_state, &base.doc_state, |d| &d.path);
+        self.doc_state.truncate(DOC_STATE_MAX);
+    }
+}
+
 /// Remembered state of one document. A struct (not a tuple) so fields can
 /// be added without breaking the parse of existing settings files.
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -432,6 +482,25 @@ mod path_json {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn instances_keep_each_others_list_entries() {
+        use std::path::PathBuf;
+        let p = |s: &str| PathBuf::from(s);
+        let mut ours = super::Settings { recent_files: vec![p("/a"), p("/b")], ..Default::default() };
+        let base = super::ListBase::of(&ours);
+        // We open /c and drop /b; meanwhile the other instance opened /d
+        // and pinned it.
+        ours.recent_files = vec![p("/c"), p("/a")];
+        let disk = super::Settings {
+            recent_files: vec![p("/d"), p("/a"), p("/b")],
+            frozen_files: vec![p("/d")],
+            ..Default::default()
+        };
+        ours.merge_lists(disk, &base);
+        assert_eq!(ours.recent_files, vec![p("/c"), p("/a"), p("/d")]);
+        assert_eq!(ours.frozen_files, vec![p("/d")]);
+    }
+
     #[test]
     fn fitted_preview_sizes_stay_in_range_and_off_whole_pixels() {
         for size in ["small", "normal", "large", "xlarge"] {

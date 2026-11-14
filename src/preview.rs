@@ -40,12 +40,6 @@ thread_local! {
     /// re-decoding images each time is wasted work.
     static LOCAL_CACHE: RefCell<HashMap<PathBuf, LocalEntry>> = RefCell::new(HashMap::new());
 
-    /// Scaled textures of loader-provided assets (.textpack), keyed by
-    /// destination and byte length. Stable texture identity also lets
-    /// `splice` treat unchanged images as unchanged content.
-    static LOADER_CACHE: RefCell<HashMap<(String, usize), gdk::Texture>> =
-        RefCell::new(HashMap::new());
-
     /// Image scale for "Fit preview to width" (1.0 = thumbnails as decoded).
     static IMAGE_SCALE: std::cell::Cell<f64> = const { std::cell::Cell::new(1.0) };
 
@@ -112,13 +106,11 @@ fn shrink_texture(texture: &gdk::Texture, scale: f64) -> Option<gdk::Texture> {
     )
 }
 
-/// Forget loader-provided textures. Call when the document changes: the key
-/// is only (dest, length), so without this a same-named, same-sized asset of
-/// another pack would be served the previous pack's image.
-pub fn reset_loader_cache() {
-    let gone: Vec<usize> = LOADER_CACHE.with(|cache| {
-        cache.borrow_mut().drain().map(|(_, t)| t.as_ptr() as usize).collect()
-    });
+/// Forget the shrunk copies of loader-provided textures the owner no longer
+/// keeps (the document changed), which `FIT_CACHE` would otherwise keep
+/// alive until the next scale change.
+pub fn forget_textures<'a>(textures: impl IntoIterator<Item = &'a gdk::Texture>) {
+    let gone: Vec<usize> = textures.into_iter().map(|t| t.as_ptr() as usize).collect();
     forget_fitted(&gone);
 }
 
@@ -150,7 +142,7 @@ struct LocalEntry {
 
 /// A decoded thumbnail's pixels: plain data, so it can come back from a
 /// worker thread, which `Pixbuf` (not `Send`) can't.
-struct Thumb {
+pub struct Thumb {
     width: i32,
     height: i32,
     stride: usize,
@@ -159,7 +151,7 @@ struct Thumb {
 }
 
 impl Thumb {
-    fn texture(&self) -> gdk::Texture {
+    pub fn texture(&self) -> gdk::Texture {
         let format = if self.alpha {
             gdk::MemoryFormat::R8g8b8a8
         } else {
@@ -217,24 +209,30 @@ fn decode_thumbnail(source: &mut dyn std::io::Read) -> Option<Thumb> {
 /// its header without decoding any pixels — for callers that decode the
 /// original at full size (Copy Image). False when there is no readable header.
 pub fn image_size_ok(data: &[u8]) -> bool {
+    image_dimensions(data).is_some_and(|(w, h)| w as i64 * h as i64 <= IMAGE_MAX_PIXELS)
+}
+
+/// An image's width and height from its header, without decoding pixels;
+/// `None` when the format is not recognised.
+pub fn image_dimensions(data: &[u8]) -> Option<(i32, i32)> {
     let loader = gdk_pixbuf::PixbufLoader::new();
     let size = Rc::new(std::cell::Cell::new(None));
     let seen = size.clone();
-    loader.connect_size_prepared(move |_, w, h| seen.set(Some(w as i64 * h as i64)));
+    loader.connect_size_prepared(move |_, w, h| seen.set(Some((w, h))));
     for chunk in data.chunks(64 * 1024) {
         if loader.write(chunk).is_err() || size.get().is_some() {
             break;
         }
     }
     let _ = loader.close();
-    size.get().is_some_and(|pixels| pixels <= IMAGE_MAX_PIXELS)
+    size.get()
 }
 
-fn texture_from_bytes(data: &[u8]) -> Option<gdk::Texture> {
-    if data.len() > REMOTE_MAX_BYTES {
-        return None;
-    }
-    decode_thumbnail(&mut &data[..]).map(|t| t.texture())
+/// A preview thumbnail of encoded image bytes — for the loader's owner to
+/// call on a worker thread, as `load_local` does for files: a full decode
+/// of a large PNG takes long enough to freeze the window.
+pub fn thumbnail_from_bytes(data: &[u8]) -> Option<Thumb> {
+    decode_thumbnail(&mut &data[..])
 }
 
 /// Stat (and, if it changed or is new, decode) a local image on a worker
@@ -380,6 +378,11 @@ pub fn retint(buffer: &gtk4::TextBuffer, colors: &crate::theme::Tags) {
 #[derive(Default)]
 pub struct SourceMap {
     entries: Vec<MapEntry>,
+    /// Entry indices sorted by (source, index), built on the first reverse
+    /// lookup: `preview_offset` runs several times per editor scroll event
+    /// (viewport bar, follow-editor), and a linear scan of a long document's
+    /// map on each was the cost.
+    by_source: std::cell::OnceCell<Vec<u32>>,
 }
 
 struct MapEntry {
@@ -430,20 +433,23 @@ impl SourceMap {
     /// so this scans for the entry closest at-or-before the source position
     /// (preferring later entries on ties — the actual text over block gaps).
     pub fn preview_offset(&self, source_offset: i32) -> Option<i32> {
-        let mut best: Option<(i32, i32)> = None; // (source gap, preview pos)
-        for e in &self.entries {
-            if e.source > source_offset {
-                continue;
+        // The entry with the greatest source at or before the position,
+        // the later one in preview order on ties: the last such in the
+        // (source, index) order.
+        let order = self.by_source.get_or_init(|| {
+            let mut order: Vec<u32> = (0..self.entries.len() as u32).collect();
+            order.sort_by_key(|&i| (self.entries[i as usize].source, i));
+            order
+        });
+        let found = order.partition_point(|&i| self.entries[i as usize].source <= source_offset);
+        match found.checked_sub(1) {
+            Some(k) => {
+                let e = &self.entries[order[k] as usize];
+                let gap = source_offset - e.source;
+                Some(if e.exact { e.preview + gap.min(e.len) } else { e.preview })
             }
-            let gap = source_offset - e.source;
-            let pos = if e.exact { e.preview + gap.min(e.len) } else { e.preview };
-            match best {
-                Some((bg, _)) if bg < gap => {}
-                _ => best = Some((gap, pos)),
-            }
+            None => self.entries.first().map(|e| e.preview),
         }
-        best.map(|(_, pos)| pos)
-            .or_else(|| self.entries.first().map(|e| e.preview))
     }
 }
 
@@ -487,13 +493,17 @@ struct TableState {
     row_src: Vec<Option<i32>>,
 }
 
+/// Resolves a local image reference to its thumbnail (assets inside a
+/// .textpack, staged or pasted images); `None` shows the placeholder.
+pub type Loader<'a> = &'a dyn Fn(&str) -> Option<gdk::Texture>;
+
 struct Renderer<'a> {
     buffer: &'a gtk4::TextBuffer,
     /// Directory of the open document, for resolving relative image paths.
     base: Option<&'a Path>,
     /// When Some, local images are read through this instead of the
     /// filesystem (assets inside a .textpack).
-    loader: Option<&'a dyn Fn(&str) -> Option<glib::Bytes>>,
+    loader: Option<Loader<'a>>,
     /// Called (later, from the main loop) when a remote image finishes
     /// downloading, so the owner can re-render the preview.
     refresh: Option<Rc<dyn Fn()>>,
@@ -940,22 +950,11 @@ impl<'a> Renderer<'a> {
         }
         let dest = crate::bundle::decode_dest(dest);
         if let Some(loader) = self.loader {
-            let Some(bytes) = loader(&dest) else {
+            // The owner decodes off the main loop and keeps the texture, so
+            // its identity is stable from render to render — which is what
+            // lets `splice` see an unchanged image as unchanged.
+            let Some(texture) = loader(&dest) else {
                 return false;
-            };
-            let key = (dest.clone(), bytes.len());
-            let cached = LOADER_CACHE.with(|cache| cache.borrow().get(&key).cloned());
-            let texture = match cached {
-                Some(texture) => texture,
-                None => {
-                    let Some(texture) = texture_from_bytes(&bytes) else {
-                        return false;
-                    };
-                    LOADER_CACHE.with(|cache| {
-                        cache.borrow_mut().insert(key, texture.clone());
-                    });
-                    texture
-                }
             };
             self.insert_texture(&texture);
             return true;
@@ -1484,7 +1483,7 @@ pub fn render(
     base: Option<&Path>,
     allow_remote: bool,
     refresh: Option<Rc<dyn Fn()>>,
-    loader: Option<&dyn Fn(&str) -> Option<glib::Bytes>>,
+    loader: Option<Loader<'_>>,
 ) -> Rendered {
     render_fitted(buffer, markdown, base, allow_remote, refresh, loader, None)
 }
@@ -1497,7 +1496,7 @@ pub fn render_fitted(
     base: Option<&Path>,
     allow_remote: bool,
     refresh: Option<Rc<dyn Fn()>>,
-    loader: Option<&dyn Fn(&str) -> Option<glib::Bytes>>,
+    loader: Option<Loader<'_>>,
     table_cols: Option<usize>,
 ) -> Rendered {
     buffer.set_text("");
@@ -1677,6 +1676,7 @@ mod tests {
         // is unmapped and whose text sits at source 20.
         let map = SourceMap {
             entries: vec![entry(0, 5, 0, true), entry(9, 5, 20, true)],
+            ..Default::default()
         };
         // The heading line is preview 7..14; its marker must not borrow "para".
         assert_eq!(map.source_span(7, 14), Some((20, 24)));
@@ -1689,8 +1689,42 @@ mod tests {
     fn source_span_spans_several_runs_and_inexact_anchors() {
         let map = SourceMap {
             entries: vec![entry(0, 3, 10, false), entry(3, 4, 30, true)],
+            ..Default::default()
         };
         assert_eq!(map.source_span(0, 7), Some((10, 33)));
         assert_eq!(map.source_span(1, 2), Some((10, 10)));
+    }
+
+    #[test]
+    fn indexed_reverse_lookup_matches_the_linear_scan() {
+        // Out-of-order sources (table cells, list markers), ties, inexact runs.
+        let entries = vec![
+            entry(0, 4, 10, true),
+            entry(4, 2, 3, false),
+            entry(6, 5, 10, true),
+            entry(11, 3, 40, true),
+            entry(14, 1, 25, false),
+            entry(15, 6, 25, true),
+        ];
+        let linear = |entries: &[MapEntry], source_offset: i32| {
+            let mut best: Option<(i32, i32)> = None;
+            for e in entries {
+                if e.source > source_offset {
+                    continue;
+                }
+                let gap = source_offset - e.source;
+                let pos = if e.exact { e.preview + gap.min(e.len) } else { e.preview };
+                match best {
+                    Some((bg, _)) if bg < gap => {}
+                    _ => best = Some((gap, pos)),
+                }
+            }
+            best.map(|(_, pos)| pos).or_else(|| entries.first().map(|e| e.preview))
+        };
+        let expected: Vec<_> = (0..60).map(|o| linear(&entries, o)).collect();
+        let map = SourceMap { entries, ..Default::default() };
+        let got: Vec<_> = (0..60).map(|o| map.preview_offset(o)).collect();
+        assert_eq!(got, expected);
+        assert_eq!(SourceMap::default().preview_offset(5), None);
     }
 }

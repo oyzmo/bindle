@@ -16,7 +16,7 @@ use crate::highlight;
 use crate::odf;
 use crate::preview;
 use crate::settings::{
-    ColorScheme, DocState, FontSize, RemotePolicy, Settings, Theme, DOC_STATE_MAX,
+    ColorScheme, DocState, FontSize, ListBase, RemotePolicy, Settings, Theme, DOC_STATE_MAX,
     RECENT_MAX, RECENT_MENU_MAX,
 };
 use crate::snippets::{self, Snippet};
@@ -44,6 +44,11 @@ const FIT_EMS: f64 = 40.0;
 /// per megabyte of markdown (the slowest scanner), so this cap is about
 /// 35 ms of main-loop work per debounce in the worst case.
 const HIGHLIGHT_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// Find highlights at most this many matches, centred on the current one
+/// (the counter still counts them all). The search entry's own
+/// `search-delay` debounces typing.
+const FIND_TAG_MAX: usize = 400;
 
 /// Which pass of an open this is — a file on an unmounted gvfs share needs
 /// two, one to discover it is missing and one after the share is up.
@@ -102,7 +107,7 @@ impl DocSource {
                 bundle::PackInfo {
                     prefix: String::new(),
                     text_name: "content.xml".into(),
-                    entries: Vec::new(),
+                    entries: Default::default(),
                 },
             )),
             _ => None,
@@ -119,10 +124,12 @@ impl DocSource {
     }
 }
 
-/// A preview image's bytes, read off the main loop (`App::asset_reads`).
+/// A preview image's thumbnail, read and decoded off the main loop
+/// (`App::asset_reads`). Only the texture is kept: the encoded bytes (up to
+/// `ASSET_MAX_BYTES` each) are never needed again.
 enum AssetRead {
     Pending,
-    Ready(glib::Bytes),
+    Ready(gdk::Texture),
     Failed,
 }
 
@@ -198,6 +205,13 @@ pub struct App {
     preview_sections: RefCell<Vec<preview::Section>>,
     /// Table lines of the current preview, for whole-row line picks.
     preview_table_rows: RefCell<Vec<preview::TableRow>>,
+    /// Source line → preview start of the first table row rendered from it,
+    /// built once per render: `preview_line_y` asks per editor scroll event
+    /// and used to resolve every row's line through the buffer each time.
+    preview_table_lines: RefCell<HashMap<i32, i32>>,
+    /// Measured digit-run widths of the two gutters (`digit_width`).
+    gutter_digits: RefCell<Option<DigitWidth>>,
+    preview_gutter_digits: RefCell<Option<DigitWidth>>,
     /// Width tables were last fitted to (see `preview_table_cols`).
     preview_table_cols: Cell<Option<usize>>,
     /// Source char range selected from the line-number gutter; mirrored in
@@ -218,6 +232,12 @@ pub struct App {
     /// Generation counter for async opens; a completion whose sequence no
     /// longer matches is stale (a newer open started) and gets dropped.
     open_seq: Cell<u64>,
+    /// Bumped whenever the buffer is given a different document
+    /// (`load_text`). Unlike `open_seq` it does not move for an open that
+    /// fails, so async work for the current document — a paste, a disk
+    /// check, an image original — is dropped only when the document really
+    /// changed.
+    doc_gen: Cell<u64>,
     /// Bumped by every user edit. An open asks about unsaved changes before
     /// it starts, but the read can take minutes on a hung share while the
     /// window stays usable: a completion that finds this moved asks again.
@@ -246,6 +266,9 @@ pub struct App {
     open_in_view: Cell<bool>,
     open_last: Cell<bool>,
     multiple_instances: Cell<bool>,
+    /// The list-valued settings as this instance last saved them, for
+    /// merging with other instances' saves (`Settings::merge_lists`).
+    list_base: RefCell<ListBase>,
     show_attachment_note: Cell<bool>,
     follow_cursor: Cell<bool>,
     keyword_highlight: Cell<bool>,
@@ -825,6 +848,9 @@ impl App {
             preview_checkboxes: RefCell::new(Vec::new()),
             preview_sections: RefCell::new(Vec::new()),
             preview_table_rows: RefCell::new(Vec::new()),
+            preview_table_lines: RefCell::new(HashMap::new()),
+            gutter_digits: RefCell::new(None),
+            preview_gutter_digits: RefCell::new(None),
             preview_table_cols: Cell::new(None),
             line_pick: Cell::new(None),
             line_hover: Cell::new(None),
@@ -835,6 +861,7 @@ impl App {
             files_order: RefCell::new(settings.recent_files.clone()),
             frozen_files: RefCell::new(settings.frozen_files.clone()),
             open_seq: Cell::new(0),
+            doc_gen: Cell::new(0),
             edit_seq: Cell::new(0),
             recent_menu,
             remember_folds: Cell::new(settings.remember_folds),
@@ -849,6 +876,7 @@ impl App {
             open_in_view: Cell::new(settings.open_in_view),
             open_last: Cell::new(settings.open_last),
             multiple_instances: Cell::new(settings.multiple_instances),
+            list_base: RefCell::new(ListBase::of(&settings)),
             show_attachment_note: Cell::new(settings.show_attachment_note),
             follow_cursor: Cell::new(settings.follow_cursor),
             keyword_highlight: Cell::new(settings.keyword_highlight),
@@ -2186,7 +2214,7 @@ impl App {
         });
     }
 
-    fn attach_file(&self, path: &Path) {
+    fn attach_file(self: &Rc<Self>, path: &Path) {
         let name = markdown_label(&file_label(&path.to_path_buf()));
         let source = self.source.borrow().clone();
         let assets_dir = match &source {
@@ -2203,10 +2231,22 @@ impl App {
                 return self.toast("Save the document first, then attach files to it");
             }
         };
-        match bundle::copy_into_assets(path, &assets_dir) {
-            Ok(stored) => self.insert_attachment_link(&name, format!("assets/{stored}")),
-            Err(err) => self.toast(&format!("Could not copy the file: {err}")),
-        }
+        // On a worker thread: an attachment can be gigabytes, or sit on a
+        // slow share, and the window must not freeze for the copy.
+        let state = self.clone();
+        let doc = self.doc_gen.get();
+        let src = path.to_path_buf();
+        glib::spawn_future_local(async move {
+            let copied = gio::spawn_blocking(move || bundle::copy_into_assets(&src, &assets_dir)).await;
+            if state.doc_gen.get() != doc {
+                return state.toast("Attach cancelled — another document was opened");
+            }
+            match copied {
+                Ok(Ok(stored)) => state.insert_attachment_link(&name, format!("assets/{stored}")),
+                Ok(Err(err)) => state.toast(&format!("Could not copy the file: {err}")),
+                Err(_) => state.toast("Could not copy the file"),
+            }
+        });
     }
 
     /// `[name](dest)` with the label preselected. The label stays the file's
@@ -2245,6 +2285,8 @@ impl App {
         });
         let key = format!("assets/{name}");
         staged.insert(key.clone(), asset);
+        // A reference typed before the asset existed left a failed read.
+        self.asset_reads.borrow_mut().remove(&key);
         key
     }
 
@@ -2252,16 +2294,21 @@ impl App {
     /// belong to another process), as a PNG stored with the document.
     fn paste_image(self: &Rc<Self>, clipboard: gdk::Clipboard) {
         let state = self.clone();
-        let seq = self.open_seq.get();
+        let seq = self.doc_gen.get();
         glib::spawn_future_local(async move {
             let read = clipboard.read_texture_future().await;
+            // PNG-encoding a large screenshot takes long enough to notice.
+            let png = match read {
+                Ok(Some(texture)) => gio::spawn_blocking(move || texture.save_to_png_bytes()).await.ok(),
+                Ok(None) => return,
+                Err(err) => return state.toast(&format!("Could not paste the image: {err}")),
+            };
             if !state.still_open(seq) {
                 return;
             }
-            match read {
-                Ok(Some(texture)) => state.store_pasted_image(&texture.save_to_png_bytes()),
-                Ok(None) => {}
-                Err(err) => state.toast(&format!("Could not paste the image: {err}")),
+            match png {
+                Some(png) => state.store_pasted_image(&png),
+                None => state.toast("Could not paste the image"),
             }
         });
     }
@@ -2271,7 +2318,7 @@ impl App {
     /// which is what the editor would have done.
     fn paste_files(self: &Rc<Self>, clipboard: gdk::Clipboard) {
         let state = self.clone();
-        let seq = self.open_seq.get();
+        let seq = self.doc_gen.get();
         glib::spawn_future_local(async move {
             let files = clipboard
                 .read_value_future(gdk::FileList::static_type(), glib::Priority::DEFAULT)
@@ -2313,11 +2360,11 @@ impl App {
         });
     }
 
-    /// Whether the document a paste started in (`open_seq` then) is still
+    /// Whether the document a paste started in (`doc_gen` then) is still
     /// the open one. A clipboard read is asynchronous — another process owns
     /// the data — and must not land in a document opened meanwhile.
     fn still_open(&self, seq: u64) -> bool {
-        let same = self.open_seq.get() == seq;
+        let same = self.doc_gen.get() == seq;
         if !same {
             self.toast("Paste cancelled — another document was opened");
         }
@@ -2476,7 +2523,13 @@ impl App {
         } else {
             matches.iter().position(|&(s, _)| s >= from_off).unwrap_or(0)
         };
-        for (i, &(s, e)) in matches.iter().enumerate() {
+        // Every tag invalidates its line's layout, so a one-letter query in
+        // a long document tagged tens of thousands of lines per keystroke.
+        // Only the matches around the current one are highlighted; all are
+        // counted, and stepping moves the highlighted window along.
+        let lo = current.saturating_sub(FIND_TAG_MAX / 2);
+        let hi = (lo + FIND_TAG_MAX).min(matches.len());
+        for (i, &(s, e)) in matches.iter().enumerate().take(hi).skip(lo) {
             let name = if i == current { "find-current" } else { "find-match" };
             buffer.apply_tag_by_name(name, &buffer.iter_at_offset(s), &buffer.iter_at_offset(e));
         }
@@ -2543,10 +2596,12 @@ impl App {
         let refreshed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // Nothing to see while the preview panel is hidden;
             // `apply_panels` renders once when it comes back.
+            // One copy of the document for both halves.
+            let text = self.text();
             if self.preview_visible() {
-                self.render_preview(true);
+                self.render_preview_text(true, &text);
             }
-            self.apply_highlight();
+            self.apply_highlight_text(&text);
         }));
         if refreshed.is_err() {
             // The baseline may describe tags that were never applied.
@@ -2598,8 +2653,8 @@ impl App {
         }
     }
 
-    /// Run `read` on a worker thread and keep its bytes for the preview
-    /// loader under `rel`, re-rendering once they are in. A failed read is
+    /// Run `read` on a worker thread, decode its bytes to a thumbnail there
+    /// and keep that for the preview loader under `rel`, re-rendering once they are in. A failed read is
     /// remembered too, so a missing image isn't retried (and the preview
     /// re-rendered) on every keystroke.
     fn read_asset_async(
@@ -2612,15 +2667,21 @@ impl App {
         let weak = Rc::downgrade(self);
         let rel = rel.to_string();
         glib::spawn_future_local(async move {
-            let bytes = gio::spawn_blocking(read).await.ok().flatten();
+            // Decoded in the same worker job as the read: a large PNG cannot
+            // scale while loading, and a full decode on the main loop froze
+            // the window for each image.
+            let thumb = gio::spawn_blocking(move || read().and_then(|b| preview::thumbnail_from_bytes(&b)))
+                .await
+                .ok()
+                .flatten();
             let Some(state) = weak.upgrade() else {
                 return;
             };
             if state.asset_gen.get() != generation {
                 return;
             }
-            let found = bytes.is_some();
-            let entry = bytes.map_or(AssetRead::Failed, |b| AssetRead::Ready(glib::Bytes::from_owned(b)));
+            let found = thumb.is_some();
+            let entry = thumb.map_or(AssetRead::Failed, |t| AssetRead::Ready(t.texture()));
             state.asset_reads.borrow_mut().insert(rel, entry);
             if found {
                 state.render_preview(true);
@@ -2631,7 +2692,11 @@ impl App {
     /// Drop the preview's asset bytes (the document changed, or the pack
     /// was rewritten) and orphan any read still in flight.
     fn forget_asset_reads(&self) {
-        self.asset_reads.borrow_mut().clear();
+        let reads = std::mem::take(&mut *self.asset_reads.borrow_mut());
+        preview::forget_textures(reads.values().filter_map(|read| match read {
+            AssetRead::Ready(texture) => Some(texture),
+            _ => None,
+        }));
         self.asset_gen.set(self.asset_gen.get().wrapping_add(1));
     }
 
@@ -2641,21 +2706,26 @@ impl App {
     /// deferred mark scroll visibly scans from the top on long documents
     /// while the fresh layout validates.
     fn render_preview(self: &Rc<Self>, keep_position: bool) {
+        self.render_preview_text(keep_position, &self.text());
+    }
+
+    /// `render_preview` with the buffer's text already in hand.
+    fn render_preview_text(self: &Rc<Self>, keep_position: bool, text: &str) {
         let restore_top = self.restore_preview_top.take().filter(|_| !keep_position);
         let adj = self.preview.vadjustment();
         let restore = match (&adj, keep_position) {
             (Some(adj), true) => adj.value(),
             _ => 0.0,
         };
-        let text = self.text();
-        let source = self.source.borrow().clone();
-        let base = source.preview_base();
+        let (base, pack_ctx, is_none) = {
+            let source = self.source.borrow();
+            (source.preview_base(), source.archive(), matches!(*source, DocSource::None))
+        };
         // Pack and ODT assets are read lazily out of the zip (staged ones
         // from memory), never extracted to disk. An unsaved document needs
         // the loader too once it holds pasted images, which live only in
         // memory until the first save.
-        let pack_ctx = source.archive();
-        let pasted = matches!(source, DocSource::None) && !self.staged_assets.borrow().is_empty();
+        let pasted = is_none && !self.staged_assets.borrow().is_empty();
         let archive = pack_ctx.as_ref();
         //
         // The loader only ever answers from memory. Anything on disk is read
@@ -2663,19 +2733,18 @@ impl App {
         // shows the placeholder until that read re-renders the preview.
         let loader = (archive.is_some() || pasted).then(|| {
             move |rel: &str| {
-                let staged_file = match self.staged_assets.borrow().get(rel) {
-                    Some(bundle::AssetSource::Bytes(bytes)) => return Some(glib::Bytes::from(&bytes[..])),
-                    Some(bundle::AssetSource::File(p)) => Some(p.clone()),
-                    None => None,
-                };
                 match self.asset_reads.borrow().get(rel) {
-                    Some(AssetRead::Ready(bytes)) => return Some(bytes.clone()),
+                    Some(AssetRead::Ready(texture)) => return Some(texture.clone()),
                     Some(AssetRead::Pending | AssetRead::Failed) => return None,
                     None => {}
                 }
+                let staged = self.staged_assets.borrow().get(rel).cloned();
                 let max = bundle::ASSET_MAX_BYTES;
-                let read: Box<dyn FnOnce() -> Option<Vec<u8>> + Send> = match (staged_file, archive) {
-                    (Some(file), _) => Box::new(move || bundle::read_file_capped(&file, max)),
+                let read: Box<dyn FnOnce() -> Option<Vec<u8>> + Send> = match (staged, archive) {
+                    (Some(bundle::AssetSource::Bytes(bytes)), _) => Box::new(move || Some(bytes)),
+                    (Some(bundle::AssetSource::File(file)), _) => {
+                        Box::new(move || bundle::read_file_capped(&file, max))
+                    }
                     (None, Some((path, info))) => {
                         let (path, info, rel) = (path.clone(), info.clone(), rel.to_string());
                         Box::new(move || bundle::read_asset(&path, &info, &rel, max))
@@ -2691,8 +2760,7 @@ impl App {
                 None
             }
         });
-        let loader_ref: Option<&dyn Fn(&str) -> Option<glib::Bytes>> =
-            loader.as_ref().map(|f| f as &dyn Fn(&str) -> Option<glib::Bytes>);
+        let loader_ref: Option<preview::Loader> = loader.as_ref().map(|f| f as preview::Loader);
         let weak = Rc::downgrade(self);
         let refresh: Rc<dyn Fn()> = Rc::new(move || {
             if let Some(state) = weak.upgrade() {
@@ -2712,7 +2780,7 @@ impl App {
         let rendered = if kind.is_markdown() {
             preview::render_fitted(
                 &scratch,
-                &text,
+                text,
                 base.as_deref(),
                 allow,
                 Some(refresh),
@@ -2720,7 +2788,7 @@ impl App {
                 table_cols,
             )
         } else {
-            preview::render_plain(&scratch, &text, kind.wrap_lines())
+            preview::render_plain(&scratch, text, kind.wrap_lines())
         };
         // Collapsed sections: swap the heading's marker glyph to ▸ before
         // the splice (same char count, so section offsets stay valid) and
@@ -2779,6 +2847,16 @@ impl App {
         *self.preview_images.borrow_mut() = rendered.images;
         *self.preview_checkboxes.borrow_mut() = rendered.checkboxes;
         *self.preview_sections.borrow_mut() = rendered.sections;
+        {
+            let mut lines = self.preview_table_lines.borrow_mut();
+            lines.clear();
+            for row in &rendered.table_rows {
+                if let Some(s) = row.source {
+                    let line = self.buffer.iter_at_offset(s).line() + row.separator as i32;
+                    lines.entry(line).or_insert(row.start);
+                }
+            }
+        }
         *self.preview_table_rows.borrow_mut() = rendered.table_rows;
         // The text under a hover may have moved; the next motion redraws it.
         self.set_line_hover(None);
@@ -2973,6 +3051,8 @@ impl App {
         }
         let remote = external_link(dest).then(|| dest.to_string()).filter(|_| self.remote_allowed());
         let loc = if remote.is_some() { None } else { self.asset_loc(dest) };
+        let state = self.clone();
+        let doc_gen = self.doc_gen.get();
         glib::spawn_future_local(async move {
             let bytes = match (remote, loc) {
                 (Some(url), _) => preview::fetch_capped(&url).await,
@@ -2985,6 +3065,11 @@ impl App {
                 Some(bytes) => gio::spawn_blocking(move || decode(bytes)).await.ok().flatten(),
                 None => None,
             };
+            // Another document was opened while this one's image loaded: it
+            // must not pop up over that one, or land on the clipboard.
+            if state.doc_gen.get() != doc_gen {
+                return;
+            }
             then(texture);
         });
     }
@@ -3311,12 +3396,12 @@ impl App {
         if self.disk_checking.replace(true) {
             return;
         }
-        let seq = self.open_seq.get();
+        let seq = self.doc_gen.get();
         let state = self.clone();
         glib::spawn_future_local(async move {
             let now = gio::spawn_blocking(move || doc::disk_stamp(&file)).await.ok().flatten();
             state.disk_checking.set(false);
-            if state.open_seq.get() != seq || state.disk_stamp.get() != Some(known) {
+            if state.doc_gen.get() != seq || state.disk_stamp.get() != Some(known) {
                 return;
             }
             match now {
@@ -3535,17 +3620,23 @@ impl App {
         let state = self.clone();
         dialog.save(Some(&self.window), gio::Cancellable::NONE, move |result| {
             if let Some(path) = state.picked_path(result) {
-                let written = match &asset {
-                    bundle::AssetSource::Bytes(bytes) => doc::write_atomic(&path, bytes),
-                    bundle::AssetSource::File(src) => copy_atomic(src, &path),
-                };
-                match written {
-                    Ok(()) => state.toast(&format!(
-                        "Saved {}",
-                        path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
-                    )),
-                    Err(err) => state.toast(&format!("Could not save: {err}")),
-                }
+                // A worker does the copy, which may be large or cross a share.
+                let state = state.clone();
+                let asset = asset.clone();
+                glib::spawn_future_local(async move {
+                    let name =
+                        path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    let written = gio::spawn_blocking(move || match &asset {
+                        bundle::AssetSource::Bytes(bytes) => doc::write_atomic(&path, bytes),
+                        bundle::AssetSource::File(src) => copy_atomic(src, &path),
+                    })
+                    .await;
+                    match written {
+                        Ok(Ok(())) => state.toast(&format!("Saved {name}")),
+                        Ok(Err(err)) => state.toast(&format!("Could not save: {err}")),
+                        Err(_) => state.toast("Could not save"),
+                    }
+                });
             }
         });
     }
@@ -3781,6 +3872,7 @@ impl App {
     fn load_text(self: &Rc<Self>, text: &str, source: DocSource) {
         // Still the outgoing document's source and views.
         self.remember_position();
+        self.doc_gen.set(self.doc_gen.get().wrapping_add(1));
         self.loading.set(true);
         // Toggling undo off clears the history of the previous document.
         self.buffer.set_enable_undo(false);
@@ -3793,7 +3885,6 @@ impl App {
         *self.source.borrow_mut() = source;
         self.staged_assets.borrow_mut().clear();
         self.forget_asset_reads();
-        preview::reset_loader_cache();
         self.restore_position();
         {
             // Restore this document's remembered folds; unknown keys are
@@ -4015,7 +4106,7 @@ impl App {
     fn finish_open(
         self: &Rc<Self>,
         path: &Path,
-        (text, source, legacy, stamp): (String, DocSource, Option<&'static str>, Option<doc::DiskStamp>),
+        (text, source, notice, stamp): (String, DocSource, Option<String>, Option<doc::DiskStamp>),
     ) {
         let imported = matches!(source, DocSource::Odt { .. });
         self.load_text(&text, source);
@@ -4023,8 +4114,8 @@ impl App {
         if imported {
             self.toast("Imported as Markdown — saving creates a new file");
         }
-        if let Some(encoding) = legacy {
-            self.toast(&format!("Not UTF-8 — read as {encoding}; saving converts it to UTF-8"));
+        if let Some(notice) = notice {
+            self.toast(&notice);
         }
         // Remembered view mode wins; without a memory the open-in-view
         // setting applies, and view mode is never dropped on open.
@@ -4182,12 +4273,17 @@ impl App {
                 }
             }
             DocSource::Pack { path, info } => {
-                let staged = self.staged_assets.borrow().clone();
-                match bundle::save_pack(&path, &info, self.text().as_str(), &staged) {
+                let text = self.text();
+                let missing = self.prune_staged(&text);
+                let saved = bundle::save_pack(&path, &info, text.as_str(), &self.staged_assets.borrow());
+                if !missing.is_empty() {
+                    self.toast(&format!("Attachment no longer found, not saved: {}", missing.join(", ")));
+                }
+                match saved {
                     Ok(entries) => {
                         // What later staging must not collide with.
                         if let DocSource::Pack { info, .. } = &mut *self.source.borrow_mut() {
-                            info.entries = entries;
+                            info.entries = std::sync::Arc::new(entries);
                         }
                         // The zip content changed; cached entry bytes are stale.
                         self.staged_assets.borrow_mut().clear();
@@ -4198,6 +4294,30 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Before a pack save: drop staged assets the text no longer references
+    /// (a paste since undone would otherwise be written as an orphan) and
+    /// staged files that can no longer be read — one attachment on a stick
+    /// since unplugged must not fail every save of the text. Returns the
+    /// names dropped for the second reason.
+    fn prune_staged(&self, text: &str) -> Vec<String> {
+        let referenced: HashSet<String> =
+            bundle::local_asset_dests(text).iter().map(|d| bundle::decode_dest(d)).collect();
+        let mut missing = Vec::new();
+        self.staged_assets.borrow_mut().retain(|key, source| {
+            if !referenced.contains(key) {
+                return false;
+            }
+            if let bundle::AssetSource::File(file) = source
+                && !file.is_file()
+            {
+                missing.push(key.strip_prefix("assets/").unwrap_or(key).to_string());
+                return false;
+            }
+            true
+        });
+        missing
     }
 
     fn text(&self) -> glib::GString {
@@ -4443,9 +4563,26 @@ impl App {
             .iter()
             .map(|dest| bundle::decode_dest(dest))
             .filter(|clean| !self.staged_assets.borrow().contains_key(clean))
-            .filter(|clean| escapes_folder(Path::new(clean)))
+            .filter(|clean| self.escapes_doc_folder(clean))
             .filter(|clean| self.asset_source(clean).is_some())
             .collect()
+    }
+
+    /// Whether a local reference leaves the document's folder — by its
+    /// spelling (`..`, absolute) or through a symlink inside the folder
+    /// (`assets/appendix.pdf` → `~/.ssh/id_ed25519`, or `assets` itself a
+    /// link). The lexical test alone let a received folder carry any
+    /// readable file into an exported pack without the prompt. The stat is
+    /// fine here: export is a one-off action that reads the file anyway.
+    fn escapes_doc_folder(&self, clean: &str) -> bool {
+        if escapes_folder(Path::new(clean)) {
+            return true;
+        }
+        let Some(base) = self.source.borrow().preview_base() else { return false };
+        match (fs::canonicalize(&base), fs::canonicalize(base.join(clean))) {
+            (Ok(base), Ok(target)) => !target.starts_with(base),
+            _ => false,
+        }
     }
 
     fn pick_pack_dest(self: &Rc<Self>, rebind: bool, then: Option<Box<dyn FnOnce()>>) {
@@ -4461,16 +4598,21 @@ impl App {
             .build();
         let state = self.clone();
         dialog.save(Some(&self.window), gio::Cancellable::NONE, move |result| {
-            if let Some(path) = state.picked_path(result) {
-                if state.export_pack_to(&path) && rebind {
-                    // Recorded now, not when the reopen lands: closing the
-                    // window (`then`) would otherwise win that race.
-                    state.remember_recent(&path);
-                    state.update_recent_menu();
-                    state.open_path(&path);
-                    if let Some(then) = then {
-                        then();
-                    }
+            if let Some(path) = state.picked_path(result)
+                && let Some((text, info)) = state.export_pack_to(&path)
+                && rebind
+            {
+                // Rebound right here rather than by reading the pack back:
+                // the window stayed editable during that read with the old
+                // source, so keys typed meanwhile went into the old file.
+                state.open_seq.set(state.open_seq.get() + 1);
+                state.load_text(&text, DocSource::Pack { path: path.clone(), info });
+                state.restamp();
+                state.remember_recent(&path);
+                state.update_recent_menu();
+                state.persist_settings();
+                if let Some(then) = then {
+                    then();
                 }
             }
         });
@@ -4478,8 +4620,9 @@ impl App {
 
     /// Bundle the document and every referenced local image and linked file
     /// into `dest`, rewriting their references to `assets/<name>`.
-    /// Returns whether the pack was written.
-    fn export_pack_to(self: &Rc<Self>, dest: &Path) -> bool {
+    /// Returns the text as written into the pack and the pack's layout, or
+    /// `None` when it was not written.
+    fn export_pack_to(self: &Rc<Self>, dest: &Path) -> Option<(String, bundle::PackInfo)> {
         let text = self.text().to_string();
         let mut assets: Vec<(String, bundle::AssetSource)> = Vec::new();
         let mut renames: Vec<(String, String)> = Vec::new();
@@ -4502,7 +4645,7 @@ impl App {
         }
         let rewritten = bundle::rewrite_asset_dests(&text, &renames);
         match bundle::export_pack(dest, &rewritten, &assets) {
-            Ok(()) => {
+            Ok(info) => {
                 let name = dest
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
@@ -4514,11 +4657,11 @@ impl App {
                         "Exported {name} — {skipped} referenced file(s) not found"
                     ));
                 }
-                true
+                Some((rewritten, info))
             }
             Err(err) => {
                 self.toast(&format!("Could not export: {err}"));
-                false
+                None
             }
         }
     }
@@ -4774,8 +4917,7 @@ impl App {
             return;
         }
         let digits = self.buffer.line_count().to_string().len().max(2);
-        let layout = self.editor.create_pango_layout(Some(&"8".repeat(digits)));
-        let (w, _) = layout.pixel_size();
+        let w = digit_width(self.editor.upcast_ref(), digits, &self.gutter_digits);
         self.gutter.set_content_width(w + 2 * GUTTER_PAD);
         self.gutter.queue_draw();
     }
@@ -4798,8 +4940,8 @@ impl App {
         let bar = if self.preview_viewport.get() { VIEWPORT_BAR + 2 * VIEWPORT_BAR_GAP } else { 0 };
         let numbers = if self.preview_line_numbers.get() {
             let digits = self.buffer.line_count().to_string().len().max(2);
-            let layout = self.preview.create_pango_layout(Some(&"8".repeat(digits)));
-            layout.pixel_size().0 + 2 * GUTTER_PAD - if bar > 0 { GUTTER_PAD } else { 0 }
+            digit_width(self.preview.upcast_ref(), digits, &self.preview_gutter_digits) + 2 * GUTTER_PAD
+                - if bar > 0 { GUTTER_PAD } else { 0 }
         } else {
             0
         };
@@ -4848,10 +4990,7 @@ impl App {
             return Some(y + h);
         }
         let source = self.buffer.iter_at_line(line)?;
-        let row = self.preview_table_rows.borrow().iter().find_map(|r| {
-            let s = r.source?;
-            (self.buffer.iter_at_offset(s).line() + r.separator as i32 == line).then_some(r.start)
-        });
+        let row = self.preview_table_lines.borrow().get(&line).copied();
         let offset = match row {
             Some(start) => start,
             None => self.preview_map.borrow().preview_offset(source.offset())?,
@@ -5088,6 +5227,11 @@ impl App {
     /// A one-line edit now costs one line of tag work however long the
     /// document is; see `highlight::line_sigs`.
     fn apply_highlight(&self) {
+        self.apply_highlight_text(&self.text());
+    }
+
+    /// `apply_highlight` with the buffer's text already in hand.
+    fn apply_highlight_text(&self, text: &str) {
         let clear_all = |buffer: &gtk4::TextBuffer| {
             let (start, end) = (buffer.start_iter(), buffer.end_iter());
             for tag in highlight::TAGS {
@@ -5099,7 +5243,6 @@ impl App {
             self.reset_highlight();
             return;
         }
-        let text = self.text();
         // Past this size the O(document) *scan* starts to show on every
         // debounce, incremental tagging or not. Nothing here can be done
         // per-line — the scanners take the whole text — so a file this big
@@ -5111,8 +5254,8 @@ impl App {
             }
             return;
         }
-        let spans = highlight::spans(&text, self.doc_kind());
-        let (starts, sigs) = highlight::line_sigs(&text, &spans);
+        let spans = highlight::spans(text, self.doc_kind());
+        let (starts, sigs) = highlight::line_sigs(text, &spans);
         let dirty = {
             let baseline = self.hl_sigs.borrow();
             // Empty, or somehow out of step with the buffer: tag everything.
@@ -5329,7 +5472,11 @@ impl App {
             if let Some(path) = state.picked_path(result) {
                 // Exporting over the imported original is exactly the lossy
                 // write-back that importing refuses to do.
-                if matches!(&*state.source.borrow(), DocSource::Odt { path: origin } if *origin == path) {
+                // Compared as files, not spellings: a symlink or `a/../`
+                // path to the original must not get past this.
+                if matches!(&*state.source.borrow(),
+                    DocSource::Odt { path: origin } if *origin == path || bundle::same_file(origin, &path))
+                {
                     return state.toast("That is the imported original — choose another name");
                 }
                 let resolve = |dest: &str| state.resolve_asset_bytes(dest);
@@ -5394,6 +5541,11 @@ impl App {
             ("preview-line-numbers", enabled),
             ("preview-viewport", enabled),
             ("preview-fit", enabled),
+            // Markdown syntax, like the hidden Insert panel's snippets:
+            // Ctrl+B in a JSON file must not turn a key into `**key**`.
+            ("insert", enabled),
+            ("bold", enabled),
+            ("italic", enabled),
             ("word-wrap", kind.wrap_lines()),
         ] {
             if let Some(action) = self.window.lookup_action(name) {
@@ -5443,7 +5595,7 @@ impl App {
 
     fn persist_settings(&self) {
         self.sync_doc_state();
-        Settings {
+        let mut settings = Settings {
             width: self.window.default_width(),
             height: self.window.default_height(),
             maximized: self.window.is_maximized(),
@@ -5478,13 +5630,47 @@ impl App {
             doc_state: self.doc_state.borrow().clone(),
             recent_files: self.recent_files.borrow().clone(),
             frozen_files: self.frozen_files.borrow().clone(),
+        };
+        let base = self.list_base.replace(ListBase::of(&settings));
+        // Another instance may have saved since: keep what it recorded. On
+        // when this process runs non-unique or the setting says others may.
+        let shared = self.multiple_instances.get()
+            || self
+                .window
+                .application()
+                .is_some_and(|app| app.flags().contains(gio::ApplicationFlags::NON_UNIQUE));
+        if shared {
+            settings.merge_lists(Settings::load(), &base);
         }
-        .save();
+        settings.save();
     }
 
     fn toast(&self, message: &str) {
         self.toasts.add_toast(adw::Toast::new(message));
     }
+}
+
+/// A gutter's measured width of `digits` eights in a given font.
+struct DigitWidth {
+    digits: usize,
+    font: String,
+    width: i32,
+}
+
+/// The pixel width of `digits` eights in `widget`'s font, measured with a
+/// Pango layout only when the digit count or the font changed — the gutters
+/// are resized on every buffer change, and the count rarely moves.
+fn digit_width(widget: &gtk4::Widget, digits: usize, cache: &RefCell<Option<DigitWidth>>) -> i32 {
+    let font = widget.pango_context().font_description().map(|f| f.to_string()).unwrap_or_default();
+    if let Some(known) = &*cache.borrow()
+        && known.digits == digits
+        && known.font == font
+    {
+        return known.width;
+    }
+    let width = widget.create_pango_layout(Some(&"8".repeat(digits))).pixel_size().0;
+    *cache.borrow_mut() = Some(DigitWidth { digits, font, width });
+    width
 }
 
 /// A folder as the title bar shows it, home abbreviated to `~`.
