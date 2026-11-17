@@ -133,10 +133,12 @@ impl Settings {
     /// this one last saved (`base`). Each instance holds its own launch-time
     /// copy of the history, pins and document state, and writing the whole
     /// struct used to erase whatever the other had recorded.
-    pub fn merge_lists(&mut self, disk: Settings, base: &ListBase) {
+    /// `filed` says which documents sit in a Files-panel folder and so
+    /// don't count toward the history's cap.
+    pub fn merge_lists(&mut self, disk: Settings, base: &ListBase, filed: impl Fn(&std::path::Path) -> bool) {
         self.recent_files =
             merge_list(std::mem::take(&mut self.recent_files), disk.recent_files, &base.recent, |p| p);
-        self.recent_files.truncate(RECENT_MAX);
+        crate::collections::cap_recent(&mut self.recent_files, RECENT_MAX, filed);
         self.frozen_files =
             merge_list(std::mem::take(&mut self.frozen_files), disk.frozen_files, &base.frozen, |p| p);
         self.doc_state =
@@ -421,7 +423,7 @@ fn salvage(value: serde_json::Value) -> Settings {
 /// file name need not be, and serde's own `PathBuf` impl refuses those —
 /// which failed the whole settings save for as long as one such file stayed
 /// in the recent list.
-mod path_json {
+pub(crate) mod path_json {
     use std::ffi::OsString;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::path::{Path, PathBuf};
@@ -502,7 +504,7 @@ mod tests {
             frozen_files: vec![p("/d")],
             ..Default::default()
         };
-        ours.merge_lists(disk, &base);
+        ours.merge_lists(disk, &base, |_| false);
         assert_eq!(ours.recent_files, vec![p("/c"), p("/a"), p("/d")]);
         assert_eq!(ours.frozen_files, vec![p("/d")]);
     }

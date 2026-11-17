@@ -9,6 +9,7 @@ use adw::prelude::*;
 use gtk4::{gdk, gio, glib};
 
 use crate::bundle;
+use crate::collections::{self, FileEntry, Node, Place};
 use crate::doc::{self, DocKind};
 use crate::editor;
 use crate::export;
@@ -148,8 +149,38 @@ pub struct App {
     files_scroll: gtk4::ScrolledWindow,
     /// The Files divider has been sized to `FILES_ROWS` rows (persisted).
     files_fitted: Cell<bool>,
-    /// Rows mirror `files_order` by index.
-    files_list: gtk4::ListBox,
+    /// The Files tree: the user's folders (`collections`) above the recent
+    /// documents.
+    files_view: gtk4::ListView,
+    /// Top-level rows: the root folders, a "Recent" caption while there are
+    /// folders, then the recent documents. Folders' rows come from the tree
+    /// model's child factory.
+    files_root: gio::ListStore,
+    files_tree: gtk4::TreeListModel,
+    files_sel: gtk4::SingleSelection,
+    /// Shown over an empty list (a ListView has no placeholder).
+    files_empty: gtk4::Label,
+    /// One context menu for every row, refilled per click — unparenting a
+    /// fresh one on `closed` can drop the action it fires.
+    files_menu: gio::Menu,
+    files_popover: gtk4::PopoverMenu,
+    /// The row the context menu was opened on (None: empty space); the
+    /// `files-*` actions act on it.
+    files_menu_target: RefCell<Option<FileItem>>,
+    /// The row being dragged within the panel.
+    files_drag: RefCell<Option<FileItem>>,
+    /// A re-select of the open document's row is queued.
+    files_reselect: Cell<bool>,
+    /// Folders of documents the user made (`collections.json`): a list
+    /// only, nothing on disk moves. Shared with the tree model's child
+    /// factory, which GTK calls from inside its own calls.
+    collections: Rc<RefCell<collections::Tree>>,
+    /// Filed documents found gone: shown dim, with Locate…/Remove, never
+    /// dropped on their own — the user put them there.
+    missing_files: RefCell<HashSet<PathBuf>>,
+    /// File names that occur more than once in the panel; those rows get a
+    /// dim folder suffix.
+    files_dup_names: RefCell<HashSet<String>>,
     /// The Files panel's own order: `recent_files` as it stood at launch
     /// (newest first), then fixed for the session — a row that jumped to
     /// the top when clicked was a moving target. Files opened later join at
@@ -368,6 +399,11 @@ pub fn load_css() {
         .files-freeze:not(:checked) {{ opacity: 0; }}
         row:hover .files-freeze:not(:checked) {{ opacity: 0.55; }}
         .files-freeze:checked {{ background: none; }}
+        .files-header-btn {{ min-height: 0; min-width: 0; padding: 2px 4px; }}
+        .files-missing {{ opacity: 0.5; }}
+        .files-drop-into {{ background-color: alpha(@accent_bg_color, 0.3); }}
+        .files-drop-before {{ box-shadow: inset 0 2px @accent_bg_color; }}
+        .files-drop-after {{ box-shadow: inset 0 -2px @accent_bg_color; }}
         .preview-card {{ background-color: var(--view-bg-color, #ffffff); border-radius: 8px; }}
     ");
     let provider = gtk4::CssProvider::new();
@@ -497,19 +533,58 @@ impl App {
         let (top_panel, _) = section("Insert", Some("Ctrl+Space"), &elements_scroll);
 
         // --- Files (sidebar top) ---
-        let files_list = gtk4::ListBox::new();
-        files_list.set_selection_mode(gtk4::SelectionMode::Single);
-        files_list.add_css_class("navigation-sidebar");
+        let collections = Rc::new(RefCell::new(collections::Tree::load()));
+        let files_root = gio::ListStore::new::<glib::BoxedAnyObject>();
+        let tree = collections.clone();
+        let files_tree = gtk4::TreeListModel::new(files_root.clone(), false, false, move |obj| {
+            let Some(FileItem::Folder(id)) = file_item(obj) else { return None };
+            let store = gio::ListStore::new::<glib::BoxedAnyObject>();
+            if let Some(folder) = tree.borrow().folder(id) {
+                for node in collections::display(&folder.children) {
+                    store.append(&glib::BoxedAnyObject::new(node_item(node)));
+                }
+            }
+            Some(store.upcast())
+        });
+        let files_sel = gtk4::SingleSelection::new(Some(files_tree.clone()));
+        files_sel.set_autoselect(false);
+        files_sel.set_can_unselect(true);
+        let files_view =
+            gtk4::ListView::new(Some(files_sel.clone()), None::<gtk4::ListItemFactory>);
+        files_view.add_css_class("navigation-sidebar");
         let files_scroll = gtk4::ScrolledWindow::builder()
-            .child(&files_list)
+            .child(&files_view)
             .vexpand(true)
             .hscrollbar_policy(gtk4::PolicyType::Never)
             .build();
-        let (files_panel, _) = section("Files", None, &files_scroll);
         let files_empty = gtk4::Label::new(Some("No recent documents"));
         files_empty.add_css_class("dim-label");
         files_empty.set_margin_top(12);
-        files_list.set_placeholder(Some(&files_empty));
+        files_empty.set_valign(gtk4::Align::Start);
+        files_empty.set_can_target(false);
+        let files_overlay = gtk4::Overlay::new();
+        files_overlay.set_child(Some(&files_scroll));
+        files_overlay.add_overlay(&files_empty);
+        files_overlay.set_vexpand(true);
+        let (files_panel, _) = section("Files", None, &files_overlay);
+        let new_folder_btn = gtk4::Button::builder()
+            .icon_name("folder-new-symbolic")
+            .tooltip_text("New Folder")
+            .action_name("win.files-new-folder-root")
+            .css_classes(["flat", "files-header-btn"])
+            .hexpand(true)
+            .halign(gtk4::Align::End)
+            .valign(gtk4::Align::Center)
+            .margin_end(8)
+            .build();
+        if let Some(header) = files_panel.first_child().and_downcast::<gtk4::Box>() {
+            header.append(&new_folder_btn);
+        }
+        let files_menu = gio::Menu::new();
+        let files_popover = gtk4::PopoverMenu::from_model(Some(&files_menu));
+        files_popover.set_parent(&files_view);
+        files_popover.set_has_arrow(false);
+        files_popover.set_halign(gtk4::Align::Start);
 
         // --- Preview (left bottom) ---
         let preview_buffer = gtk4::TextBuffer::new(None);
@@ -834,7 +909,19 @@ impl App {
             files_panel,
             files_scroll,
             files_fitted: Cell::new(settings.files_fitted),
-            files_list,
+            files_view,
+            files_root,
+            files_tree,
+            files_sel,
+            files_empty,
+            files_menu,
+            files_popover,
+            files_menu_target: RefCell::new(None),
+            files_drag: RefCell::new(None),
+            files_reselect: Cell::new(false),
+            collections,
+            missing_files: RefCell::new(HashSet::new()),
+            files_dup_names: RefCell::new(HashSet::new()),
             top_panel,
             bottom_panel,
             bottom_label,
@@ -950,6 +1037,7 @@ impl App {
         state.wire_signals(&elements, &popover_list);
         state.register_actions();
         state.update_recent_menu();
+        state.check_missing_files();
 
         // Restore the last opened file if enabled. No is_file() probe: it
         // could hang on an unreachable mount; open_path fails with a toast
@@ -1406,62 +1494,52 @@ impl App {
             }
         });
 
+        // Rows are built per bind (cheap, and every closure then holds the
+        // item it was built for); see `bind_files_row`.
+        let factory = gtk4::SignalListItemFactory::new();
         let state = self.clone();
-        self.files_list.connect_row_activated(move |_, row| {
-            let path = usize::try_from(row.index())
-                .ok()
-                .and_then(|i| state.files_order.borrow().get(i).cloned());
-            // The click already moved the selection; put it back on the open
-            // document until the open (if it gets past guard_unsaved) lands.
-            state.mark_current_file();
-            let Some(path) = path else { return };
-            if state.source.borrow().container() == Some(path.as_path()) {
+        factory.connect_bind(move |_, obj| {
+            let Some(li) = obj.downcast_ref::<gtk4::ListItem>() else { return };
+            if let Some(row) = li.item().and_downcast::<gtk4::TreeListRow>() {
+                state.bind_files_row(li, &row);
+            }
+        });
+        self.files_view.set_factory(Some(&factory));
+        // Enter (and double click): open the document. Folders fold by click
+        // or by the expander's own keys (+, −).
+        let state = self.clone();
+        self.files_view.connect_activate(move |_, pos| {
+            let item = state.files_tree.item(pos).and_then(|o| file_item(&o));
+            if let Some(item @ (FileItem::File(_) | FileItem::Recent(_))) = item {
+                state.files_open(&item);
+            }
+        });
+        // Folding a folder can drop the selected row (or reveal the open
+        // document inside it): put the highlight back where it belongs.
+        let state = self.clone();
+        self.files_tree.connect_items_changed(move |_, _, _, _| {
+            if state.files_reselect.replace(true) {
                 return;
             }
             let s = state.clone();
-            state.guard_unsaved(Box::new(move || s.open_path(&path)));
+            glib::idle_add_local_once(move || {
+                s.files_reselect.set(false);
+                s.select_current_file();
+            });
         });
-        // Right-click: "Open Location", "Remove from List". One popover, refilled per click —
-        // unparenting a fresh one on `closed` can drop the action it fires.
-        let files_menu = gio::Menu::new();
-        let files_popover = gtk4::PopoverMenu::from_model(Some(&files_menu));
-        files_popover.set_parent(&self.files_list);
-        files_popover.set_has_arrow(false);
-        files_popover.set_halign(gtk4::Align::Start);
+        // Right-click on empty space: "New Folder…" (rows claim their own).
         let click = gtk4::GestureClick::new();
         click.set_button(gdk::BUTTON_SECONDARY);
         let state = self.clone();
-        click.connect_pressed(move |_, _, x, y| {
-            let Some(row) = state.files_list.row_at_y(y as i32) else { return };
-            let Some(path) = usize::try_from(row.index())
-                .ok()
-                .and_then(|i| state.files_order.borrow().get(i).cloned())
-            else {
-                return;
-            };
-            files_menu.remove_all();
-            let item = gio::MenuItem::new(Some("Open _Location"), None);
-            item.set_action_and_target_value(
-                Some("win.open-location"),
-                Some(&path_variant(&path)),
-            );
-            files_menu.append_item(&item);
-            let item = gio::MenuItem::new(Some("_Remove from List"), None);
-            item.set_action_and_target_value(
-                Some("win.forget-recent"),
-                Some(&path_variant(&path)),
-            );
-            files_menu.append_item(&item);
-            files_popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-            files_popover.popup();
-        });
-        self.files_list.add_controller(click);
+        click.connect_pressed(move |_, _, x, y| state.files_context_menu(None, x, y));
+        self.files_view.add_controller(click);
 
         // Close: persist layout, confirm if there are unsaved changes.
         let state = self.clone();
         self.window.connect_close_request(move |_| {
             state.remember_position();
             state.persist_settings();
+            state.save_collections();
             if state.modified.get() {
                 let destroy = state.clone();
                 state.guard_unsaved(Box::new(move || {
@@ -1569,6 +1647,8 @@ impl App {
             state.persist_settings();
         });
         self.window.add_action(&action);
+
+        self.register_files_actions();
 
         let action = gio::SimpleAction::new_stateful("view-mode", None, &false.to_variant());
         let state = self.clone();
@@ -3264,7 +3344,8 @@ impl App {
         let mut recent = self.recent_files.borrow_mut();
         recent.retain(|p| *p != path);
         recent.insert(0, path);
-        recent.truncate(RECENT_MAX);
+        let tree = self.collections.borrow();
+        collections::cap_recent(&mut recent, RECENT_MAX, |p| tree.contains_path(p));
     }
 
     /// Rebuild the "Open Recent" submenu from the recent-files list. No
@@ -3288,11 +3369,13 @@ impl App {
         self.update_files_panel();
     }
 
-    /// Rebuild the Files panel from the same list, under the same rule: no
-    /// stat on the main loop, so a gone entry only says so when clicked.
-    /// The rows keep `files_order`, reconciled with the recent list, with
-    /// pinned files on top.
+    /// Rebuild the Files panel: the folders, then the recent list under the
+    /// same rule as the menu — no stat on the main loop, so a gone entry only
+    /// says so when clicked. The recent rows keep `files_order`, reconciled
+    /// with the recent list, pinned files on top, minus anything filed in a
+    /// folder (that row lives in its folder instead).
     fn update_files_panel(&self) {
+        self.sync_expanded();
         {
             let recent = self.recent_files.borrow();
             let frozen = self.frozen_files.borrow();
@@ -3305,122 +3388,721 @@ impl App {
             }
             *order = pinned_first(std::mem::take(&mut *order), &frozen);
         }
-        // Not remove_all(): with a placeholder set, GTK's loop keeps trying
-        // to remove the placeholder (a child, but not a row) forever.
-        while let Some(row) = self.files_list.row_at_index(0) {
-            self.files_list.remove(&row);
+        let tree = self.collections.borrow();
+        let filed: HashSet<PathBuf> = tree.paths().into_iter().collect();
+        let recent: Vec<PathBuf> =
+            self.files_order.borrow().iter().filter(|p| !filed.contains(*p)).cloned().collect();
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for path in filed.iter().chain(&recent) {
+            *counts.entry(file_label(path)).or_default() += 1;
         }
-        let recent = self.files_order.borrow();
-        let names: Vec<String> = recent.iter().map(file_label).collect();
-        for (path, name) in recent.iter().zip(&names) {
-            let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
-            let label = gtk4::Label::new(Some(name));
-            label.set_hexpand(true);
-            label.set_xalign(0.0);
-            label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-            hbox.append(&label);
-            // Name only (the tooltip has the path), except where two entries
-            // share a name: then the folder tells them apart.
-            if names.iter().filter(|n| *n == name).count() > 1 {
-                let folder = path.parent().and_then(Path::file_name).map(|f| f.to_string_lossy());
-                if let Some(folder) = folder {
-                    let suffix = gtk4::Label::new(Some(&format!("· {folder}")));
-                    suffix.add_css_class("caption");
-                    suffix.add_css_class("dim-label");
-                    suffix.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-                    hbox.append(&suffix);
-                    label.set_hexpand(false);
-                    suffix.set_hexpand(true);
-                    suffix.set_xalign(0.0);
+        *self.files_dup_names.borrow_mut() =
+            counts.into_iter().filter(|(_, n)| *n > 1).map(|(name, _)| name).collect();
+        let mut items: Vec<glib::BoxedAnyObject> = collections::display(&tree.folders)
+            .into_iter()
+            .map(|n| glib::BoxedAnyObject::new(node_item(n)))
+            .collect();
+        if !tree.is_empty() {
+            items.push(glib::BoxedAnyObject::new(FileItem::Header));
+        }
+        items.extend(recent.into_iter().map(|p| glib::BoxedAnyObject::new(FileItem::Recent(p))));
+        drop(tree);
+        let adj = self.files_scroll.vadjustment();
+        let scroll = adj.value();
+        self.files_root.splice(0, self.files_root.n_items(), &items);
+        // Reopen the folders that were open. Expanding a row inserts its
+        // children right after it, so one forward pass reaches nested ones.
+        let mut i = 0;
+        while i < self.files_tree.n_items() {
+            if let Some(row) = self.files_tree.row(i) {
+                if let Some(FileItem::Folder(id)) = file_item(row.upcast_ref()) {
+                    let open = self.collections.borrow().is_expanded(id);
+                    if open {
+                        row.set_expanded(true);
+                    }
                 }
             }
-            hbox.append(&self.freeze_button(path));
-            let row = gtk4::ListBoxRow::new();
-            row.set_child(Some(&hbox));
-            row.set_tooltip_text(Some(&path.display().to_string()));
-            self.files_list.append(&row);
+            i += 1;
         }
-        drop(recent);
-        self.mark_current_file();
+        self.files_empty.set_visible(self.files_tree.n_items() == 0);
+        self.select_current_file();
+        // Rebuilding must not move the list; then show the open document's
+        // row if it is off-screen, as before.
+        let view = self.files_view.clone();
+        let sel = self.files_sel.clone();
+        glib::idle_add_local_once(move || {
+            adj.set_value(scroll);
+            let pos = sel.selected();
+            if pos != gtk4::INVALID_LIST_POSITION {
+                view.scroll_to(pos, gtk4::ListScrollFlags::NONE, None);
+            }
+        });
     }
 
-    /// The Files row's freeze pin: a frozen file stays in the panel when it
-    /// falls off the recent list. Shown dim on hover only until set.
-    fn freeze_button(&self, path: &Path) -> gtk4::ToggleButton {
-        let frozen = self.frozen_files.borrow().iter().any(|p| p == path);
+    /// Fill one Files row. Built fresh on every bind, so each closure holds
+    /// the item it was made for.
+    fn bind_files_row(self: &Rc<Self>, li: &gtk4::ListItem, row: &gtk4::TreeListRow) {
+        let Some(item) = file_item(row.upcast_ref()) else { return };
+        let header = item == FileItem::Header;
+        li.set_selectable(!header);
+        li.set_activatable(!header);
+        let content = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        match &item {
+            FileItem::Header => {
+                let label = gtk4::Label::new(Some("Recent"));
+                label.add_css_class("caption-heading");
+                label.add_css_class("dim-label");
+                label.set_xalign(0.0);
+                label.set_margin_top(6);
+                content.append(&label);
+            }
+            FileItem::Folder(id) => {
+                let tree = self.collections.borrow();
+                let Some(folder) = tree.folder(*id) else { return };
+                let icon = gtk4::Image::from_icon_name("folder-symbolic");
+                icon.add_css_class("dim-label");
+                content.append(&icon);
+                let name = gtk4::Label::new(Some(&folder.name));
+                name.set_hexpand(true);
+                name.set_xalign(0.0);
+                name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                content.append(&name);
+                let n = tree.count_files(*id);
+                if n > 0 {
+                    let count = gtk4::Label::new(Some(&n.to_string()));
+                    count.add_css_class("caption");
+                    count.add_css_class("dim-label");
+                    count.set_margin_end(4);
+                    content.append(&count);
+                }
+            }
+            FileItem::File(id) => {
+                let Some(entry) = self.collections.borrow().file(*id).cloned() else { return };
+                self.file_row_content(&content, &entry.path, entry.pinned, Some(*id));
+            }
+            FileItem::Recent(path) => {
+                let pinned = self.frozen_files.borrow().contains(path);
+                self.file_row_content(&content, path, pinned, None);
+            }
+        }
+        let widget: gtk4::Widget = if header {
+            content.upcast()
+        } else {
+            let expander = gtk4::TreeExpander::new();
+            expander.set_list_row(Some(row));
+            // Recent rows line up with the folder names beside them; with no
+            // folders there is nothing to line up with.
+            expander.set_indent_for_icon(!self.collections.borrow().is_empty());
+            expander.set_child(Some(&content));
+            expander.upcast()
+        };
+        self.files_row_controllers(&widget, &item, row);
+        li.set_child(Some(&widget));
+    }
+
+    /// Name (path in the tooltip), a dim folder suffix where two entries
+    /// share a name, and the pin.
+    fn file_row_content(&self, content: &gtk4::Box, path: &Path, pinned: bool, filed: Option<u64>) {
+        let name = file_label(&path.to_path_buf());
+        let missing = filed.is_some() && self.missing_files.borrow().contains(path);
+        let label = gtk4::Label::new(Some(&name));
+        label.set_hexpand(true);
+        label.set_xalign(0.0);
+        label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        if missing {
+            label.add_css_class("files-missing");
+        }
+        content.append(&label);
+        if self.files_dup_names.borrow().contains(&name) {
+            let folder = path.parent().and_then(Path::file_name).map(|f| f.to_string_lossy());
+            if let Some(folder) = folder {
+                let suffix = gtk4::Label::new(Some(&format!("· {folder}")));
+                suffix.add_css_class("caption");
+                suffix.add_css_class("dim-label");
+                suffix.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                content.append(&suffix);
+                label.set_hexpand(false);
+                suffix.set_hexpand(true);
+                suffix.set_xalign(0.0);
+            }
+        }
+        content.append(&self.freeze_button(path, pinned, filed));
+        content.set_tooltip_text(Some(&if missing {
+            format!("Not found: {}", path.display())
+        } else {
+            path.display().to_string()
+        }));
+    }
+
+    /// The row's pin: a pinned row leads its list — the recent list, where
+    /// it also never falls off, or its folder. Shown dim on hover until set.
+    fn freeze_button(&self, path: &Path, pinned: bool, filed: Option<u64>) -> gtk4::ToggleButton {
+        let tip = |on: bool| if on { "Unpin" } else { "Pin to Top" };
         let button = gtk4::ToggleButton::builder()
             .icon_name("view-pin-symbolic")
-            .active(frozen)
+            .active(pinned)
             .valign(gtk4::Align::Center)
-            .tooltip_text(if frozen { "Unfreeze" } else { "Freeze in List" })
+            .tooltip_text(tip(pinned))
             .css_classes(["flat", "files-freeze"])
             .build();
         let path = path.to_path_buf();
-        // From the thread-local at click time: this also runs while `build`
-        // is still assembling the window, before there is an Rc to capture.
         button.connect_toggled(move |button| {
             let Some(state) = STATE.with(|s| s.borrow().clone()) else { return };
             let on = button.is_active();
-            button.set_tooltip_text(Some(if on { "Unfreeze" } else { "Freeze in List" }));
-            {
-                let mut frozen = state.frozen_files.borrow_mut();
-                frozen.retain(|p| *p != path);
-                if on {
-                    frozen.push(path.clone());
+            button.set_tooltip_text(Some(tip(on)));
+            match filed {
+                Some(id) => {
+                    state.collections.borrow_mut().set_pinned(id, on);
+                    state.save_collections();
+                }
+                None => {
+                    let mut frozen = state.frozen_files.borrow_mut();
+                    frozen.retain(|p| *p != path);
+                    if on {
+                        frozen.push(path.clone());
+                    }
                 }
             }
             state.persist_settings();
-            // The row moves (pinned rows sit on top; an unpinned file that
-            // is no longer recent leaves the list). Rebuild after this
-            // handler, not under the button emitting it.
+            // The row moves. Rebuild after this handler, not under the
+            // button emitting it.
             glib::idle_add_local_once(move || state.update_files_panel());
         });
         button
     }
 
-    /// Select the open document's row in the Files panel, or none.
-    fn mark_current_file(&self) {
-        let source = self.source.borrow();
-        let index = source
-            .container()
-            .and_then(|current| self.files_order.borrow().iter().position(|p| p == current));
-        match index.and_then(|i| self.files_list.row_at_index(i as i32)) {
-            Some(row) => self.files_list.select_row(Some(&row)),
-            None => self.files_list.unselect_all(),
+    /// Click, right-click and drag-and-drop on one row.
+    fn files_row_controllers(self: &Rc<Self>, widget: &gtk4::Widget, item: &FileItem, row: &gtk4::TreeListRow) {
+        let header = *item == FileItem::Header;
+        if !header {
+            // A plain click opens a document or folds a folder (the list's
+            // own activation needs a double click).
+            let click = gtk4::GestureClick::new();
+            click.set_button(gdk::BUTTON_PRIMARY);
+            let state = self.clone();
+            let it = item.clone();
+            let row = row.clone();
+            click.connect_released(move |_, n, _, _| {
+                if n != 1 {
+                    return;
+                }
+                match &it {
+                    FileItem::Folder(_) => row.set_expanded(!row.is_expanded()),
+                    _ => state.files_open(&it),
+                }
+            });
+            widget.add_controller(click);
         }
+
+        let menu_click = gtk4::GestureClick::new();
+        menu_click.set_button(gdk::BUTTON_SECONDARY);
+        let state = self.clone();
+        let it = item.clone();
+        let w = widget.clone();
+        menu_click.connect_pressed(move |g, _, x, y| {
+            g.set_state(gtk4::EventSequenceState::Claimed);
+            let at = w
+                .compute_point(&state.files_view, &gtk4::graphene::Point::new(x as f32, y as f32))
+                .map_or((x, y), |p| (p.x() as f64, p.y() as f64));
+            state.files_context_menu(Some(it.clone()), at.0, at.1);
+        });
+        widget.add_controller(menu_click);
+
+        if !header {
+            let drag = gtk4::DragSource::new();
+            drag.set_actions(gdk::DragAction::MOVE);
+            let state = self.clone();
+            let it = item.clone();
+            drag.connect_prepare(move |_, _, _| {
+                *state.files_drag.borrow_mut() = Some(it.clone());
+                Some(gdk::ContentProvider::for_value(&"bindle-files-row".to_value()))
+            });
+            let w = widget.clone();
+            drag.connect_drag_begin(move |source, _| {
+                source.set_icon(Some(&gtk4::WidgetPaintable::new(Some(&w))), 0, 0);
+            });
+            let state = self.clone();
+            drag.connect_drag_end(move |_, _, _| {
+                state.files_drag.replace(None);
+            });
+            widget.add_controller(drag);
+        }
+
+        // The drop marker goes on the list row (full width), not our child.
+        let marked = |w: &gtk4::Widget| w.parent().unwrap_or_else(|| w.clone());
+        let clear = |w: &gtk4::Widget| {
+            for class in ["files-drop-into", "files-drop-before", "files-drop-after"] {
+                w.remove_css_class(class);
+            }
+        };
+        let target = gtk4::DropTarget::new(glib::Type::STRING, gdk::DragAction::MOVE);
+        let state = self.clone();
+        target.connect_accept(move |_, _| state.files_drag.borrow().is_some());
+        let state = self.clone();
+        let it = item.clone();
+        let w = widget.clone();
+        target.connect_motion(move |_, _, y| {
+            let row = marked(&w);
+            clear(&row);
+            let frac = y / f64::from(w.height().max(1));
+            match state.files_drop_place(&it, frac) {
+                Some(drop) => {
+                    row.add_css_class(match drop {
+                        FilesDrop::Place(Place::Before(_)) => "files-drop-before",
+                        FilesDrop::Place(Place::After(_)) => "files-drop-after",
+                        _ => "files-drop-into",
+                    });
+                    gdk::DragAction::MOVE
+                }
+                None => gdk::DragAction::empty(),
+            }
+        });
+        let w = widget.clone();
+        target.connect_leave(move |_| clear(&marked(&w)));
+        let state = self.clone();
+        let it = item.clone();
+        let w = widget.clone();
+        target.connect_drop(move |_, _, _, y| {
+            clear(&marked(&w));
+            let frac = y / f64::from(w.height().max(1));
+            let Some(drop) = state.files_drop_place(&it, frac) else { return false };
+            // Taken now: drag-end clears it before the idle below runs.
+            let Some(dragged) = state.files_drag.borrow_mut().take() else { return false };
+            let s = state.clone();
+            // After the drag finishes: the rebuild destroys this row.
+            glib::idle_add_local_once(move || s.files_drop(dragged, drop));
+            true
+        });
+        widget.add_controller(target);
+    }
+
+    /// Where the dragged row would land on `target`, `frac` of the way down
+    /// it. A folder dropped near a folder's top or bottom edge goes beside
+    /// it, anywhere else into it; anything onto the recent list leaves its
+    /// folder.
+    fn files_drop_place(&self, target: &FileItem, frac: f64) -> Option<FilesDrop> {
+        let dragged = self.files_drag.borrow().clone()?;
+        let moving = match &dragged {
+            FileItem::Folder(id) | FileItem::File(id) => Some(*id),
+            FileItem::Recent(_) => None,
+            FileItem::Header => return None,
+        };
+        let place = match target {
+            FileItem::Header | FileItem::Recent(_) => {
+                return matches!(dragged, FileItem::File(_)).then_some(FilesDrop::ToRecent);
+            }
+            FileItem::Folder(t) if matches!(dragged, FileItem::Folder(_)) => {
+                if frac < 0.25 {
+                    Place::Before(*t)
+                } else if frac > 0.75 {
+                    Place::After(*t)
+                } else {
+                    Place::Into(*t)
+                }
+            }
+            FileItem::Folder(t) => Place::Into(*t),
+            FileItem::File(t) => {
+                if frac < 0.5 { Place::Before(*t) } else { Place::After(*t) }
+            }
+        };
+        self.collections.borrow().can_place(moving, place).then_some(FilesDrop::Place(place))
+    }
+
+    fn files_drop(&self, dragged: FileItem, drop: FilesDrop) {
+        match (drop, dragged) {
+            (FilesDrop::ToRecent, FileItem::File(id)) => self.unfile(id),
+            (FilesDrop::Place(place), FileItem::Recent(path)) => self.file_into(&path, place),
+            (FilesDrop::Place(place), FileItem::Folder(id) | FileItem::File(id)) => {
+                if self.collections.borrow_mut().move_node(id, place) {
+                    self.collections_changed();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// File a recent document at `place`; its pin goes with it.
+    fn file_into(&self, path: &Path, place: Place) {
+        let pinned = self.frozen_files.borrow().iter().any(|p| p == path);
+        if !self.collections.borrow_mut().place_file(path, pinned, place) {
+            return;
+        }
+        self.frozen_files.borrow_mut().retain(|p| p != path);
+        self.collections_changed();
+        self.persist_settings();
+    }
+
+    /// Take a filed document out of its folder, back to the recent list.
+    fn unfile(&self, id: u64) {
+        let taken = self.collections.borrow_mut().take(id);
+        if let Some(Node::File(entry)) = taken {
+            self.return_to_recent(vec![entry]);
+        }
+        self.collections_changed();
+    }
+
+    /// Documents leaving the folders rejoin the recent list (a pinned one
+    /// stays pinned there). Gone ones just go.
+    fn return_to_recent(&self, entries: Vec<FileEntry>) {
+        {
+            let mut recent = self.recent_files.borrow_mut();
+            let mut frozen = self.frozen_files.borrow_mut();
+            let mut missing = self.missing_files.borrow_mut();
+            for entry in entries {
+                if missing.remove(&entry.path) {
+                    continue;
+                }
+                if !recent.contains(&entry.path) {
+                    recent.insert(0, entry.path.clone());
+                }
+                if entry.pinned && !frozen.contains(&entry.path) {
+                    frozen.push(entry.path);
+                }
+            }
+            let tree = self.collections.borrow();
+            collections::cap_recent(&mut recent, RECENT_MAX, |p| tree.contains_path(p));
+        }
+        self.persist_settings();
+    }
+
+    /// After any change to the folders: save them, rebuild the panel.
+    fn collections_changed(&self) {
+        self.save_collections();
+        self.update_recent_menu();
+    }
+
+    fn save_collections(&self) {
+        self.sync_expanded();
+        self.collections.borrow().save();
+    }
+
+    /// Read back which folders are open. Only shown rows can say; a folder
+    /// inside a closed one keeps what it had.
+    fn sync_expanded(&self) {
+        let mut tree = self.collections.borrow_mut();
+        for i in 0..self.files_tree.n_items() {
+            let Some(row) = self.files_tree.row(i) else { continue };
+            if let Some(FileItem::Folder(id)) = file_item(row.upcast_ref()) {
+                tree.set_expanded(id, row.is_expanded());
+            }
+        }
+    }
+
+    /// Mark filed documents that are gone (missing, with the folder they
+    /// were in still there — a missing folder may be an unmounted share).
+    /// On a worker thread: any stat may hang on an unreachable mount.
+    fn check_missing_files(self: &Rc<Self>) {
+        let paths = self.collections.borrow().paths();
+        if paths.is_empty() {
+            return;
+        }
+        let state = self.clone();
+        glib::spawn_future_local(async move {
+            let gone = gio::spawn_blocking(move || {
+                paths
+                    .into_iter()
+                    .filter(|p| {
+                        p.try_exists().is_ok_and(|e| !e) && p.parent().is_some_and(Path::is_dir)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default();
+            if !gone.is_empty() {
+                state.missing_files.borrow_mut().extend(gone);
+                state.update_files_panel();
+            }
+        });
+    }
+
+    fn files_open(self: &Rc<Self>, item: &FileItem) {
+        let path = match item {
+            FileItem::Recent(p) => p.clone(),
+            FileItem::File(id) => match self.collections.borrow().file(*id) {
+                Some(f) => f.path.clone(),
+                None => return,
+            },
+            _ => return,
+        };
+        // The click already moved the selection; put it back on the open
+        // document until the open (if it gets past guard_unsaved) lands.
+        self.select_current_file();
+        if self.source.borrow().container() == Some(path.as_path()) {
+            return;
+        }
+        let s = self.clone();
+        self.guard_unsaved(Box::new(move || s.open_path(&path)));
+    }
+
+    /// Select the open document's row — or, while it sits in a closed
+    /// folder, the nearest shown folder around it — or none.
+    fn select_current_file(&self) {
+        let current = self.source.borrow().container().map(Path::to_path_buf);
+        let wanted: Vec<FileItem> = match current {
+            None => Vec::new(),
+            Some(path) => {
+                let tree = self.collections.borrow();
+                match tree.file_id(&path) {
+                    Some(id) => tree
+                        .ancestors(id)
+                        .into_iter()
+                        .map(FileItem::Folder)
+                        .chain([FileItem::File(id)])
+                        .collect(),
+                    None => vec![FileItem::Recent(path)],
+                }
+            }
+        };
+        // Folders come before what is in them, so the last hit is the
+        // deepest one shown.
+        let mut pos = gtk4::INVALID_LIST_POSITION;
+        if !wanted.is_empty() {
+            for i in 0..self.files_tree.n_items() {
+                let item = self.files_tree.row(i).and_then(|r| file_item(r.upcast_ref()));
+                if item.is_some_and(|it| wanted.contains(&it)) {
+                    pos = i;
+                }
+            }
+        }
+        if self.files_sel.selected() != pos {
+            self.files_sel.set_selected(pos);
+        }
+    }
+
+    /// Select the open document's row and show it.
+    fn mark_current_file(&self) {
+        self.select_current_file();
         self.scroll_to_current_file();
     }
 
     /// Scroll the Files panel just far enough to show the selected row —
     /// never when it is already in view, so clicking a row moves nothing.
-    /// Waits on the frame clock, since a freshly rebuilt list has no row
-    /// positions until GTK has laid it out.
     fn scroll_to_current_file(&self) {
-        let list = self.files_list.clone();
-        let scroll = self.files_scroll.clone();
-        let panel = self.files_panel.clone();
-        let tries = Cell::new(0);
-        self.files_list.add_tick_callback(move |_, _| {
-            tries.set(tries.get() + 1);
-            let Some(row) = list.selected_row() else { return glib::ControlFlow::Break };
-            if !row.is_mapped() || row.height() == 0 {
-                return if tries.get() < 30 && panel.is_visible() {
-                    glib::ControlFlow::Continue
-                } else {
-                    glib::ControlFlow::Break
-                };
-            }
-            if let Some(bounds) = row.compute_bounds(&list) {
-                let adj = scroll.vadjustment();
-                let top = bounds.y() as f64;
-                let bottom = top + bounds.height() as f64;
-                if top < adj.value() {
-                    adj.set_value(top);
-                } else if bottom > adj.value() + adj.page_size() {
-                    adj.set_value(bottom - adj.page_size());
+        let pos = self.files_sel.selected();
+        if pos != gtk4::INVALID_LIST_POSITION {
+            self.files_view.scroll_to(pos, gtk4::ListScrollFlags::NONE, None);
+        }
+    }
+
+    /// The right-click menu for a row (None: empty space).
+    fn files_context_menu(&self, item: Option<FileItem>, x: f64, y: f64) {
+        let menu = &self.files_menu;
+        menu.remove_all();
+        let tree = self.collections.borrow();
+        let move_menu = |exclude: Option<u64>| {
+            let sub = gio::Menu::new();
+            let folders = gio::Menu::new();
+            for (id, label) in tree.folder_list() {
+                if Some(id) != exclude {
+                    let mi = gio::MenuItem::new(Some(&menu_label(&label)), None);
+                    mi.set_action_and_target_value(Some("win.files-move-to"), Some(&id.to_variant()));
+                    folders.append_item(&mi);
                 }
             }
-            glib::ControlFlow::Break
+            sub.append_section(None, &folders);
+            sub.append(Some("_New Folder…"), Some("win.files-new-folder"));
+            sub
+        };
+        let location = |path: &Path| {
+            let mi = gio::MenuItem::new(Some("Open _Location"), None);
+            mi.set_action_and_target_value(Some("win.open-location"), Some(&path_variant(&path)));
+            mi
+        };
+        match &item {
+            None | Some(FileItem::Header) => menu.append(Some("New _Folder…"), Some("win.files-new-folder")),
+            Some(FileItem::Folder(_)) => {
+                menu.append(Some("New _Subfolder…"), Some("win.files-new-folder"));
+                menu.append(Some("_Rename…"), Some("win.files-rename-folder"));
+                menu.append(Some("_Delete Folder"), Some("win.files-delete-folder"));
+            }
+            Some(FileItem::Recent(path)) => {
+                menu.append_item(&location(path));
+                menu.append_submenu(Some("_Move to Folder"), &move_menu(None));
+                let mi = gio::MenuItem::new(Some("_Remove from List"), None);
+                mi.set_action_and_target_value(Some("win.forget-recent"), Some(&path_variant(&path)));
+                menu.append_item(&mi);
+            }
+            Some(FileItem::File(id)) => {
+                let Some(entry) = tree.file(*id) else { return };
+                let missing = self.missing_files.borrow().contains(&entry.path);
+                if missing {
+                    menu.append(Some("_Locate…"), Some("win.files-locate"));
+                } else {
+                    menu.append_item(&location(&entry.path));
+                }
+                menu.append_submenu(Some("_Move to Folder"), &move_menu(tree.parent(*id)));
+                let remove = if missing { "_Remove" } else { "_Remove from Folder" };
+                menu.append(Some(remove), Some("win.files-remove"));
+            }
+        }
+        drop(tree);
+        *self.files_menu_target.borrow_mut() = item;
+        self.files_popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        self.files_popover.popup();
+    }
+
+    /// The `files-*` actions behind the Files context menu and the panel's
+    /// New Folder button. They act on `files_menu_target`.
+    fn register_files_actions(self: &Rc<Self>) {
+        let target = |s: &App| s.files_menu_target.borrow().clone();
+        let simple: [(&str, Box<dyn Fn(&Rc<App>)>); 6] = [
+            ("files-new-folder-root", Box::new(|s| {
+                s.files_menu_target.replace(None);
+                s.new_folder_dialog();
+            })),
+            ("files-new-folder", Box::new(|s| s.new_folder_dialog())),
+            ("files-rename-folder", Box::new(move |s| {
+                let Some(FileItem::Folder(id)) = target(s) else { return };
+                let Some(name) = s.collections.borrow().folder(id).map(|f| f.name.clone()) else { return };
+                s.folder_name_dialog("Rename Folder", &name, "_Rename", move |s, name| {
+                    s.collections.borrow_mut().rename(id, &name);
+                    s.collections_changed();
+                });
+            })),
+            ("files-delete-folder", Box::new(move |s| {
+                let Some(FileItem::Folder(id)) = target(s) else { return };
+                s.delete_folder(id);
+            })),
+            ("files-remove", Box::new(move |s| {
+                let Some(FileItem::File(id)) = target(s) else { return };
+                s.unfile(id);
+            })),
+            ("files-locate", Box::new(move |s| {
+                let Some(FileItem::File(id)) = target(s) else { return };
+                s.locate_dialog(id);
+            })),
+        ];
+        for (name, handler) in simple {
+            let action = gio::SimpleAction::new(name, None);
+            let state = self.clone();
+            action.connect_activate(move |_, _| handler(&state));
+            self.window.add_action(&action);
+        }
+
+        let action = gio::SimpleAction::new("files-move-to", Some(glib::VariantTy::UINT64));
+        let state = self.clone();
+        action.connect_activate(move |_, param| {
+            let Some(folder) = param.and_then(|v| v.get::<u64>()) else { return };
+            match target(&state) {
+                Some(FileItem::Recent(path)) => state.file_into(&path, Place::Into(folder)),
+                Some(FileItem::File(id)) => {
+                    if state.collections.borrow_mut().move_node(id, Place::Into(folder)) {
+                        state.collections_changed();
+                    }
+                }
+                _ => {}
+            }
+        });
+        self.window.add_action(&action);
+    }
+
+    /// "New Folder…" for the menu's row: a subfolder of a folder, a folder
+    /// to hold a document (beside where it is now), or a top-level one.
+    fn new_folder_dialog(self: &Rc<Self>) {
+        let target = self.files_menu_target.borrow().clone();
+        let parent = match &target {
+            Some(FileItem::Folder(id)) => Some(*id),
+            Some(FileItem::File(id)) => self.collections.borrow().parent(*id),
+            _ => None,
+        };
+        let heading = if parent.is_some() && matches!(target, Some(FileItem::Folder(_))) {
+            "New Subfolder"
+        } else {
+            "New Folder"
+        };
+        self.folder_name_dialog(heading, "", "_Create", move |s, name| {
+            let Some(new) = s.collections.borrow_mut().add_folder(parent, &name) else { return };
+            match target {
+                Some(FileItem::Recent(path)) => return s.file_into(&path, Place::Into(new)),
+                Some(FileItem::File(id)) => {
+                    s.collections.borrow_mut().move_node(id, Place::Into(new));
+                }
+                _ => {}
+            }
+            s.collections_changed();
+        });
+    }
+
+    fn folder_name_dialog(
+        self: &Rc<Self>,
+        heading: &str,
+        initial: &str,
+        ok: &str,
+        then: impl FnOnce(&Rc<App>, String) + 'static,
+    ) {
+        let dialog = adw::AlertDialog::new(Some(heading), None);
+        dialog.add_responses(&[("cancel", "_Cancel"), ("ok", ok)]);
+        dialog.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("ok"));
+        dialog.set_close_response("cancel");
+        let entry = gtk4::Entry::builder()
+            .text(initial)
+            .placeholder_text("Folder name")
+            .activates_default(true)
+            .build();
+        dialog.set_extra_child(Some(&entry));
+        dialog.set_response_enabled("ok", !initial.trim().is_empty());
+        let d = dialog.clone();
+        entry.connect_changed(move |e| d.set_response_enabled("ok", !e.text().trim().is_empty()));
+        dialog.set_focus(Some(&entry));
+        let state = self.clone();
+        let field = entry.clone();
+        dialog.choose(Some(&self.window), gio::Cancellable::NONE, move |response| {
+            let name = field.text().trim().to_string();
+            if response == "ok" && !name.is_empty() {
+                then(&state, name);
+            }
+        });
+    }
+
+    /// Delete a folder — only the list entry; its documents go back to the
+    /// recent list. Asks first when it holds anything.
+    fn delete_folder(self: &Rc<Self>, id: u64) {
+        let (name, files, empty) = {
+            let tree = self.collections.borrow();
+            let Some(f) = tree.folder(id) else { return };
+            (f.name.clone(), tree.count_files(id), f.children.is_empty())
+        };
+        let delete = move |s: &Rc<App>| {
+            let freed = s.collections.borrow_mut().delete_folder(id);
+            s.return_to_recent(freed);
+            s.collections_changed();
+        };
+        if empty {
+            return delete(self);
+        }
+        let body = match files {
+            0 => "Its subfolders are deleted too. Files on disk are not touched.".to_string(),
+            1 => "The document in it returns to Recent. Files on disk are not touched.".to_string(),
+            n => format!("The {n} documents in it return to Recent. Files on disk are not touched."),
+        };
+        let dialog = adw::AlertDialog::new(Some(&format!("Delete Folder “{name}”?")), Some(&body));
+        dialog.add_responses(&[("cancel", "_Cancel"), ("delete", "_Delete")]);
+        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        let state = self.clone();
+        dialog.choose(Some(&self.window), gio::Cancellable::NONE, move |response| {
+            if response == "delete" {
+                delete(&state);
+            }
+        });
+    }
+
+    /// "Locate…" for a filed document that went missing: point the entry at
+    /// the file where it is now. It keeps its folder, place and pin.
+    fn locate_dialog(self: &Rc<Self>, id: u64) {
+        let Some(old) = self.collections.borrow().file(id).map(|f| f.path.clone()) else { return };
+        let dialog = gtk4::FileDialog::builder()
+            .title(format!("Locate {}", file_label(&old)))
+            .modal(true)
+            .build();
+        let state = self.clone();
+        dialog.open(Some(&self.window), gio::Cancellable::NONE, move |res| {
+            let Some(path) = state.picked_path(res) else { return };
+            state.missing_files.borrow_mut().remove(&old);
+            state.collections.borrow_mut().relocate(id, path);
+            state.collections_changed();
         });
     }
 
@@ -3437,7 +4119,7 @@ impl App {
         let tries = Cell::new(0);
         self.sidebar.add_tick_callback(move |_, _| {
             tries.set(tries.get() + 1);
-            let first = state.files_list.row_at_index(0);
+            let first = state.files_view.first_child();
             let ready = first.as_ref().is_some_and(|r| r.height() > 0)
                 && state.files_scroll.height() > 0;
             let Some(first) = first.filter(|_| ready) else {
@@ -3445,17 +4127,11 @@ impl App {
             };
             // Row pitch includes any spacing between rows, which the row's
             // own height does not.
-            let mut n = 1;
-            while state.files_list.row_at_index(n).is_some() {
-                n += 1;
-            }
-            let pitch = state
-                .files_list
-                .row_at_index(1)
+            let pitch = first
+                .next_sibling()
                 .and_then(|second| second.compute_bounds(&first))
                 .map_or(first.height(), |b| b.y() as i32);
-            let (_, natural, _, _) = state.files_list.measure(gtk4::Orientation::Vertical, -1);
-            let padding = (natural - n * pitch).max(0);
+            let padding = 6;
             let header = state.files_panel.height() - state.files_scroll.height();
             let want = header + padding + FILES_ROWS * pitch;
             let cap = state.sidebar.height() / 2;
@@ -4146,6 +4822,8 @@ impl App {
             }
             match loaded {
                 Ok((Ok(opened), _)) => {
+                    // A filed document that was missing is back.
+                    state.missing_files.borrow_mut().remove(&path);
                     if state.edit_seq.get() == edits {
                         return state.finish_open(&path, opened);
                     }
@@ -4158,6 +4836,18 @@ impl App {
                             s.finish_open(&path, opened);
                         }
                     }));
+                }
+                // Filed in a folder: the user put it there, so it stays —
+                // dimmed, with Locate…/Remove on right-click.
+                Ok((Err(_), true)) if state.collections.borrow().contains_path(&path) => {
+                    state.missing_files.borrow_mut().insert(path.clone());
+                    state.recent_files.borrow_mut().retain(|p| *p != path);
+                    state.update_recent_menu();
+                    state.persist_settings();
+                    state.toast(&format!(
+                        "{} was not found — right-click it in Files to locate it",
+                        file_label(&path)
+                    ));
                 }
                 Ok((Err(_), true))
                     if state.recent_files.borrow().contains(&path)
@@ -5727,7 +6417,8 @@ impl App {
                 .application()
                 .is_some_and(|app| app.flags().contains(gio::ApplicationFlags::NON_UNIQUE));
         if shared {
-            settings.merge_lists(Settings::load(), &base);
+            let tree = self.collections.borrow();
+            settings.merge_lists(Settings::load(), &base, |p| tree.contains_path(p));
         }
         settings.save();
     }
@@ -5820,6 +6511,47 @@ fn file_stem_label(path: &Path) -> String {
     path.file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "Document".to_string())
+}
+
+/// One row of the Files panel.
+#[derive(Clone, Debug, PartialEq)]
+enum FileItem {
+    Folder(u64),
+    /// A document filed in a folder.
+    File(u64),
+    /// A document from the recent list.
+    Recent(PathBuf),
+    /// The "Recent" caption between the folders and the recent list.
+    Header,
+}
+
+/// Where a drop in the Files panel lands.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum FilesDrop {
+    Place(Place),
+    /// Out of its folder, back to the recent list.
+    ToRecent,
+}
+
+/// The item behind a Files model object (or a tree row holding one).
+fn file_item(obj: &glib::Object) -> Option<FileItem> {
+    let obj = match obj.downcast_ref::<gtk4::TreeListRow>() {
+        Some(row) => row.item()?,
+        None => obj.clone(),
+    };
+    obj.downcast_ref::<glib::BoxedAnyObject>().map(|b| b.borrow::<FileItem>().clone())
+}
+
+fn node_item(node: &Node) -> FileItem {
+    match node {
+        Node::Folder(f) => FileItem::Folder(f.id),
+        Node::File(f) => FileItem::File(f.id),
+    }
+}
+
+/// A user's folder name as a menu label: GTK reads `_` as a mnemonic.
+fn menu_label(name: &str) -> String {
+    name.replace('_', "__")
 }
 
 /// The Files panel's order with pinned files first, in the order they were

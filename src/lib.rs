@@ -1,5 +1,6 @@
 pub mod bundle;
 pub mod changelog;
+pub mod collections;
 pub mod doc;
 pub mod editor;
 pub mod export;
