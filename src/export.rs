@@ -171,11 +171,14 @@ pub struct Page {
     pub width: f64,
     pub height: f64,
     pub margin: f64,
+    /// Multiplies every font size (and the spacing that goes with text).
+    /// 1.0 is the export default; printing follows the preview font size.
+    pub font_scale: f64,
 }
 
 impl Page {
     /// A4 with a typographic margin, the export default.
-    pub const A4: Page = Page { width: 595.276, height: 841.89, margin: 56.0 };
+    pub const A4: Page = Page { width: 595.276, height: 841.89, margin: 56.0, font_scale: 1.0 };
 
     fn content_w(&self) -> f64 {
         self.width - 2.0 * self.margin
@@ -195,6 +198,7 @@ impl Page {
         self.height = self.height.max(72.0);
         let room = (self.width.min(self.height) - 72.0) / 2.0;
         self.margin = self.margin.clamp(0.0, room.max(0.0));
+        self.font_scale = if self.font_scale.is_finite() { self.font_scale.clamp(0.5, 3.0) } else { 1.0 };
         self
     }
 }
@@ -205,6 +209,13 @@ const CODE_FONT: &str = "Monospace 8.5";
 /// its column, so it needs neither a fixed advance nor the body size.
 const TABLE_FONT: &str = "Sans 9.5";
 const TABLE_HEAD_FONT: &str = "Sans Bold 9.5";
+/// `desc` (a pango font string such as "Sans 10.5") with its size scaled.
+fn scaled_font(desc: &str, scale: f64) -> pango::FontDescription {
+    let mut font = pango::FontDescription::from_string(desc);
+    font.set_size((font.size() as f64 * scale).round() as i32);
+    font
+}
+
 /// Padding between a cell's text and its border.
 const CELL_PAD: f64 = 5.0;
 const HEADING_FONTS: [&str; 4] = ["Sans Bold 19", "Sans Bold 15", "Sans Bold 12.5", "Sans Bold 11"];
@@ -628,7 +639,7 @@ fn draw_document(
 
     for block in blocks {
         if y > page.margin {
-            y += block.space_before;
+            y += block.space_before * page.font_scale;
         }
         if block.rule {
             if y + 8.0 > bottom {
@@ -652,7 +663,7 @@ fn draw_document(
             continue;
         }
         let layout = pangocairo::functions::create_layout(&cr);
-        layout.set_font_description(Some(&pango::FontDescription::from_string(block.font)));
+        layout.set_font_description(Some(&scaled_font(block.font, page.font_scale)));
         layout.set_width(((page.content_w() - block.indent).max(1.0) * pango::SCALE as f64) as i32);
         layout.set_wrap(pango::WrapMode::WordChar);
         if block.markup {
@@ -691,8 +702,9 @@ fn cell_layouts(
     row: &[String],
     widths: &[f64],
     header: bool,
+    scale: f64,
 ) -> Vec<pango::Layout> {
-    let font = pango::FontDescription::from_string(if header { TABLE_HEAD_FONT } else { TABLE_FONT });
+    let font = scaled_font(if header { TABLE_HEAD_FONT } else { TABLE_FONT }, scale);
     row.iter()
         .zip(widths)
         .map(|(cell, width)| {
@@ -718,9 +730,9 @@ fn row_height(layouts: &[pango::Layout]) -> f64 {
 /// page when the total overflows. Only columns above their fair share give
 /// space up, so a prose column wraps while `Default` / `Yes` columns keep
 /// their words intact instead of every column being scaled down alike.
-fn column_widths(cr: &cairo::Context, table: &TableData, avail: f64) -> Vec<f64> {
-    let body = pango::FontDescription::from_string(TABLE_FONT);
-    let head = pango::FontDescription::from_string(TABLE_HEAD_FONT);
+fn column_widths(cr: &cairo::Context, table: &TableData, avail: f64, scale: f64) -> Vec<f64> {
+    let body = scaled_font(TABLE_FONT, scale);
+    let head = scaled_font(TABLE_HEAD_FONT, scale);
     let mut natural = vec![0.0f64; table.cols];
     for (r, row) in table.rows.iter().enumerate() {
         for (i, cell) in row.iter().enumerate() {
@@ -810,9 +822,9 @@ fn draw_table(
 ) -> Result<f64, String> {
     let bottom = page.bottom();
     let x0 = page.margin + indent;
-    let widths = column_widths(cr, table, (page.content_w() - indent).max(1.0));
+    let widths = column_widths(cr, table, (page.content_w() - indent).max(1.0), page.font_scale);
     let header = table.rows.first().map(|row| {
-        let layouts = cell_layouts(cr, row, &widths, true);
+        let layouts = cell_layouts(cr, row, &widths, true, page.font_scale);
         let height = row_height(&layouts);
         (layouts, height)
     });
@@ -825,7 +837,7 @@ fn draw_table(
                 None => continue,
             }
         } else {
-            let layouts = cell_layouts(cr, row, &widths, false);
+            let layouts = cell_layouts(cr, row, &widths, false, page.font_scale);
             let height = row_height(&layouts);
             (layouts, height)
         };
@@ -1072,7 +1084,7 @@ mod tests {
     /// sheet it was given — the printer is not asked to scale an A4 PDF.
     #[test]
     fn pdf_bytes_use_the_page_they_are_given() {
-        let letter = Page { width: 612.0, height: 792.0, margin: 54.0 };
+        let letter = Page { width: 612.0, height: 792.0, margin: 54.0, font_scale: 1.0 };
         let doc = "# Title\n\n".to_string() + &"A line of body text.\n\n".repeat(60);
         let render = |page| pdf_bytes("T", &doc, Content::Plain, page).expect("pdf");
         let bytes = render(letter);
@@ -1086,16 +1098,20 @@ mod tests {
         // the page too — not just the declared paper size.
         let short = Page { height: 400.0, ..letter };
         assert!(render(short).len() > bytes.len(), "pagination ignored the page height");
+        // A larger font scale takes more sheets for the same text.
+        let big = Page { font_scale: 1.5, ..letter };
+        assert!(render(big).len() > bytes.len(), "font scale ignored");
     }
 
     /// A printer whose margins swallow the sheet must still leave a content
     /// box: a zero or negative width would make every block overflow.
     #[test]
     fn insane_page_geometry_is_clamped() {
-        let page = Page { width: 200.0, height: 300.0, margin: 500.0 }.sane();
+        let page = Page { width: 200.0, height: 300.0, margin: 500.0, font_scale: 1.0 }.sane();
         assert!(page.content_w() > 0.0);
         assert!(page.bottom() > page.margin);
-        let tiny = Page { width: 0.0, height: -10.0, margin: -5.0 }.sane();
+        let tiny = Page { width: 0.0, height: -10.0, margin: -5.0, font_scale: f64::NAN }.sane();
+        assert_eq!(tiny.font_scale, 1.0);
         assert!(tiny.content_w() > 0.0 && tiny.bottom() > tiny.margin);
         assert_eq!(Page::A4.sane(), Page::A4);
     }

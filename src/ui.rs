@@ -5391,7 +5391,7 @@ impl App {
                 Ok(setup) => setup,
                 Err(err) => return state.print_failed(&err),
             };
-            let bytes = match state.document_pdf(page_geometry(&setup.page_setup())) {
+            let bytes = match state.document_pdf(page_geometry(&setup.page_setup(), state.preview_font.get().print_scale())) {
                 Ok(bytes) => bytes,
                 Err(err) => return state.toast(&format!("Could not prepare the document: {err}")),
             };
@@ -5708,7 +5708,8 @@ fn file_label(path: &PathBuf) -> String {
 /// printer's *unprintable* edges, which would put text at the very rim — so
 /// they act as a floor and the A4 typographic margin wins whenever it is
 /// larger, keeping print and PDF export visually identical on A4.
-fn page_geometry(setup: &gtk4::PageSetup) -> export::Page {
+/// `font_scale` comes from the preview font size, so print follows it.
+fn page_geometry(setup: &gtk4::PageSetup, font_scale: f64) -> export::Page {
     let unit = gtk4::Unit::Points;
     let hardware = [
         setup.top_margin(unit),
@@ -5722,6 +5723,7 @@ fn page_geometry(setup: &gtk4::PageSetup) -> export::Page {
         width: setup.paper_width(unit),
         height: setup.paper_height(unit),
         margin: hardware.max(export::Page::A4.margin),
+        font_scale,
     }
     .sane()
 }

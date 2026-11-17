@@ -42,6 +42,11 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.36.0" date="2026-11-17">
+      <description>
+        <p>Printing follows the preview font size</p>
+      </description>
+    </release>
     <release version="1.35.2" date="2026-11-14">
       <description>
         <ul>

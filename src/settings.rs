@@ -271,6 +271,12 @@ impl FontSize {
         }
     }
 
+    /// Print font scale: the preview size relative to Normal, whose print
+    /// sizes are the PDF export defaults (body 10.5pt).
+    pub fn print_scale(self) -> f64 {
+        self.preview_pt() / FontSize::Normal.preview_pt()
+    }
+
     /// The preview size shrunk by `scale` for "Fit preview to width": never
     /// below `FIT_MIN_PT`, never above the unscaled size, and on a quarter
     /// point that is not a whole pixel (the clipping rule above).
