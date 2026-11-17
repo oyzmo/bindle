@@ -42,6 +42,11 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.37.0" date="2026-11-17">
+      <description>
+        <p>Header buttons −# / +# move every heading one level up or down</p>
+      </description>
+    </release>
     <release version="1.36.0" date="2026-11-17">
       <description>
         <p>Printing follows the preview font size</p>

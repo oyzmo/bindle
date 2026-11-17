@@ -129,6 +129,69 @@ pub fn on_backspace(before_cursor: &str, after_cursor: &str) -> BackspaceAction 
     BackspaceAction::None
 }
 
+/// Deepest ATX heading level (CommonMark).
+pub const MAX_HEADING: u8 = 6;
+
+/// A heading in the source, found by the markdown parser (so `#` lines
+/// inside code blocks and `#hashtags` are never mistaken for one).
+#[derive(Debug, PartialEq)]
+pub struct Heading {
+    pub level: u8,
+    /// Char offset of the first `#`, or None for a setext heading
+    /// (underlined with `===`/`---`), which has no `#` run to change.
+    pub hash: Option<usize>,
+}
+
+pub fn headings(text: &str) -> Vec<Heading> {
+    use pulldown_cmark::{Event, Options, Parser, Tag};
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+    let mut found = Vec::new();
+    // Byte → char offsets, walked forward once since events come in order.
+    let (mut byte, mut chars) = (0usize, 0usize);
+    for (event, range) in Parser::new_ext(text, options).into_offset_iter() {
+        let Event::Start(Tag::Heading { level, .. }) = event else { continue };
+        let rest = &text[range.start..];
+        let skipped = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+        let start = range.start + skipped;
+        let hash = text[start..].starts_with('#').then(|| {
+            chars += text[byte..start].chars().count();
+            byte = start;
+            chars
+        });
+        found.push(Heading { level: level as u8, hash });
+    }
+    found
+}
+
+/// Whether every heading can move one level up (`delta` -1, one `#`
+/// fewer) or down (+1) without leaving 1..=MAX_HEADING. All or nothing,
+/// so the hierarchy is never flattened and −/+ always round-trip.
+/// Setext headings count toward the bounds even though they don't move.
+pub fn can_shift(headings: &[Heading], delta: i8) -> bool {
+    headings.iter().any(|h| h.hash.is_some())
+        && headings.iter().all(|h| {
+            let level = h.level as i8 + delta;
+            (1..=MAX_HEADING as i8).contains(&level)
+        })
+}
+
+/// Char offsets where one `#` is inserted (delta +1) or deleted (−1),
+/// in document order; None when `can_shift` says no.
+pub fn shift_offsets(headings: &[Heading], delta: i8) -> Option<Vec<usize>> {
+    can_shift(headings, delta).then(|| headings.iter().filter_map(|h| h.hash).collect())
+}
+
+/// Collapsed-section key (`level:occurrence:text`, see preview.rs) after
+/// a shift by `delta`; None for a key that isn't one.
+pub fn shift_section_key(key: &str, delta: i8) -> Option<String> {
+    let (level, rest) = key.split_once(':')?;
+    let level = level.parse::<i8>().ok()? + delta;
+    Some(format!("{level}:{rest}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,5 +267,51 @@ mod tests {
         assert_eq!(on_backspace("| | |", ""), BackspaceAction::ClearLine);
         assert_eq!(on_backspace("- x", ""), BackspaceAction::None);
         assert_eq!(on_backspace("plain", ""), BackspaceAction::None);
+    }
+
+    fn shifted(text: &str, delta: i8) -> Option<String> {
+        let offsets = shift_offsets(&headings(text), delta)?;
+        let mut chars: Vec<char> = text.chars().collect();
+        for &at in offsets.iter().rev() {
+            if delta > 0 { chars.insert(at, '#') } else { assert_eq!(chars.remove(at), '#') }
+        }
+        Some(chars.into_iter().collect())
+    }
+
+    #[test]
+    fn headings_shift_together() {
+        let doc = "# Æøå\n\ntext #not\n\n## Two ##\n   ### Three\n> #### Quoted\n";
+        assert_eq!(
+            shifted(doc, 1).unwrap(),
+            "## Æøå\n\ntext #not\n\n### Two ##\n   #### Three\n> ##### Quoted\n"
+        );
+        assert_eq!(shifted(&shifted(doc, 1).unwrap(), -1).unwrap(), doc);
+    }
+
+    #[test]
+    fn bounds_are_all_or_nothing() {
+        assert_eq!(shifted("# One\n## Two\n", -1), None);
+        assert_eq!(shifted("## One\n###### Six\n", 1), None);
+        assert_eq!(shifted("## One\n### Two\n", -1).unwrap(), "# One\n## Two\n");
+    }
+
+    #[test]
+    fn code_hashtags_and_setext_are_left_alone() {
+        let doc = "```sh\n# comment\n```\n#hashtag\n\nTitle\n-----\n\n### Real\n";
+        let hs = headings(doc);
+        assert_eq!(hs.len(), 2);
+        assert_eq!(hs[0], Heading { level: 2, hash: None });
+        assert_eq!(shifted(doc, 1).unwrap(), doc.replace("### Real", "#### Real"));
+        // A setext H1 is the floor for raising.
+        assert_eq!(shifted("Title\n===\n\n## Two\n", -1), None);
+        // Nothing to move at all.
+        assert_eq!(shifted("Title\n===\n", 1), None);
+        assert_eq!(shifted("plain\n", 1), None);
+    }
+
+    #[test]
+    fn section_keys_follow_the_shift() {
+        assert_eq!(shift_section_key("2:0:A: b", 1).as_deref(), Some("3:0:A: b"));
+        assert_eq!(shift_section_key("bogus", 1), None);
     }
 }

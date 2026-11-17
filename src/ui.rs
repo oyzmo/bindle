@@ -176,6 +176,8 @@ pub struct App {
     find_count: gtk4::Label,
     /// Header collapse/expand-all button; icon mirrors the fold state.
     fold_btn: gtk4::Button,
+    /// −# / +#: every heading one level up or down (markdown only).
+    heading_btns: gtk4::Box,
     remote_banner: adw::Banner,
     /// "Changed on disk" — another program wrote the open file.
     disk_banner: adw::Banner,
@@ -614,6 +616,19 @@ impl App {
         fold_btn.set_sensitive(false);
         header.pack_start(&fold_btn);
 
+        let heading_btns = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        heading_btns.add_css_class("linked");
+        for (label, action, tip) in [
+            ("−#", "win.headings-raise", "Raise every heading one level (one # fewer)"),
+            ("+#", "win.headings-lower", "Lower every heading one level (one # more)"),
+        ] {
+            let button = gtk4::Button::with_label(label);
+            button.set_action_name(Some(action));
+            button.set_tooltip_text(Some(tip));
+            heading_btns.append(&button);
+        }
+        header.pack_start(&heading_btns);
+
         // Primary menu: sectioned per the GNOME HIG — file operations,
         // view options, opening behavior, then About.
         let menu = gio::Menu::new();
@@ -832,6 +847,7 @@ impl App {
             find_entry,
             find_count,
             fold_btn,
+            heading_btns,
             remote_banner,
             disk_banner,
             source: RefCell::new(DocSource::None),
@@ -1462,8 +1478,10 @@ impl App {
     }
 
     fn register_actions(self: &Rc<Self>) {
-        let actions: [(&str, Box<dyn Fn(&Rc<App>)>); 15] = [
+        let actions: [(&str, Box<dyn Fn(&Rc<App>)>); 17] = [
             ("new", Box::new(|s| s.new_file())),
+            ("headings-raise", Box::new(|s| s.shift_headings(-1))),
+            ("headings-lower", Box::new(|s| s.shift_headings(1))),
             ("find", Box::new(|s| s.show_find())),
             ("fold-all", Box::new(|s| s.toggle_fold_all())),
             ("open", Box::new(|s| s.open_dialog())),
@@ -2602,6 +2620,7 @@ impl App {
                 self.render_preview_text(true, &text);
             }
             self.apply_highlight_text(&text);
+            self.update_heading_btns(&text);
         }));
         if refreshed.is_err() {
             // The baseline may describe tags that were never applied.
@@ -3159,6 +3178,73 @@ impl App {
         }
         self.render_preview(true);
         self.persist_settings();
+    }
+
+    /// Move every heading one level: one `#` fewer (`delta` −1) or more
+    /// (+1), as a single undo step. Refused when any heading would leave
+    /// 1..=6, so the hierarchy is never flattened.
+    fn shift_headings(self: &Rc<Self>, delta: i8) {
+        if !self.doc_kind().is_markdown() {
+            return;
+        }
+        let text = self.text();
+        let Some(offsets) = editor::shift_offsets(&editor::headings(&text), delta) else {
+            // Only reachable past the scan limit, where the buttons stay live.
+            self.toast(if delta < 0 {
+                "A heading is already at level 1"
+            } else {
+                "A heading is already at level 6"
+            });
+            return;
+        };
+        // Collapsed sections keep their state under the new levels.
+        {
+            let mut collapsed = self.collapsed.borrow_mut();
+            *collapsed = collapsed
+                .iter()
+                .filter_map(|key| editor::shift_section_key(key, delta))
+                .collect();
+        }
+        self.syncing_cursor.set(true);
+        self.buffer.begin_user_action();
+        // Last to first, so the earlier offsets still hold.
+        for &at in offsets.iter().rev() {
+            let mut iter = self.buffer.iter_at_offset(at as i32);
+            if delta > 0 {
+                self.buffer.insert(&mut iter, "#");
+            } else {
+                let mut end = iter;
+                end.forward_char();
+                self.buffer.delete(&mut iter, &mut end);
+            }
+        }
+        self.buffer.end_user_action();
+        self.syncing_cursor.set(false);
+        self.flush_preview();
+        self.persist_settings();
+    }
+
+    /// −#/+# are live only when the shift is possible. Past the
+    /// highlighter's size limit the per-keystroke parse is skipped and both
+    /// stay live; `shift_headings` checks on click instead.
+    fn update_heading_btns(&self, text: &str) {
+        let markdown = self.doc_kind().is_markdown();
+        self.heading_btns.set_visible(markdown);
+        let (raise, lower) = if !markdown {
+            (false, false)
+        } else if text.len() > HIGHLIGHT_MAX_BYTES {
+            (true, true)
+        } else {
+            let headings = editor::headings(text);
+            (editor::can_shift(&headings, -1), editor::can_shift(&headings, 1))
+        };
+        for (name, enabled) in [("headings-raise", raise), ("headings-lower", lower)] {
+            if let Some(action) = self.window.lookup_action(name) {
+                if let Ok(action) = action.downcast::<gio::SimpleAction>() {
+                    action.set_enabled(enabled);
+                }
+            }
+        }
     }
 
     fn toggle_fold(self: &Rc<Self>, key: String) {
@@ -5554,6 +5640,7 @@ impl App {
                 }
             }
         }
+        self.update_heading_btns(&self.text());
     }
 
     /// Editor wrap follows the "Word wrap" toggle, except that NFO/DIZ art
