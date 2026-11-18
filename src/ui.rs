@@ -208,7 +208,6 @@ pub struct App {
     /// Header collapse/expand-all button; icon mirrors the fold state.
     fold_btn: gtk4::Button,
     /// −# / +#: every heading one level up or down (markdown only).
-    heading_btns: gtk4::Box,
     remote_banner: adw::Banner,
     /// "Changed on disk" — another program wrote the open file.
     disk_banner: adw::Banner,
@@ -370,6 +369,19 @@ fn apply_color_scheme(scheme: ColorScheme) {
 /// (`dev/clip/`) — and no size rule avoids it, since which sizes break depends
 /// on the font. Manual mode rendered every size from 5 to 20pt cleanly.
 /// The property doesn't exist on 4.14, hence the lookup.
+/// The app's own symbolic icons, compiled into the binary by build.rs and
+/// added to the icon theme so `from_icon_name` finds (and recolours) them.
+fn register_icons() {
+    static BUNDLE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bindle.gresource"));
+    match gio::Resource::from_data(&glib::Bytes::from_static(BUNDLE)) {
+        Ok(resource) => gio::resources_register(&resource),
+        Err(e) => eprintln!("bindle: icon resources: {e}"),
+    }
+    if let Some(display) = gtk4::gdk::Display::default() {
+        gtk4::IconTheme::for_display(&display).add_resource_path("/no/oyzmo/Bindle/icons");
+    }
+}
+
 pub fn fix_font_rendering() {
     if let Some(settings) = gtk4::Settings::default() {
         let manual = settings
@@ -383,6 +395,7 @@ pub fn fix_font_rendering() {
 }
 
 pub fn load_css() {
+    register_icons();
     // Fractional pt sizes on purpose: at integer-pixel sizes (12pt = 16px)
     // GTK's hinted glyph rendering clips the top strokes of T/F glyphs.
     // (Only part of the story — see `fix_font_rendering`.)
@@ -674,8 +687,12 @@ impl App {
         let open_btn = gtk4::Button::from_icon_name("document-open-symbolic");
         open_btn.set_tooltip_text(Some("Open… (Ctrl+O)"));
         open_btn.set_action_name(Some("win.open"));
+        let save_btn = gtk4::Button::from_icon_name("document-save-symbolic");
+        save_btn.set_tooltip_text(Some("Save (Ctrl+S)"));
+        save_btn.set_action_name(Some("win.save"));
         header.pack_start(&new_btn);
         header.pack_start(&open_btn);
+        header.pack_start(&save_btn);
 
         let view_btn = gtk4::ToggleButton::new();
         view_btn.set_icon_name("object-flip-horizontal-symbolic");
@@ -683,26 +700,14 @@ impl App {
         view_btn.set_action_name(Some("win.view-mode"));
         header.pack_start(&view_btn);
 
-        // Mirrors the preview's disclosure markers: ▾ while sections are
-        // expanded (click collapses all), ▸ once everything is collapsed.
-        let fold_btn = gtk4::Button::from_icon_name("pan-down-symbolic");
-        fold_btn.set_tooltip_text(Some("Collapse or expand all sections"));
+        // Shows what a click does: arrows in (collapse all) while any
+        // section is open, arrows out (expand all) once all are collapsed.
+        // Our own icons (data/icons): a bare pan chevron read as a dropdown.
+        let fold_btn = gtk4::Button::from_icon_name("bindle-collapse-all-symbolic");
+        fold_btn.set_tooltip_text(Some("Collapse all sections"));
         fold_btn.set_action_name(Some("win.fold-all"));
         fold_btn.set_sensitive(false);
         header.pack_start(&fold_btn);
-
-        let heading_btns = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-        heading_btns.add_css_class("linked");
-        for (label, action, tip) in [
-            ("−#", "win.headings-raise", "Raise every heading one level (one # fewer)"),
-            ("+#", "win.headings-lower", "Lower every heading one level (one # more)"),
-        ] {
-            let button = gtk4::Button::with_label(label);
-            button.set_action_name(Some(action));
-            button.set_tooltip_text(Some(tip));
-            heading_btns.append(&button);
-        }
-        header.pack_start(&heading_btns);
 
         // Primary menu: sectioned per the GNOME HIG — file operations,
         // view options, opening behavior, then About.
@@ -722,6 +727,13 @@ impl App {
         file_section.append_submenu(Some("_Export"), &export_menu);
         file_section.append(Some("_Print…"), Some("win.print"));
         menu.append_section(None, &file_section);
+
+        // Rarely used, so menu items rather than header buttons. Greyed out
+        // (not hidden) when the shift is impossible or the file isn't markdown.
+        let headings_section = gio::Menu::new();
+        headings_section.append(Some("Raise All _Headings (−#)"), Some("win.headings-raise"));
+        headings_section.append(Some("Lower All H_eadings (+#)"), Some("win.headings-lower"));
+        menu.append_section(None, &headings_section);
 
         let view_section = gio::Menu::new();
         let appearance_menu = gio::Menu::new();
@@ -793,11 +805,6 @@ impl App {
             .tooltip_text("Main menu")
             .build();
         header.pack_end(&menu_btn);
-
-        let save_btn = gtk4::Button::from_icon_name("document-save-symbolic");
-        save_btn.set_tooltip_text(Some("Save (Ctrl+S)"));
-        save_btn.set_action_name(Some("win.save"));
-        header.pack_end(&save_btn);
 
         let insert_content = adw::ButtonContent::builder()
             .icon_name("list-add-symbolic")
@@ -934,7 +941,6 @@ impl App {
             find_entry,
             find_count,
             fold_btn,
-            heading_btns,
             remote_banner,
             disk_banner,
             source: RefCell::new(DocSource::None),
@@ -2700,7 +2706,7 @@ impl App {
                 self.render_preview_text(true, &text);
             }
             self.apply_highlight_text(&text);
-            self.update_heading_btns(&text);
+            self.update_heading_actions(&text);
         }));
         if refreshed.is_err() {
             // The baseline may describe tags that were never applied.
@@ -3000,14 +3006,19 @@ impl App {
     }
 
     /// Icon and sensitivity of the collapse/expand-all header button:
-    /// ▸ when every section is collapsed, ▾ otherwise; insensitive when
-    /// the document has no sections.
+    /// expand-all when every section is collapsed, collapse-all otherwise;
+    /// insensitive when the document has no sections.
     fn update_fold_btn(&self) {
         let sections = self.preview_sections.borrow();
         let collapsed = self.collapsed.borrow();
         let all = !sections.is_empty() && sections.iter().all(|s| collapsed.contains(&s.key));
-        self.fold_btn
-            .set_icon_name(if all { "pan-end-symbolic" } else { "pan-down-symbolic" });
+        let (icon, tip) = if all {
+            ("bindle-expand-all-symbolic", "Expand all sections")
+        } else {
+            ("bindle-collapse-all-symbolic", "Collapse all sections")
+        };
+        self.fold_btn.set_icon_name(icon);
+        self.fold_btn.set_tooltip_text(Some(tip));
         self.fold_btn.set_sensitive(!sections.is_empty());
     }
 
@@ -3304,12 +3315,11 @@ impl App {
         self.persist_settings();
     }
 
-    /// −#/+# are live only when the shift is possible. Past the
+    /// The −#/+# menu items are live only when the shift is possible. Past the
     /// highlighter's size limit the per-keystroke parse is skipped and both
     /// stay live; `shift_headings` checks on click instead.
-    fn update_heading_btns(&self, text: &str) {
+    fn update_heading_actions(&self, text: &str) {
         let markdown = self.doc_kind().is_markdown();
-        self.heading_btns.set_visible(markdown);
         let (raise, lower) = if !markdown {
             (false, false)
         } else if text.len() > HIGHLIGHT_MAX_BYTES {
@@ -6330,7 +6340,7 @@ impl App {
                 }
             }
         }
-        self.update_heading_btns(&self.text());
+        self.update_heading_actions(&self.text());
     }
 
     /// Editor wrap follows the "Word wrap" toggle, except that NFO/DIZ art

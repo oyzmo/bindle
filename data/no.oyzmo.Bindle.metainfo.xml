@@ -42,6 +42,14 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.39.0" date="2026-11-18">
+      <description>
+        <ul>
+          <li>Header: Save sits next to Open, and expand/collapse all has clearer icons</li>
+          <li>Raise/Lower All Headings moved from the header to the main menu</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.38.0" date="2026-11-17">
       <description>
         <ul>

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/no/oyzmo/Bindle">
+    <file>icons/scalable/actions/bindle-collapse-all-symbolic.svg</file>
+    <file>icons/scalable/actions/bindle-expand-all-symbolic.svg</file>
+  </gresource>
+</gresources>
