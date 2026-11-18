@@ -698,9 +698,6 @@ impl App {
         view_btn.set_icon_name("object-flip-horizontal-symbolic");
         view_btn.set_tooltip_text(Some("Swap view/edit mode (Ctrl+E)"));
         view_btn.set_action_name(Some("win.view-mode"));
-        // A gap between the file group (new/open/save) and the view group.
-        view_btn.set_margin_start(12);
-        header.pack_start(&view_btn);
 
         // Shows what a click does: arrows in (collapse all) while any
         // section is open, arrows out (expand all) once all are collapsed.
@@ -709,7 +706,10 @@ impl App {
         fold_btn.set_tooltip_text(Some("Collapse all sections"));
         fold_btn.set_action_name(Some("win.fold-all"));
         fold_btn.set_sensitive(false);
+        // A gap between the file group (new/open/save) and the view group.
+        fold_btn.set_margin_start(12);
         header.pack_start(&fold_btn);
+        header.pack_start(&view_btn);
 
         // Primary menu: sectioned per the GNOME HIG — file operations,
         // view options, opening behavior, then About.
