@@ -698,6 +698,8 @@ impl App {
         view_btn.set_icon_name("object-flip-horizontal-symbolic");
         view_btn.set_tooltip_text(Some("Swap view/edit mode (Ctrl+E)"));
         view_btn.set_action_name(Some("win.view-mode"));
+        // A gap between the file group (new/open/save) and the view group.
+        view_btn.set_margin_start(12);
         header.pack_start(&view_btn);
 
         // Shows what a click does: arrows in (collapse all) while any
@@ -806,12 +808,9 @@ impl App {
             .build();
         header.pack_end(&menu_btn);
 
-        let insert_content = adw::ButtonContent::builder()
-            .icon_name("list-add-symbolic")
-            .label("Insert")
-            .build();
+        // Icon only, to leave the title room; the tooltip names it.
         let insert_btn = gtk4::Button::builder()
-            .child(&insert_content)
+            .icon_name("list-add-symbolic")
             .tooltip_text("Insert markdown element at cursor (Ctrl+Space)")
             .build();
         insert_btn.set_action_name(Some("win.insert"));

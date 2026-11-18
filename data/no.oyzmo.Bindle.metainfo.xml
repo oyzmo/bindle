@@ -42,6 +42,11 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.39.1" date="2026-11-18">
+      <description>
+        <p>Header: gap between file and view buttons, Insert shown as just +</p>
+      </description>
+    </release>
     <release version="1.39.0" date="2026-11-18">
       <description>
         <ul>
