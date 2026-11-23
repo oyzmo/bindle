@@ -46,6 +46,11 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.40.9" date="2026-11-23">
+      <description>
+        <p>README shows the screenshot from data/screenshots</p>
+      </description>
+    </release>
     <release version="1.40.8" date="2026-11-23">
       <description>
         <p>bindle.sh: option 17 updates the GitHub page without a release</p>

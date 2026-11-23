@@ -23,14 +23,14 @@ A tiny Markdown editor for GNOME, written in Rust with GTK4 + Libadwaita. Create
 - **Appearance & behavior** — Bindle's own warm sage/cream/cocoa palette or your stock GNOME theme, light/dark/system style, separate editor and preview font sizes, line numbers (in the editor and, optionally, source line numbers in the preview) and word wrap, all remembered between launches, single- or multi-instance, open last file or start blank, and a "New Document" template for GNOME Files (installable from `bindle.sh`).
 - **The basics done right** — undo/redo (<kbd>Ctrl</kbd>+<kbd>Z</kbd>), <kbd>Ctrl</kbd>+<kbd>B</kbd>/<kbd>Ctrl</kbd>+<kbd>I</kbd> for bold/italic, unsaved-changes protection everywhere (even when opening files from GNOME Files), toast notifications, atomic saves that never leave a half-written file, follow symlinks and keep a private file private, and a warning banner (with Reload) when the file changes on disk behind your back. Files on network shares (gvfs: SMB, WebDAV, …) reopen even after a reboot — Bindle remounts the share itself — and a hung share never freezes the window. **About → What's New** lists the changes in each release.
 
-![Screenshot](screenshot.png)
+![Screenshot](data/screenshots/files.png)
 
 ## Installing (Flatpak — easiest)
 
 Grab the latest `.flatpak` bundle from [GitHub Releases](https://github.com/oyzmo/bindle/releases/latest) or [oyzmo.no/apps](https://oyzmo.no/apps) and install it:
 
 ```sh
-flatpak install bindle-1.40.8.flatpak
+flatpak install bindle-1.40.9.flatpak
 ```
 
 or just double-click it in GNOME Software. Works on any Linux desktop with Flatpak set up; the GNOME runtime is fetched automatically if you don't have it.
@@ -54,8 +54,8 @@ flatpak-builder --user --install --force-clean build-dir no.oyzmo.Bindle.yml
 First download the source zip (`bindle-<version>-src.zip`) from [GitHub Releases](https://github.com/oyzmo/bindle/releases/latest) or [oyzmo.no/apps](https://oyzmo.no/apps) and unpack it:
 
 ```sh
-unzip bindle-1.40.8-src.zip
-cd bindle-1.40.8
+unzip bindle-1.40.9-src.zip
+cd bindle-1.40.9
 ```
 
 Then run the helper menu:

@@ -30,7 +30,6 @@ ITEMS=(
     source.sh
     bump.sh
     no.oyzmo.Bindle.yml
-    screenshot.png
     src
     tests
     examples
