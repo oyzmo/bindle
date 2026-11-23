@@ -244,6 +244,19 @@ full_release() {
     fi
 }
 
+# Without a release: master to the NAS and (filtered) to GitHub, so the
+# GitHub page shows the current README and screenshot. No tag, no dist/.
+update_github() {
+    if ! git -C "$SCRIPT_DIR" diff --quiet HEAD; then
+        err "There are uncommitted changes — commit them first, GitHub gets master."
+        return 1
+    fi
+    bold "Backing up to the NAS…"
+    git -C "$SCRIPT_DIR" push -q nas master || err "NAS push failed — continuing."
+    bold "Pushing master to GitHub (no release)…"
+    "$SCRIPT_DIR/dev/push-github.sh" && ok "GitHub page updated."
+}
+
 # Exports the signing key into a private repo on the NAS (the site's
 # tools/backup-key.sh, shared with the other apps' menus).
 backup_key() {
@@ -367,6 +380,7 @@ while true; do
     echo "  7)   Make distribution (source zip + flatpak → dist/ and the Flatpak site)"
     echo " 12)   Publish flatpak updates (flatpak.oyzmo.no → GNOME Software)"
     github_scripts && echo "  9)   Release newest version on GitHub (from dist/)"
+    github_scripts && echo " 17) Update GitHub page only (NAS + push master, no release)"
     echo " 14) Back up the flatpak signing key to the NAS (after the key changes)"
     echo "  q) Quit"
     read -rp "Choose: " choice || { echo; exit 0; }  # Ctrl+D quits
@@ -387,6 +401,7 @@ while true; do
         14) backup_key ;;
         15) install_flatpak ;;
         16) uninstall_flatpak ;;
+        17) if github_scripts; then update_github; else err "Unknown choice."; fi ;;
         q|Q) exit 0 ;;
         *) err "Unknown choice." ;;
     esac
