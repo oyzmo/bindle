@@ -86,6 +86,10 @@ pub struct Settings {
     /// Where flagged documents are copied after each save.
     #[serde(with = "path_json::opt")]
     pub backup_folder: Option<PathBuf>,
+    /// The mount point the backup folder was on when chosen: found on
+    /// another, its drive is not mounted (`backup::Job::mount`).
+    #[serde(with = "path_json::opt")]
+    pub backup_mount: Option<PathBuf>,
     /// Copy flagged documents on save; off keeps the flags but copies nothing.
     pub backup_on_save: bool,
     /// The documents flagged for backup ("Back Up This File").
@@ -370,6 +374,7 @@ impl Default for Settings {
             recent_files: Vec::new(),
             frozen_files: Vec::new(),
             backup_folder: None,
+            backup_mount: None,
             backup_on_save: true,
             backups: Vec::new(),
         }
@@ -531,6 +536,7 @@ mod tests {
             stamp: None,
             pending: false,
             assets: Vec::new(),
+            interrupted: false,
         };
         let mut ours = super::Settings { backups: vec![flag("/a"), flag("/b")], ..Default::default() };
         let base = super::ListBase::of(&ours);

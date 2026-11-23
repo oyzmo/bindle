@@ -193,6 +193,7 @@ pub struct App {
     /// Backup copies (`backup.rs`): the folder, the on/off switch and the
     /// flagged documents, all persisted.
     backup_folder: RefCell<Option<PathBuf>>,
+    backup_mount: RefCell<Option<PathBuf>>,
     backup_on_save: Cell<bool>,
     backups: RefCell<Vec<backup::Entry>>,
     /// Documents whose copy is being written; a save meanwhile queues one
@@ -996,6 +997,7 @@ impl App {
             files_order: RefCell::new(settings.recent_files.clone()),
             frozen_files: RefCell::new(settings.frozen_files.clone()),
             backup_folder: RefCell::new(settings.backup_folder.clone()),
+            backup_mount: RefCell::new(settings.backup_mount.clone()),
             backup_on_save: Cell::new(settings.backup_on_save),
             backups: RefCell::new(settings.backups.clone()),
             backup_inflight: RefCell::new(HashSet::new()),
@@ -4142,6 +4144,7 @@ impl App {
                 stamp: None,
                 pending: true,
                 assets: Vec::new(),
+                interrupted: false,
             });
             self.backup_declined.borrow_mut().remove(path);
             self.run_backup(path.to_path_buf(), false, true);
@@ -4180,10 +4183,27 @@ impl App {
                 state.backup_warned.set(false);
                 state.backup_mount_tried.set(false);
             }
+            // Which mount point it is on, for telling a drive that is not
+            // mounted from the empty directory beneath it later. Off the main
+            // loop (the folder may be on a share); a copy that lands first
+            // records the same thing from where it found the folder (now
+            // mounted, since it was just picked). Picking the same folder
+            // again re-records it, which is the way out after a drive moved.
+            *state.backup_mount.borrow_mut() = None;
             state.persist_settings();
             state.update_files_panel();
             state.toast(&format!("Backups go to {}", folder.display()));
-            state.retry_pending_backups();
+            let state = state.clone();
+            glib::spawn_future_local(async move {
+                let at = folder.clone();
+                let mount = gio::spawn_blocking(move || backup::mount_point(&at)).await.ok().flatten();
+                if state.backup_folder.borrow().as_ref() != Some(&folder) {
+                    return;
+                }
+                *state.backup_mount.borrow_mut() = mount;
+                state.persist_settings();
+                state.retry_pending_backups();
+            });
         });
     }
 
@@ -4222,7 +4242,7 @@ impl App {
             // Until it lands: a quit meanwhile retries it.
             entry.pending = true;
             let entry = entry.clone();
-            backup::Job::for_entry(&entry, &folder, &backups, force)
+            backup::Job::for_entry(&entry, &folder, self.backup_mount.borrow().as_deref(), &backups, force)
         };
         if !self.backup_inflight.borrow_mut().insert(path.clone()) {
             self.backup_again.borrow_mut().insert(path);
@@ -4265,6 +4285,13 @@ impl App {
                 self.record_backup(path, copied);
                 self.backup_warned.set(false);
                 self.persist_settings();
+            }
+            Ok(backup::Outcome::Interrupted(err)) => {
+                self.mark_interrupted(path);
+                self.persist_settings();
+                if !self.backup_warned.replace(true) {
+                    self.toast(&format!("Backup of {name} was cut off, will retry: {err}"));
+                }
             }
             Ok(backup::Outcome::SourceMissing) => {
                 // Nothing to retry until the document is back (and saved).
@@ -4371,7 +4398,12 @@ impl App {
         // worker's own result would never be handled, the main loop is done.
         let jobs: Vec<backup::Job> = {
             let backups = self.backups.borrow();
-            backups.iter().filter(|e| e.pending).map(|e| backup::Job::for_entry(e, &folder, &backups, false)).collect()
+            let mount = self.backup_mount.borrow();
+            backups
+                .iter()
+                .filter(|e| e.pending)
+                .map(|e| backup::Job::for_entry(e, &folder, mount.as_deref(), &backups, false))
+                .collect()
         };
         if jobs.is_empty() {
             return;
@@ -4388,8 +4420,10 @@ impl App {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
             let Ok((path, result)) = rx.recv_timeout(left) else { break };
-            if let Ok(backup::Outcome::Copied(copied)) = result {
-                self.record_backup(&path, copied);
+            match result {
+                Ok(backup::Outcome::Copied(copied)) => self.record_backup(&path, copied),
+                Ok(backup::Outcome::Interrupted(_)) => self.mark_interrupted(&path),
+                _ => {}
             }
         }
     }
@@ -4400,6 +4434,21 @@ impl App {
             e.stamp = Some(copied.stamp);
             e.assets = copied.assets;
             e.pending = false;
+            e.interrupted = false;
+        }
+        // Settings from before the mount point was recorded: take it from
+        // the first copy that lands.
+        let mut mount = self.backup_mount.borrow_mut();
+        if mount.is_none() {
+            *mount = copied.mount;
+        }
+    }
+
+    /// The copy failed halfway: what is at the target is ours, half written.
+    fn mark_interrupted(&self, path: &Path) {
+        if let Some(e) = self.backups.borrow_mut().iter_mut().find(|e| e.path == path) {
+            e.interrupted = true;
+            e.pending = true;
         }
     }
 
@@ -6821,6 +6870,7 @@ impl App {
             recent_files: self.recent_files.borrow().clone(),
             frozen_files: self.frozen_files.borrow().clone(),
             backup_folder: self.backup_folder.borrow().clone(),
+            backup_mount: self.backup_mount.borrow().clone(),
             backup_on_save: self.backup_on_save.get(),
             backups: self.backups.borrow().clone(),
         };

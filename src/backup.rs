@@ -39,6 +39,11 @@ pub struct Entry {
     /// from another document's or someone else's at the same path.
     #[serde(default)]
     pub assets: Vec<AssetCopy>,
+    /// A copy failed after it had started writing (the drive went away):
+    /// whatever is at the target now is Bindle's own half-written copy, so
+    /// the next copy replaces it without asking.
+    #[serde(default)]
+    pub interrupted: bool,
 }
 
 /// A referenced file copied beside a document's copy.
@@ -70,11 +75,19 @@ pub struct Job {
     pub reserved: Vec<PathBuf>,
     /// Replace the copy even if it was changed elsewhere.
     pub force: bool,
+    /// `Entry::interrupted`.
+    pub interrupted: bool,
+    /// The mount point the backup folder sat on when it was chosen
+    /// (`mount_point`). Found on another one now, the drive is not mounted
+    /// and the folder is just the empty directory underneath.
+    pub mount: Option<PathBuf>,
 }
 
 impl Job {
-    pub fn for_entry(entry: &Entry, folder: &Path, all: &[Entry], force: bool) -> Job {
+    pub fn for_entry(entry: &Entry, folder: &Path, mount: Option<&Path>, all: &[Entry], force: bool) -> Job {
         Job {
+            interrupted: entry.interrupted,
+            mount: mount.map(Path::to_path_buf),
             src: entry.path.clone(),
             folder: folder.to_path_buf(),
             name: entry.name.clone(),
@@ -154,6 +167,8 @@ pub enum Outcome {
     Changed,
     /// The document itself is gone; nothing to copy.
     SourceMissing,
+    /// Failed after the target had changed: `Entry::interrupted`.
+    Interrupted(String),
 }
 
 /// What a copy wrote.
@@ -166,6 +181,9 @@ pub struct Copied {
     /// References not copied because a different file Bindle didn't write
     /// for this document is already at that path.
     pub clashes: Vec<PathBuf>,
+    /// The backup folder's mount point, for `Job::mount` when none was
+    /// recorded yet (settings from before it was).
+    pub mount: Option<PathBuf>,
 }
 
 /// Copy `src` (a file or a bundle directory) to `folder/name`. Unless
@@ -180,29 +198,76 @@ pub fn copy(job: &Job) -> io::Result<Outcome> {
     if !job.folder.is_dir() {
         return Err(io::Error::new(io::ErrorKind::NotFound, "the backup folder is not available"));
     }
+    let mount = mount_point(&job.folder);
+    if let (Some(was), Some(now)) = (&job.mount, &mount)
+        && was != now
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("the drive is not mounted at {} (choose the folder again if it moved)", was.display()),
+        ));
+    }
     let meta = match fs::metadata(&job.src) {
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Outcome::SourceMissing),
         other => other?,
     };
     let target = job.folder.join(&job.name);
+    let before = target_stamp(&target);
     if !job.force
-        && let Some(now) = target_stamp(&target)
+        && !job.interrupted
+        && let Some(now) = before
         && Some(now) != job.last
         && !same_tree(&job.src, &target)
     {
         return Ok(Outcome::Changed);
     }
-    let (mut assets, mut clashes) = (Vec::new(), Vec::new());
-    if meta.is_dir() {
-        copy_dir(&job.src, &target, job.force)?;
-    } else {
-        copy_file(&job.src, &target)?;
-        if is_plain_markdown(&job.src) {
-            (assets, clashes) = copy_assets(job);
+    let written = if meta.is_dir() { copy_dir(&job.src, &target, job.force) } else { copy_file(&job.src, &target) };
+    if let Err(err) = written {
+        // A temp file that never got renamed leaves the target as it was;
+        // an in-place write or a bundle half copied file by file does not.
+        return if target_stamp(&target) == before { Err(err) } else { Ok(Outcome::Interrupted(err.to_string())) };
+    }
+    let (assets, clashes) = if !meta.is_dir() && is_plain_markdown(&job.src) { copy_assets(job) } else { Default::default() };
+    let stamp = target_stamp(&target).ok_or_else(|| io::Error::other("the copy could not be read back"))?;
+    Ok(Outcome::Copied(Copied { stamp, assets, clashes, mount }))
+}
+
+/// The mount point holding `path`: the longest mount point in
+/// `/proc/self/mountinfo` that the canonical path lies under. Mount point
+/// paths are stable across reboots, unlike device numbers (anonymous on
+/// btrfs subvolumes and FUSE, handed out in mount order).
+pub fn mount_point(path: &Path) -> Option<PathBuf> {
+    let info = fs::read_to_string("/proc/self/mountinfo").ok()?;
+    containing_mount(&info, &fs::canonicalize(path).ok()?)
+}
+
+fn containing_mount(mountinfo: &str, path: &Path) -> Option<PathBuf> {
+    mountinfo
+        .lines()
+        .filter_map(|line| line.split(' ').nth(4))
+        .map(unescape_mount)
+        .filter(|m| path.starts_with(m))
+        .max_by_key(|m| m.as_os_str().len())
+}
+
+/// mountinfo escapes space, tab, newline and backslash as `\ooo`.
+fn unescape_mount(field: &str) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    let b = field.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let octal = |c: u8| (b'0'..=b'7').contains(&c);
+        if b[i] == b'\\' && i + 4 <= b.len() && b[i + 1..i + 4].iter().all(|&c| octal(c)) {
+            let v = (b[i + 1] - b'0') as u16 * 64 + (b[i + 2] - b'0') as u16 * 8 + (b[i + 3] - b'0') as u16;
+            out.push(v as u8);
+            i += 4;
+        } else {
+            out.push(b[i]);
+            i += 1;
         }
     }
-    let stamp = target_stamp(&target).ok_or_else(|| io::Error::other("the copy could not be read back"))?;
-    Ok(Outcome::Copied(Copied { stamp, assets, clashes }))
+    PathBuf::from(OsString::from_vec(out))
 }
 
 /// Same content: two files with the same bytes, or two directories holding
@@ -386,9 +451,10 @@ fn copy_assets(job: &Job) -> (Vec<AssetCopy>, Vec<PathBuf>) {
             if let Some(dir) = to.parent() {
                 let _ = fs::create_dir_all(dir);
             }
-            if copy_file(&from, &to).is_err() {
-                continue;
-            }
+            // A failed write still records what is there now as ours: if it
+            // was half written in place, the next copy replaces it rather
+            // than calling it a clash.
+            let _ = copy_file(&from, &to);
         }
         if let Ok(meta) = fs::metadata(&to)
             && let Ok(mtime) = meta.modified()
@@ -488,6 +554,8 @@ mod tests {
             assets: Vec::new(),
             reserved: vec![name.into()],
             force,
+            interrupted: false,
+            mount: None,
         }
     }
 
@@ -619,6 +687,64 @@ mod tests {
         let b = dir.join("b");
         fs::create_dir_all(&b).unwrap();
         assert_eq!(copy(&job(&dir.join("nope.md"), &b, "nope.md", None, false)).unwrap(), Outcome::SourceMissing);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_mount_point_is_the_longest_one_holding_the_path() {
+        let info = "22 1 0:21 / / rw - btrfs /dev/vda3 rw\n\
+                    40 22 8:17 / /mnt/back\\040up rw - ext4 /dev/sdb1 rw\n\
+                    41 22 0:50 / /mnt/back rw - tmpfs tmpfs rw\n";
+        assert_eq!(containing_mount(info, Path::new("/mnt/back up/notes")), Some(PathBuf::from("/mnt/back up")));
+        assert_eq!(containing_mount(info, Path::new("/mnt/backup/notes")), Some(PathBuf::from("/")));
+        assert_eq!(unescape_mount("a\\134b\\011"), PathBuf::from("a\\b\t"));
+    }
+
+    #[test]
+    fn a_folder_off_its_drive_is_unavailable() {
+        // The drive unplugged under a fixed mount point: the folder is the
+        // empty directory on the disk beneath, on another mount point.
+        let dir = scratch("unmounted");
+        let doc = dir.join("n.md");
+        fs::write(&doc, "x").unwrap();
+        let backup = dir.join("b");
+        fs::create_dir_all(&backup).unwrap();
+        let mut j = job(&doc, &backup, "n.md", None, false);
+        j.mount = Some(PathBuf::from("/no/such/mount"));
+        let err = copy(&j).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert_eq!(fs::read_dir(&backup).unwrap().count(), 0, "nothing written");
+        // Recorded as found, it copies, and reports the mount point.
+        j.mount = mount_point(&backup);
+        assert_eq!(copied(copy(&j)).mount, j.mount);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_copy_cut_off_halfway_is_replaced_without_asking() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch("interrupted");
+        let bundle = dir.join("t.textbundle");
+        fs::create_dir_all(&bundle).unwrap();
+        fs::write(bundle.join("text.md"), "x").unwrap();
+        let locked = bundle.join("locked.png");
+        fs::write(&locked, "secret").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let backup = dir.join("b");
+        fs::create_dir_all(&backup).unwrap();
+        let outcome = copy(&job(&bundle, &backup, "t.textbundle", None, false)).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
+        if fs::File::open(&locked).is_ok() && matches!(outcome, Outcome::Copied(_)) {
+            return; // running as root: nothing could be refused
+        }
+        assert!(matches!(outcome, Outcome::Interrupted(_)), "{outcome:?}");
+        // No stamp was recorded and the half copy differs from the bundle:
+        // without the flag that reads as changed elsewhere.
+        assert_eq!(copy(&job(&bundle, &backup, "t.textbundle", None, false)).unwrap(), Outcome::Changed);
+        let mut again = job(&bundle, &backup, "t.textbundle", None, false);
+        again.interrupted = true;
+        copied(copy(&again));
+        assert_eq!(fs::read(backup.join("t.textbundle/locked.png")).unwrap(), b"secret");
         let _ = fs::remove_dir_all(&dir);
     }
 }

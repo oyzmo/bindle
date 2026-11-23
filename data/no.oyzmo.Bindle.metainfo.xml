@@ -42,6 +42,14 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.40.2" date="2026-11-23">
+      <description>
+        <ul>
+          <li>Backups: a fixed mount point whose drive is unplugged is no longer written to</li>
+          <li>Backups: a copy cut off when the drive disconnects is replaced without asking</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.40.1" date="2026-11-23">
       <description>
         <ul>
