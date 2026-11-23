@@ -1,3 +1,4 @@
+pub mod backup;
 pub mod bundle;
 pub mod changelog;
 pub mod collections;

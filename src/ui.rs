@@ -8,6 +8,7 @@ use std::time::Duration;
 use adw::prelude::*;
 use gtk4::{gdk, gio, glib};
 
+use crate::backup;
 use crate::bundle;
 use crate::collections::{self, FileEntry, Node, Place};
 use crate::doc::{self, DocKind};
@@ -189,6 +190,22 @@ pub struct App {
     files_order: RefCell<Vec<PathBuf>>,
     /// Files frozen in the Files panel (the pin toggle), persisted.
     frozen_files: RefCell<Vec<PathBuf>>,
+    /// Backup copies (`backup.rs`): the folder, the on/off switch and the
+    /// flagged documents, all persisted.
+    backup_folder: RefCell<Option<PathBuf>>,
+    backup_on_save: Cell<bool>,
+    backups: RefCell<Vec<backup::Entry>>,
+    /// Documents whose copy is being written; a save meanwhile queues one
+    /// more run in `backup_again` instead of racing it.
+    backup_inflight: RefCell<HashSet<PathBuf>>,
+    backup_again: RefCell<HashSet<PathBuf>>,
+    /// "Keep It" answered for a copy changed elsewhere: not asked again
+    /// this session.
+    backup_declined: RefCell<HashSet<PathBuf>>,
+    /// The folder was reported unavailable this session (one toast), and a
+    /// share mount was already tried (one password prompt).
+    backup_warned: Cell<bool>,
+    backup_mount_tried: Cell<bool>,
     top_panel: gtk4::Box,
     bottom_panel: gtk4::Box,
     bottom_label: gtk4::Label,
@@ -730,6 +747,13 @@ impl App {
         file_section.append(Some("_Print…"), Some("win.print"));
         menu.append_section(None, &file_section);
 
+        // Copies of the documents flagged in the Files panel ("Back Up This
+        // File"), written after every save.
+        let backup_section = gio::Menu::new();
+        backup_section.append(Some("Backup _Folder…"), Some("win.backup-folder"));
+        backup_section.append(Some("Back Up on Sa_ve"), Some("win.backup-on-save"));
+        menu.append_section(None, &backup_section);
+
         // Rarely used, so menu items rather than header buttons. Greyed out
         // (not hidden) when the shift is impossible or the file isn't markdown.
         let headings_section = gio::Menu::new();
@@ -968,6 +992,14 @@ impl App {
             recent_files: RefCell::new(settings.recent_files.clone()),
             files_order: RefCell::new(settings.recent_files.clone()),
             frozen_files: RefCell::new(settings.frozen_files.clone()),
+            backup_folder: RefCell::new(settings.backup_folder.clone()),
+            backup_on_save: Cell::new(settings.backup_on_save),
+            backups: RefCell::new(settings.backups.clone()),
+            backup_inflight: RefCell::new(HashSet::new()),
+            backup_again: RefCell::new(HashSet::new()),
+            backup_declined: RefCell::new(HashSet::new()),
+            backup_warned: Cell::new(false),
+            backup_mount_tried: Cell::new(false),
             open_seq: Cell::new(0),
             doc_gen: Cell::new(0),
             edit_seq: Cell::new(0),
@@ -1043,6 +1075,7 @@ impl App {
         state.register_actions();
         state.update_recent_menu();
         state.check_missing_files();
+        state.retry_pending_backups();
 
         // Restore the last opened file if enabled. No is_file() probe: it
         // could hang on an unreachable mount; open_path fails with a toast
@@ -1543,13 +1576,18 @@ impl App {
         let state = self.clone();
         self.window.connect_close_request(move |_| {
             state.remember_position();
+            if !state.modified.get() {
+                state.backup_before_quit();
+            }
             state.persist_settings();
             state.save_collections();
             if state.modified.get() {
                 let destroy = state.clone();
                 state.guard_unsaved(Box::new(move || {
                     // Settings were written before the dialog; a Save As in
-                    // between added a file to the recent list.
+                    // between added a file to the recent list. A save just
+                    // started its backup copy, which must finish first.
+                    destroy.backup_before_quit();
                     destroy.persist_settings();
                     destroy.window.destroy()
                 }));
@@ -1654,6 +1692,7 @@ impl App {
         self.window.add_action(&action);
 
         self.register_files_actions();
+        self.register_backup_actions();
 
         let action = gio::SimpleAction::new_stateful("view-mode", None, &false.to_variant());
         let state = self.clone();
@@ -3535,6 +3574,13 @@ impl App {
                 suffix.set_xalign(0.0);
             }
         }
+        if self.is_backed_up(path) {
+            let icon = gtk4::Image::from_icon_name("send-to-symbolic");
+            icon.add_css_class("dim-label");
+            icon.set_pixel_size(12);
+            icon.set_tooltip_text(Some(&self.backup_tip(path)));
+            content.append(&icon);
+        }
         content.append(&self.freeze_button(path, pinned, filed));
         content.set_tooltip_text(Some(&if missing {
             format!("Not found: {}", path.display())
@@ -3927,6 +3973,7 @@ impl App {
             Some(FileItem::Recent(path)) => {
                 menu.append_item(&location(path));
                 menu.append_submenu(Some("_Move to Folder"), &move_menu(None));
+                menu.append(Some("_Back Up This File"), Some("win.files-backup"));
                 let mi = gio::MenuItem::new(Some("_Remove from List"), None);
                 mi.set_action_and_target_value(Some("win.forget-recent"), Some(&path_variant(&path)));
                 menu.append_item(&mi);
@@ -3940,11 +3987,23 @@ impl App {
                     menu.append_item(&location(&entry.path));
                 }
                 menu.append_submenu(Some("_Move to Folder"), &move_menu(tree.parent(*id)));
+                menu.append(Some("_Back Up This File"), Some("win.files-backup"));
                 let remove = if missing { "_Remove" } else { "_Remove from Folder" };
                 menu.append(Some(remove), Some("win.files-remove"));
             }
         }
         drop(tree);
+        let backup_path = match &item {
+            Some(FileItem::Recent(path)) => Some(path.clone()),
+            Some(FileItem::File(id)) => self.collections.borrow().file(*id).map(|f| f.path.clone()),
+            _ => None,
+        };
+        if let Some(path) = backup_path
+            && let Some(action) = self.window.lookup_action("files-backup").and_downcast::<gio::SimpleAction>()
+        {
+            action.set_state(&self.is_backed_up(&path).to_variant());
+            action.set_enabled(self.backup_folder.borrow().is_some());
+        }
         *self.files_menu_target.borrow_mut() = item;
         self.files_popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
         self.files_popover.popup();
@@ -4003,6 +4062,311 @@ impl App {
             }
         });
         self.window.add_action(&action);
+    }
+
+    /// "Back Up This File" (Files context menu), "Backup Folder…" and
+    /// "Back Up on Save" (main menu).
+    fn register_backup_actions(self: &Rc<Self>) {
+        let action = gio::SimpleAction::new_stateful("files-backup", None, &false.to_variant());
+        let state = self.clone();
+        action.connect_activate(move |_, _| {
+            let path = match state.files_menu_target.borrow().clone() {
+                Some(FileItem::Recent(path)) => Some(path),
+                Some(FileItem::File(id)) => state.collections.borrow().file(id).map(|f| f.path.clone()),
+                _ => None,
+            };
+            if let Some(path) = path {
+                let on = !state.is_backed_up(&path);
+                state.set_backup(&path, on);
+            }
+        });
+        self.window.add_action(&action);
+
+        let action = gio::SimpleAction::new("backup-folder", None);
+        let state = self.clone();
+        action.connect_activate(move |_, _| state.backup_folder_dialog());
+        self.window.add_action(&action);
+
+        let action = gio::SimpleAction::new_stateful("backup-on-save", None, &self.backup_on_save.get().to_variant());
+        action.set_enabled(self.backup_folder.borrow().is_some());
+        let state = self.clone();
+        action.connect_activate(move |action, _| {
+            let on = !state.backup_on_save.get();
+            action.set_state(&on.to_variant());
+            state.backup_on_save.set(on);
+            state.persist_settings();
+            if on {
+                state.retry_pending_backups();
+            }
+            state.update_files_panel();
+        });
+        self.window.add_action(&action);
+    }
+
+    fn is_backed_up(&self, path: &Path) -> bool {
+        self.backups.borrow().iter().any(|e| e.path == path)
+    }
+
+    /// The row icon's tooltip: where the copy goes, or why it doesn't.
+    fn backup_tip(&self, path: &Path) -> String {
+        let folder = self.backup_folder.borrow();
+        let name = self.backups.borrow().iter().find(|e| e.path == path).map(|e| e.name.clone());
+        match (folder.as_ref(), name) {
+            (None, _) => "Backed up — choose a backup folder in the main menu".into(),
+            (Some(_), _) if !self.backup_on_save.get() => "Backup is switched off".into(),
+            (Some(folder), Some(name)) => format!("Backed up on save to {}", folder.join(name).display()),
+            (Some(folder), None) => format!("Backed up on save to {}", folder.display()),
+        }
+    }
+
+    /// Flag or unflag a document. A newly flagged one gets its name in the
+    /// backup folder now (`backup::name_for`) and is copied at once.
+    fn set_backup(self: &Rc<Self>, path: &Path, on: bool) {
+        if on {
+            if self.is_backed_up(path) {
+                return;
+            }
+            let name = {
+                let backups = self.backups.borrow();
+                let taken: Vec<&Path> = backups.iter().map(|e| e.name.as_path()).collect();
+                backup::name_for(path, &taken)
+            };
+            self.backups.borrow_mut().push(backup::Entry {
+                path: path.to_path_buf(),
+                name,
+                stamp: None,
+                pending: true,
+            });
+            self.backup_declined.borrow_mut().remove(path);
+            self.run_backup(path.to_path_buf(), false, true);
+        } else {
+            self.backups.borrow_mut().retain(|e| e.path != path);
+        }
+        self.persist_settings();
+        let state = STATE.with(|s| s.borrow().clone());
+        glib::idle_add_local_once(move || {
+            if let Some(state) = state {
+                state.update_files_panel();
+            }
+        });
+    }
+
+    fn backup_folder_dialog(self: &Rc<Self>) {
+        let dialog = gtk4::FileDialog::builder().title("Backup Folder").modal(true).build();
+        if let Some(folder) = self.backup_folder.borrow().as_ref() {
+            dialog.set_initial_folder(Some(&gio::File::for_path(folder)));
+        }
+        let state = self.clone();
+        dialog.select_folder(Some(&self.window), gio::Cancellable::NONE, move |res| {
+            let Some(folder) = state.picked_path(res) else { return };
+            let moved = state.backup_folder.borrow().as_ref() != Some(&folder);
+            *state.backup_folder.borrow_mut() = Some(folder.clone());
+            if let Some(action) = state.window.lookup_action("backup-on-save").and_downcast::<gio::SimpleAction>() {
+                action.set_enabled(true);
+            }
+            if moved {
+                // A new folder holds none of our copies: write them all there.
+                for entry in state.backups.borrow_mut().iter_mut() {
+                    entry.stamp = None;
+                    entry.pending = true;
+                }
+                state.backup_declined.borrow_mut().clear();
+                state.backup_warned.set(false);
+                state.backup_mount_tried.set(false);
+            }
+            state.persist_settings();
+            state.update_files_panel();
+            state.toast(&format!("Backups go to {}", folder.display()));
+            state.retry_pending_backups();
+        });
+    }
+
+    /// After a save: copy the document if it is flagged, and retry earlier
+    /// copies that failed.
+    fn backup_after_save(self: &Rc<Self>) {
+        if let Some(path) = self.source.borrow().container().map(Path::to_path_buf)
+            && self.is_backed_up(&path)
+        {
+            self.run_backup(path, false, true);
+        }
+        self.retry_pending_backups();
+    }
+
+    /// Copies that failed last time (share offline). Never mounts: at launch
+    /// a password prompt out of nowhere would be confusing.
+    fn retry_pending_backups(self: &Rc<Self>) {
+        let pending: Vec<PathBuf> =
+            self.backups.borrow().iter().filter(|e| e.pending).map(|e| e.path.clone()).collect();
+        for path in pending {
+            self.run_backup(path, false, false);
+        }
+    }
+
+    /// Copy one flagged document on a worker thread. `mount`: a folder on
+    /// an unmounted gvfs share (smb://…) may be mounted first, once per
+    /// session.
+    fn run_backup(self: &Rc<Self>, path: PathBuf, force: bool, mount: bool) {
+        if !self.backup_on_save.get() {
+            return;
+        }
+        let Some(folder) = self.backup_folder.borrow().clone() else { return };
+        let Some((name, stamp)) = ({
+            let mut backups = self.backups.borrow_mut();
+            backups.iter_mut().find(|e| e.path == path).map(|e| {
+                // Until it lands: a quit meanwhile retries it.
+                e.pending = true;
+                (e.name.clone(), e.stamp)
+            })
+        }) else {
+            return;
+        };
+        if !self.backup_inflight.borrow_mut().insert(path.clone()) {
+            self.backup_again.borrow_mut().insert(path);
+            return;
+        }
+        let state = self.clone();
+        glib::spawn_future_local(async move {
+            let (src, dir) = (path.clone(), folder.clone());
+            let result = gio::spawn_blocking(move || backup::copy(&src, &dir, &name, stamp, force))
+                .await
+                .unwrap_or_else(|_| Err(std::io::Error::other("the copy failed")));
+            state.backup_inflight.borrow_mut().remove(&path);
+            state.backup_done(&path, &folder, result, mount);
+            if state.backup_again.borrow_mut().remove(&path) {
+                state.run_backup(path, false, mount);
+            }
+        });
+    }
+
+    fn backup_done(self: &Rc<Self>, path: &Path, folder: &Path, result: std::io::Result<backup::Outcome>, mount: bool) {
+        // The folder changed or the flag went while the copy ran.
+        if self.backup_folder.borrow().as_deref() != Some(folder) || !self.is_backed_up(path) {
+            return;
+        }
+        let name = file_label(&path.to_path_buf());
+        match result {
+            Ok(backup::Outcome::Copied(stamp)) => {
+                if let Some(e) = self.backups.borrow_mut().iter_mut().find(|e| e.path == path) {
+                    e.stamp = Some(stamp);
+                    e.pending = false;
+                }
+                self.backup_warned.set(false);
+                self.persist_settings();
+            }
+            Ok(backup::Outcome::Changed) => {
+                if let Some(e) = self.backups.borrow_mut().iter_mut().find(|e| e.path == path) {
+                    e.pending = false;
+                }
+                self.persist_settings();
+                if self.backup_declined.borrow().contains(path) {
+                    return;
+                }
+                self.ask_replace_backup(path.to_path_buf(), &name);
+            }
+            Err(err) => {
+                if err.kind() == std::io::ErrorKind::NotFound
+                    && mount
+                    && !self.backup_mount_tried.replace(true)
+                    && let Some(uri) = doc::gvfs_share_uri(folder)
+                {
+                    return self.mount_backup_share(&uri, path.to_path_buf());
+                }
+                if !self.backup_warned.replace(true) {
+                    self.toast(&format!("Backup of {name} failed, will retry: {err}"));
+                }
+            }
+        }
+    }
+
+    /// The copy in the backup folder is not the one Bindle wrote last.
+    fn ask_replace_backup(self: &Rc<Self>, path: PathBuf, name: &str) {
+        let dialog = adw::AlertDialog::new(
+            Some("Replace Backup Copy?"),
+            Some(&format!(
+                "The copy of “{name}” in the backup folder was changed outside Bindle, \
+                 or is another file with the same name. Replacing it loses that version."
+            )),
+        );
+        dialog.add_responses(&[("keep", "_Keep It"), ("replace", "_Replace")]);
+        dialog.set_response_appearance("replace", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("keep"));
+        dialog.set_close_response("keep");
+        let state = self.clone();
+        dialog.choose(Some(&self.window), gio::Cancellable::NONE, move |response| {
+            if response == "replace" {
+                state.run_backup(path, true, true);
+            } else {
+                state.backup_declined.borrow_mut().insert(path);
+            }
+        });
+    }
+
+    /// Mount the share the backup folder lives on (a remembered smb://
+    /// folder is just missing until something mounts it), then copy again.
+    fn mount_backup_share(self: &Rc<Self>, uri: &str, path: PathBuf) {
+        let op = gtk4::MountOperation::new(Some(&self.window));
+        let state = self.clone();
+        let name = uri.to_string();
+        gio::File::for_uri(uri).mount_enclosing_volume(
+            gio::MountMountFlags::NONE,
+            Some(&op),
+            gio::Cancellable::NONE,
+            move |result| match result {
+                Err(err)
+                    if !err.matches(gio::IOErrorEnum::AlreadyMounted)
+                        && !err.matches(gio::IOErrorEnum::Cancelled)
+                        && !err.matches(gio::IOErrorEnum::FailedHandled) =>
+                {
+                    state.toast(&format!("Could not connect to the backup folder {name}: {}", err.message()));
+                }
+                Err(err) if !err.matches(gio::IOErrorEnum::AlreadyMounted) => {}
+                _ => {
+                    // gvfsd-fuse publishes the directory a moment later.
+                    let folder = state.backup_folder.borrow().clone();
+                    let state = state.clone();
+                    glib::spawn_future_local(async move {
+                        if let Some(folder) = folder {
+                            let _ = gio::spawn_blocking(move || doc::wait_for_path(&folder)).await;
+                        }
+                        state.run_backup(path, false, false);
+                        state.retry_pending_backups();
+                    });
+                }
+            },
+        );
+    }
+
+    /// At quit: copies still pending (a save just now, or failed earlier)
+    /// get one last try, waited for — the process ends right after. Bounded,
+    /// since the folder may be on a share that hangs; never mounts or asks.
+    fn backup_before_quit(&self) {
+        if !self.backup_on_save.get() {
+            return;
+        }
+        let Some(folder) = self.backup_folder.borrow().clone() else { return };
+        let jobs: Vec<backup::Entry> = self.backups.borrow().iter().filter(|e| e.pending).cloned().collect();
+        if jobs.is_empty() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for job in jobs {
+                let result = backup::copy(&job.path, &folder, &job.name, job.stamp, false);
+                if tx.send((job.path, result)).is_err() {
+                    return;
+                }
+            }
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+            let Ok((path, result)) = rx.recv_timeout(left) else { break };
+            if let Ok(backup::Outcome::Copied(stamp)) = result
+                && let Some(e) = self.backups.borrow_mut().iter_mut().find(|e| e.path == path)
+            {
+                e.stamp = Some(stamp);
+                e.pending = false;
+            }
+        }
     }
 
     /// "New Folder…" for the menu's row: a subfolder of a folder, a folder
@@ -4110,8 +4474,12 @@ impl App {
         dialog.open(Some(&self.window), gio::Cancellable::NONE, move |res| {
             let Some(path) = state.picked_path(res) else { return };
             state.missing_files.borrow_mut().remove(&old);
+            if let Some(entry) = state.backups.borrow_mut().iter_mut().find(|e| e.path == old) {
+                entry.path = path.clone();
+            }
             state.collections.borrow_mut().relocate(id, path);
             state.collections_changed();
+            state.persist_settings();
         });
     }
 
@@ -5110,8 +5478,9 @@ impl App {
             .text(&self.buffer.start_iter(), &self.buffer.end_iter(), false)
     }
 
-    fn finish_save(&self, shown: &Path, then: Option<Box<dyn FnOnce()>>) {
+    fn finish_save(self: &Rc<Self>, shown: &Path, then: Option<Box<dyn FnOnce()>>) {
         self.restamp();
+        self.backup_after_save();
         self.modified.set(false);
         self.update_title();
         let name = shown.file_name().map(|n| n.to_string_lossy().to_string());
@@ -6416,6 +6785,9 @@ impl App {
             doc_state: self.doc_state.borrow().clone(),
             recent_files: self.recent_files.borrow().clone(),
             frozen_files: self.frozen_files.borrow().clone(),
+            backup_folder: self.backup_folder.borrow().clone(),
+            backup_on_save: self.backup_on_save.get(),
+            backups: self.backups.borrow().clone(),
         };
         let base = self.list_base.replace(ListBase::of(&settings));
         // Another instance may have saved since: keep what it recorded. On

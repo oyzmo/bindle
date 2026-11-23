@@ -42,6 +42,14 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.40.0" date="2026-11-23">
+      <description>
+        <ul>
+          <li>Backup copies: right-click a file in the Files panel → Back Up This File; every save also copies it to a backup folder chosen in the main menu</li>
+          <li>The backup folder can be a cloud folder, the NAS or an smb:// share</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.39.2" date="2026-11-18">
       <description>
         <p>Header: expand/collapse all now sits before the view toggle</p>

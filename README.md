@@ -8,6 +8,7 @@ A tiny Markdown editor for GNOME, written in Rust with GTK4 + Libadwaita. Create
 
 - **Flexible layout** — sidebar + editor with draggable dividers, an optional horizontal layout (editor on top, insert + preview below), and a view mode (<kbd>Ctrl</kbd>+<kbd>E</kbd> or the ↔ button) that swaps the preview into the main pane for comfortable reading. Each of the three sidebar panels (Files, Insert, Preview) can be shown or hidden on its own. Optionally open existing files straight into view mode. Everything — window size, dividers, layout, last file, and per document its folded sections and view mode — is remembered between launches.
 - **Files panel** — your recent files as a quiet list in the sidebar that doesn't reshuffle while you click through it. Pin a file to keep it at the top for good; right-click → Open Location shows it in GNOME Files, or removes it from the list.
+- **Backup copies** — right-click a file → Back Up This File, and every save also copies it (with its images) to a backup folder you pick in the main menu: a cloud-synced folder, the NAS, or an `smb://` share typed into the folder picker. Latest copy only; a copy changed elsewhere is never replaced without asking.
 - **Live preview that stays put** — rendered natively (no web view), updated as you type with only the changed region redrawn, so it never flickers or jumps. The preview can follow your cursor (toggleable) and stays centered on the line you're editing. Click the ▾ beside a heading to fold its section (or fold everything into an outline from the header bar), tick task-list checkboxes right in the preview, and use *Fit preview to width* to shrink text and images for an overview of the full-width layout.
 - **Click to sync, both ways** — click a word in the preview and the editor cursor jumps to it (double-click selects it); the preview tracks where you type. <kbd>Ctrl</kbd>+click opens links with your system's default app. With line numbers on, double-click a number (or beside a preview line) to pick that line in both panes; <kbd>Shift</kbd>+click extends the pick.
 - **Find** — <kbd>Ctrl</kbd>+<kbd>F</kbd> searches the editor, or the preview in view mode, highlighting every match with a running count; <kbd>Enter</kbd>/<kbd>Shift</kbd>+<kbd>Enter</kbd> step through them.
@@ -29,7 +30,7 @@ A tiny Markdown editor for GNOME, written in Rust with GTK4 + Libadwaita. Create
 Grab the latest `.flatpak` bundle from [GitHub Releases](https://github.com/oyzmo/bindle/releases/latest) or [oyzmo.no/apps](https://oyzmo.no/apps) and install it:
 
 ```sh
-flatpak install bindle-1.39.2.flatpak
+flatpak install bindle-1.40.0.flatpak
 ```
 
 or just double-click it in GNOME Software. Works on any Linux desktop with Flatpak set up; the GNOME runtime is fetched automatically if you don't have it.
@@ -53,8 +54,8 @@ flatpak-builder --user --install --force-clean build-dir no.oyzmo.Bindle.yml
 First download the source zip (`bindle-<version>-src.zip`) from [GitHub Releases](https://github.com/oyzmo/bindle/releases/latest) or [oyzmo.no/apps](https://oyzmo.no/apps) and unpack it:
 
 ```sh
-unzip bindle-1.39.2-src.zip
-cd bindle-1.39.2
+unzip bindle-1.40.0-src.zip
+cd bindle-1.40.0
 ```
 
 Then run the helper menu:

@@ -83,6 +83,13 @@ pub struct Settings {
     /// `recent_files`, until unfrozen, removed, or found to be gone.
     #[serde(with = "path_json::list")]
     pub frozen_files: Vec<PathBuf>,
+    /// Where flagged documents are copied after each save.
+    #[serde(with = "path_json::opt")]
+    pub backup_folder: Option<PathBuf>,
+    /// Copy flagged documents on save; off keeps the flags but copies nothing.
+    pub backup_on_save: bool,
+    /// The documents flagged for backup ("Back Up This File").
+    pub backups: Vec<crate::backup::Entry>,
 }
 
 /// Documents kept in the recent history, which the Files panel shows.
@@ -356,6 +363,9 @@ impl Default for Settings {
             doc_state: Vec::new(),
             recent_files: Vec::new(),
             frozen_files: Vec::new(),
+            backup_folder: None,
+            backup_on_save: true,
+            backups: Vec::new(),
         }
     }
 }
