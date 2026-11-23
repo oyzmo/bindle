@@ -42,6 +42,11 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.40.5" date="2026-11-23">
+      <description>
+        <p>Backup icon: a page with a drive</p>
+      </description>
+    </release>
     <release version="1.40.4" date="2026-11-23">
       <description>
         <p>New backup icon in the Files panel: a page with a circular arrow</p>
