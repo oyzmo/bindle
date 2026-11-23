@@ -3,5 +3,6 @@
   <gresource prefix="/no/oyzmo/Bindle">
     <file>icons/scalable/actions/bindle-collapse-all-symbolic.svg</file>
     <file>icons/scalable/actions/bindle-expand-all-symbolic.svg</file>
+    <file>icons/scalable/actions/bindle-backup-symbolic.svg</file>
   </gresource>
 </gresources>

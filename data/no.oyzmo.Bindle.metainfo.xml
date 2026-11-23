@@ -42,6 +42,11 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.40.4" date="2026-11-23">
+      <description>
+        <p>New backup icon in the Files panel: a page with a circular arrow</p>
+      </description>
+    </release>
     <release version="1.40.3" date="2026-11-23">
       <description>
         <p>Files panel no longer jumps to the open document when a row's backup flag or pin is changed</p>

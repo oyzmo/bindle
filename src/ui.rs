@@ -3587,7 +3587,7 @@ impl App {
             }
         }
         if self.is_backed_up(path) {
-            let icon = gtk4::Image::from_icon_name("send-to-symbolic");
+            let icon = gtk4::Image::from_icon_name("bindle-backup-symbolic");
             icon.add_css_class("dim-label");
             icon.set_pixel_size(12);
             icon.set_tooltip_text(Some(&self.backup_tip(path)));
