@@ -31,6 +31,10 @@
       <image type="source" width="1280" height="768">https://flatpak.oyzmo.no/screenshots/bindle/view.png</image>
     </screenshot>
     <screenshot>
+      <caption>Files panel: folders, pinned and backed-up documents</caption>
+      <image type="source" width="1280" height="768">https://flatpak.oyzmo.no/screenshots/bindle/files.png</image>
+    </screenshot>
+    <screenshot>
       <caption>Dark mode</caption>
       <image type="source" width="1280" height="768">https://flatpak.oyzmo.no/screenshots/bindle/dark.png</image>
     </screenshot>
@@ -42,6 +46,11 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.40.6" date="2026-11-23">
+      <description>
+        <p>README and Software screenshots show the Files panel</p>
+      </description>
+    </release>
     <release version="1.40.5" date="2026-11-23">
       <description>
         <p>Backup icon: a page with a drive</p>
