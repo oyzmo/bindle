@@ -6294,10 +6294,10 @@ impl App {
             return;
         }
         let colors = theme::tags(self.theme.get(), adw::StyleManager::default().is_dark());
-        let Ok(color) = gdk::RGBA::parse(colors.link) else {
+        let Ok(color) = gdk::RGBA::parse(colors.viewport) else {
             return;
         };
-        cr.set_source_rgba(color.red() as f64, color.green() as f64, color.blue() as f64, 0.7);
+        cr.set_source_rgb(color.red() as f64, color.green() as f64, color.blue() as f64);
         let (x, w) = (VIEWPORT_BAR_GAP as f64, VIEWPORT_BAR as f64);
         let (y0, y1) = (top.max(-w as i32) as f64, bottom.min(height + w as i32) as f64);
         let r = w / 2.0;

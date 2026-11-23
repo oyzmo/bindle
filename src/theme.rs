@@ -44,6 +44,9 @@ pub struct Tags {
     pub dim: &'static str,
     /// Preview: background behind inline code, as (colour, alpha).
     pub code_bg: (&'static str, f32),
+    /// Preview gutter: the editor-position bar. A "you are here" marker, so
+    /// the accent rather than a text colour; a UI mark, so 3:1 is its bar.
+    pub viewport: &'static str,
 }
 
 /// The GNOME palette the app shipped with: mid-saturation tones picked to stay
@@ -62,6 +65,7 @@ const STOCK: Tags = Tags {
     section: "#e66100",
     dim: "#808080",
     code_bg: ("#808080", 0.16),
+    viewport: "#3584e4",
 };
 
 /// Bindle on cream (`#FBF5EA`): darkened so each hue clears AA on a light
@@ -80,6 +84,8 @@ const BINDLE_LIGHT: Tags = Tags {
     section: "#9A4F22",
     dim: "#7A6250",
     code_bg: ("#8A6A50", 0.14),
+    // Sage hover: plain sage is only ~2.7:1 on cream.
+    viewport: "#6E8C6A",
 };
 
 /// Bindle on cocoa (`#251A14`): the same hues lightened, since on a dark
@@ -98,6 +104,7 @@ const BINDLE_DARK: Tags = Tags {
     section: "#E0985E",
     dim: "#A08D78",
     code_bg: ("#F4E7D3", 0.10),
+    viewport: "#9BBA95",
 };
 
 /// Text-tag colours for the current theme and colour scheme.
@@ -311,6 +318,16 @@ mod tests {
                 let ratio = contrast(color, bg);
                 assert!(ratio >= 4.5, "{name} {color} on {bg} is only {ratio:.2}:1");
             }
+        }
+    }
+
+    /// The editor-position bar is a non-text mark: 3:1 on the preview.
+    #[test]
+    fn viewport_bar_is_visible_on_the_preview() {
+        for (dark, bg) in [(false, "#FBF5EA"), (true, "#251A14")] {
+            let color = tags(Theme::Bindle, dark).viewport;
+            let ratio = contrast(color, bg);
+            assert!(ratio >= 3.0, "viewport {color} on {bg} is only {ratio:.2}:1");
         }
     }
 
