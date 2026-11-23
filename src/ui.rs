@@ -3464,6 +3464,7 @@ impl App {
         drop(tree);
         let adj = self.files_scroll.vadjustment();
         let scroll = adj.value();
+        let was_selected = self.files_sel.selected_item().and_then(|o| file_item(&o));
         self.files_root.splice(0, self.files_root.n_items(), &items);
         // Reopen the folders that were open. Expanding a row inserts its
         // children right after it, so one forward pass reaches nested ones.
@@ -3481,14 +3482,18 @@ impl App {
         }
         self.files_empty.set_visible(self.files_tree.n_items() == 0);
         self.select_current_file();
-        // Rebuilding must not move the list; then show the open document's
-        // row if it is off-screen, as before.
+        // Rebuilding must not move the list. Only when the selection moved
+        // to another row (a newly opened document) is it scrolled into view —
+        // a rebuild from a row's context menu (backup flag, pin, rename…)
+        // must leave the list where the user was working.
+        let now_selected = self.files_sel.selected_item().and_then(|o| file_item(&o));
+        let reveal = now_selected.is_some() && now_selected != was_selected;
         let view = self.files_view.clone();
         let sel = self.files_sel.clone();
         glib::idle_add_local_once(move || {
             adj.set_value(scroll);
             let pos = sel.selected();
-            if pos != gtk4::INVALID_LIST_POSITION {
+            if reveal && pos != gtk4::INVALID_LIST_POSITION {
                 view.scroll_to(pos, gtk4::ListScrollFlags::NONE, None);
             }
         });
