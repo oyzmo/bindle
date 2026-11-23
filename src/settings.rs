@@ -109,6 +109,7 @@ pub struct ListBase {
     recent: Vec<PathBuf>,
     frozen: Vec<PathBuf>,
     doc_state: Vec<PathBuf>,
+    backups: Vec<PathBuf>,
 }
 
 impl ListBase {
@@ -117,6 +118,7 @@ impl ListBase {
             recent: settings.recent_files.clone(),
             frozen: settings.frozen_files.clone(),
             doc_state: settings.doc_state.iter().map(|d| d.path.clone()).collect(),
+            backups: settings.backups.iter().map(|e| e.path.clone()).collect(),
         }
     }
 }
@@ -151,6 +153,10 @@ impl Settings {
         self.doc_state =
             merge_list(std::mem::take(&mut self.doc_state), disk.doc_state, &base.doc_state, |d| &d.path);
         self.doc_state.truncate(DOC_STATE_MAX);
+        // A flag set in another instance survives. For a document both
+        // flag, our stamp wins even if the other wrote the copy last: a
+        // stale stamp only costs a content comparison (`backup::copy`).
+        self.backups = merge_list(std::mem::take(&mut self.backups), disk.backups, &base.backups, |e| &e.path);
     }
 }
 
@@ -517,6 +523,21 @@ mod tests {
         ours.merge_lists(disk, &base, |_| false);
         assert_eq!(ours.recent_files, vec![p("/c"), p("/a"), p("/d")]);
         assert_eq!(ours.frozen_files, vec![p("/d")]);
+
+        // Backup flags: ours kept, the other's added, our unflag sticks.
+        let flag = |s: &str| crate::backup::Entry {
+            path: p(s),
+            name: p(s.trim_start_matches('/')),
+            stamp: None,
+            pending: false,
+            assets: Vec::new(),
+        };
+        let mut ours = super::Settings { backups: vec![flag("/a"), flag("/b")], ..Default::default() };
+        let base = super::ListBase::of(&ours);
+        ours.backups = vec![flag("/a")];
+        let disk = super::Settings { backups: vec![flag("/a"), flag("/b"), flag("/e")], ..Default::default() };
+        ours.merge_lists(disk, &base, |_| false);
+        assert_eq!(ours.backups, vec![flag("/a"), flag("/e")]);
     }
 
     #[test]

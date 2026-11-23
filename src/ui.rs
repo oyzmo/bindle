@@ -206,6 +206,9 @@ pub struct App {
     /// share mount was already tried (one password prompt).
     backup_warned: Cell<bool>,
     backup_mount_tried: Cell<bool>,
+    /// Documents already told this session that some referenced files
+    /// clash with other files in the backup folder.
+    backup_clash_warned: RefCell<HashSet<PathBuf>>,
     top_panel: gtk4::Box,
     bottom_panel: gtk4::Box,
     bottom_label: gtk4::Label,
@@ -1000,6 +1003,7 @@ impl App {
             backup_declined: RefCell::new(HashSet::new()),
             backup_warned: Cell::new(false),
             backup_mount_tried: Cell::new(false),
+            backup_clash_warned: RefCell::new(HashSet::new()),
             open_seq: Cell::new(0),
             doc_gen: Cell::new(0),
             edit_seq: Cell::new(0),
@@ -1686,6 +1690,7 @@ impl App {
             };
             state.recent_files.borrow_mut().retain(|p| *p != path);
             state.frozen_files.borrow_mut().retain(|p| *p != path);
+            state.backups.borrow_mut().retain(|e| e.path != path);
             state.update_recent_menu();
             state.persist_settings();
         });
@@ -4136,6 +4141,7 @@ impl App {
                 name,
                 stamp: None,
                 pending: true,
+                assets: Vec::new(),
             });
             self.backup_declined.borrow_mut().remove(path);
             self.run_backup(path.to_path_buf(), false, true);
@@ -4210,15 +4216,13 @@ impl App {
             return;
         }
         let Some(folder) = self.backup_folder.borrow().clone() else { return };
-        let Some((name, stamp)) = ({
+        let job = {
             let mut backups = self.backups.borrow_mut();
-            backups.iter_mut().find(|e| e.path == path).map(|e| {
-                // Until it lands: a quit meanwhile retries it.
-                e.pending = true;
-                (e.name.clone(), e.stamp)
-            })
-        }) else {
-            return;
+            let Some(entry) = backups.iter_mut().find(|e| e.path == path) else { return };
+            // Until it lands: a quit meanwhile retries it.
+            entry.pending = true;
+            let entry = entry.clone();
+            backup::Job::for_entry(&entry, &folder, &backups, force)
         };
         if !self.backup_inflight.borrow_mut().insert(path.clone()) {
             self.backup_again.borrow_mut().insert(path);
@@ -4226,8 +4230,7 @@ impl App {
         }
         let state = self.clone();
         glib::spawn_future_local(async move {
-            let (src, dir) = (path.clone(), folder.clone());
-            let result = gio::spawn_blocking(move || backup::copy(&src, &dir, &name, stamp, force))
+            let result = gio::spawn_blocking(move || backup::copy(&job))
                 .await
                 .unwrap_or_else(|_| Err(std::io::Error::other("the copy failed")));
             state.backup_inflight.borrow_mut().remove(&path);
@@ -4245,12 +4248,29 @@ impl App {
         }
         let name = file_label(&path.to_path_buf());
         match result {
-            Ok(backup::Outcome::Copied(stamp)) => {
+            Ok(backup::Outcome::Copied(copied)) => {
+                if let Some(first) = copied.clashes.first()
+                    && self.backup_clash_warned.borrow_mut().insert(path.to_path_buf())
+                {
+                    let more = match copied.clashes.len() - 1 {
+                        0 => String::new(),
+                        1 => " and 1 more file".into(),
+                        n => format!(" and {n} more files"),
+                    };
+                    self.toast(&format!(
+                        "Backup of {name}: {}{more} not copied — the backup folder already has a different file there",
+                        first.display()
+                    ));
+                }
+                self.record_backup(path, copied);
+                self.backup_warned.set(false);
+                self.persist_settings();
+            }
+            Ok(backup::Outcome::SourceMissing) => {
+                // Nothing to retry until the document is back (and saved).
                 if let Some(e) = self.backups.borrow_mut().iter_mut().find(|e| e.path == path) {
-                    e.stamp = Some(stamp);
                     e.pending = false;
                 }
-                self.backup_warned.set(false);
                 self.persist_settings();
             }
             Ok(backup::Outcome::Changed) => {
@@ -4269,7 +4289,7 @@ impl App {
                     && !self.backup_mount_tried.replace(true)
                     && let Some(uri) = doc::gvfs_share_uri(folder)
                 {
-                    return self.mount_backup_share(&uri, path.to_path_buf());
+                    return self.mount_backup_share(&uri);
                 }
                 if !self.backup_warned.replace(true) {
                     self.toast(&format!("Backup of {name} failed, will retry: {err}"));
@@ -4303,7 +4323,7 @@ impl App {
 
     /// Mount the share the backup folder lives on (a remembered smb://
     /// folder is just missing until something mounts it), then copy again.
-    fn mount_backup_share(self: &Rc<Self>, uri: &str, path: PathBuf) {
+    fn mount_backup_share(self: &Rc<Self>, uri: &str) {
         let op = gtk4::MountOperation::new(Some(&self.window));
         let state = self.clone();
         let name = uri.to_string();
@@ -4328,7 +4348,8 @@ impl App {
                         if let Some(folder) = folder {
                             let _ = gio::spawn_blocking(move || doc::wait_for_path(&folder)).await;
                         }
-                        state.run_backup(path, false, false);
+                        // The copy that found the share missing is still
+                        // pending, so this reruns it too.
                         state.retry_pending_backups();
                     });
                 }
@@ -4344,15 +4365,22 @@ impl App {
             return;
         }
         let Some(folder) = self.backup_folder.borrow().clone() else { return };
-        let jobs: Vec<backup::Entry> = self.backups.borrow().iter().filter(|e| e.pending).cloned().collect();
+        // A copy a save started may still be running on the worker pool;
+        // `backup::copy` takes a lock, so this one waits for it, then finds
+        // the copy already holds the same bytes and records its stamp — the
+        // worker's own result would never be handled, the main loop is done.
+        let jobs: Vec<backup::Job> = {
+            let backups = self.backups.borrow();
+            backups.iter().filter(|e| e.pending).map(|e| backup::Job::for_entry(e, &folder, &backups, false)).collect()
+        };
         if jobs.is_empty() {
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             for job in jobs {
-                let result = backup::copy(&job.path, &folder, &job.name, job.stamp, false);
-                if tx.send((job.path, result)).is_err() {
+                let result = backup::copy(&job);
+                if tx.send((job.src, result)).is_err() {
                     return;
                 }
             }
@@ -4360,12 +4388,18 @@ impl App {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
             let Ok((path, result)) = rx.recv_timeout(left) else { break };
-            if let Ok(backup::Outcome::Copied(stamp)) = result
-                && let Some(e) = self.backups.borrow_mut().iter_mut().find(|e| e.path == path)
-            {
-                e.stamp = Some(stamp);
-                e.pending = false;
+            if let Ok(backup::Outcome::Copied(copied)) = result {
+                self.record_backup(&path, copied);
             }
+        }
+    }
+
+    /// A copy landed: its stamp and the files written beside it.
+    fn record_backup(&self, path: &Path, copied: backup::Copied) {
+        if let Some(e) = self.backups.borrow_mut().iter_mut().find(|e| e.path == path) {
+            e.stamp = Some(copied.stamp);
+            e.assets = copied.assets;
+            e.pending = false;
         }
     }
 
@@ -5232,6 +5266,7 @@ impl App {
                 {
                     state.recent_files.borrow_mut().retain(|p| *p != path);
                     state.frozen_files.borrow_mut().retain(|p| *p != path);
+                    state.backups.borrow_mut().retain(|e| e.path != path);
                     state.update_recent_menu();
                     state.persist_settings();
                     state.toast(&format!(

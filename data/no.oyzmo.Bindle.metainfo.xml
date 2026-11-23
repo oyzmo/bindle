@@ -42,6 +42,16 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.40.1" date="2026-11-23">
+      <description>
+        <ul>
+          <li>Backups: a copy with the same content is never asked about</li>
+          <li>Backups: referenced images from different documents no longer overwrite each other</li>
+          <li>Backups: hidden files and links out of the document folder are not copied</li>
+          <li>Backups: saving right before quitting no longer leads to a question at the next launch</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.40.0" date="2026-11-23">
       <description>
         <ul>

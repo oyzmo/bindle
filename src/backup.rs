@@ -6,8 +6,10 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io;
+use std::io::{self, BufRead};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -32,10 +34,57 @@ pub struct Entry {
     /// quit and at the next launch.
     #[serde(default)]
     pub pending: bool,
+    /// The referenced files (images, attachments) copied along with it, as
+    /// Bindle last wrote them: what lets a later copy tell its own files
+    /// from another document's or someone else's at the same path.
+    #[serde(default)]
+    pub assets: Vec<AssetCopy>,
+}
+
+/// A referenced file copied beside a document's copy.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AssetCopy {
+    /// Relative to the backup folder (and to the document).
+    #[serde(with = "path_json")]
+    pub path: PathBuf,
+    pub stamp: Stamp,
 }
 
 /// `Entry::stamp`.
 pub type Stamp = (u64, u32, u64);
+
+/// Copies run one at a time, whoever starts them: the copy started by a
+/// save and the last try at quit must not write the same temp file at once.
+static COPY_LOCK: Mutex<()> = Mutex::new(());
+
+/// Everything `copy` needs, taken from an `Entry` on the main thread.
+#[derive(Clone, Debug)]
+pub struct Job {
+    pub src: PathBuf,
+    pub folder: PathBuf,
+    pub name: PathBuf,
+    pub last: Option<Stamp>,
+    pub assets: Vec<AssetCopy>,
+    /// The names of every flagged document's copy: a reference that would
+    /// land on one of them is never copied.
+    pub reserved: Vec<PathBuf>,
+    /// Replace the copy even if it was changed elsewhere.
+    pub force: bool,
+}
+
+impl Job {
+    pub fn for_entry(entry: &Entry, folder: &Path, all: &[Entry], force: bool) -> Job {
+        Job {
+            src: entry.path.clone(),
+            folder: folder.to_path_buf(),
+            name: entry.name.clone(),
+            last: entry.stamp,
+            assets: entry.assets.clone(),
+            reserved: all.iter().map(|e| e.name.clone()).collect(),
+            force,
+        }
+    }
+}
 
 fn stamp_of(mtime: SystemTime, size: u64) -> Stamp {
     let d = mtime.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
@@ -97,41 +146,112 @@ fn split_ext(name: &OsStr) -> (OsString, Option<OsString>) {
 /// What `copy` did.
 #[derive(Debug, PartialEq)]
 pub enum Outcome {
-    /// Written; the copy's new stamp.
-    Copied(Stamp),
+    /// Written.
+    Copied(Copied),
     /// Not written: something is already at the target that Bindle did not
     /// write last (edited elsewhere, or an unrelated file of the same name).
     /// Run again with `force` to replace it.
     Changed,
+    /// The document itself is gone; nothing to copy.
+    SourceMissing,
+}
+
+/// What a copy wrote.
+#[derive(Debug, PartialEq)]
+pub struct Copied {
+    /// The copy's new stamp.
+    pub stamp: Stamp,
+    /// The referenced files now beside it (`Entry::assets`).
+    pub assets: Vec<AssetCopy>,
+    /// References not copied because a different file Bindle didn't write
+    /// for this document is already at that path.
+    pub clashes: Vec<PathBuf>,
 }
 
 /// Copy `src` (a file or a bundle directory) to `folder/name`. Unless
-/// `force`, refuses to replace a copy whose stamp is not `last`. A plain
+/// `force`, refuses to replace a copy whose stamp is not `last` and whose
+/// content differs (a copy with the same content is ours whatever its
+/// stamp says: written by another instance, a quit, or re-flagged). A plain
 /// markdown file brings along the local files it references inside its
 /// own folder (images, attachments), at the same relative paths, so its
 /// links keep working in the backup folder.
-pub fn copy(src: &Path, folder: &Path, name: &Path, last: Option<Stamp>, force: bool) -> io::Result<Outcome> {
-    if !folder.is_dir() {
+pub fn copy(job: &Job) -> io::Result<Outcome> {
+    let _one_at_a_time = COPY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if !job.folder.is_dir() {
         return Err(io::Error::new(io::ErrorKind::NotFound, "the backup folder is not available"));
     }
-    let target = folder.join(name);
-    if !force && let Some(now) = target_stamp(&target)
-        && Some(now) != last
+    let meta = match fs::metadata(&job.src) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Outcome::SourceMissing),
+        other => other?,
+    };
+    let target = job.folder.join(&job.name);
+    if !job.force
+        && let Some(now) = target_stamp(&target)
+        && Some(now) != job.last
+        && !same_tree(&job.src, &target)
     {
         return Ok(Outcome::Changed);
     }
-    let meta = fs::metadata(src)?;
+    let (mut assets, mut clashes) = (Vec::new(), Vec::new());
     if meta.is_dir() {
-        copy_dir(src, &target)?;
+        copy_dir(&job.src, &target, job.force)?;
     } else {
-        copy_file(src, &target)?;
-        if is_plain_markdown(src) {
-            copy_assets(src, folder);
+        copy_file(&job.src, &target)?;
+        if is_plain_markdown(&job.src) {
+            (assets, clashes) = copy_assets(job);
         }
     }
-    target_stamp(&target)
-        .map(Outcome::Copied)
-        .ok_or_else(|| io::Error::other("the copy could not be read back"))
+    let stamp = target_stamp(&target).ok_or_else(|| io::Error::other("the copy could not be read back"))?;
+    Ok(Outcome::Copied(Copied { stamp, assets, clashes }))
+}
+
+/// Same content: two files with the same bytes, or two directories holding
+/// the same names with the same content all the way down.
+fn same_tree(a: &Path, b: &Path) -> bool {
+    let (Ok(ma), Ok(mb)) = (fs::metadata(a), fs::metadata(b)) else { return false };
+    match (ma.is_dir(), mb.is_dir()) {
+        (false, false) => same_bytes(a, b),
+        (true, true) => {
+            let names = |dir: &Path| -> Option<std::collections::BTreeSet<OsString>> {
+                fs::read_dir(dir).ok()?.map(|e| e.ok().map(|e| e.file_name())).collect()
+            };
+            match (names(a), names(b)) {
+                (Some(na), Some(nb)) if na == nb => na.iter().all(|n| same_tree(&a.join(n), &b.join(n))),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn same_bytes(a: &Path, b: &Path) -> bool {
+    let (Ok(ma), Ok(mb)) = (fs::metadata(a), fs::metadata(b)) else { return false };
+    if ma.len() != mb.len() {
+        return false;
+    }
+    let (Ok(fa), Ok(fb)) = (fs::File::open(a), fs::File::open(b)) else { return false };
+    let (mut ra, mut rb) = (io::BufReader::new(fa), io::BufReader::new(fb));
+    loop {
+        let (Ok(ba), Ok(bb)) = (ra.fill_buf(), rb.fill_buf()) else { return false };
+        let n = ba.len().min(bb.len());
+        if n == 0 {
+            return ba.is_empty() && bb.is_empty();
+        }
+        if ba[..n] != bb[..n] {
+            return false;
+        }
+        ra.consume(n);
+        rb.consume(n);
+    }
+}
+
+/// The copy gets the document's permissions, so a private file doesn't turn
+/// world-readable in the backup folder. Best effort: cloud and FAT folders
+/// may not keep modes at all.
+fn keep_mode(src: &Path, target: &Path) {
+    if let Ok(meta) = fs::metadata(src) {
+        let _ = fs::set_permissions(target, fs::Permissions::from_mode(meta.permissions().mode() & 0o777));
+    }
 }
 
 /// A markdown text file, whose references live beside it — not a pack or
@@ -172,13 +292,18 @@ fn copy_file(src: &Path, target: &Path) -> io::Result<()> {
     crate::doc::replace_or_in_place(target, |out| {
         let mut input = fs::File::open(src)?;
         io::copy(&mut input, out).map(|_| ())
-    })
+    })?;
+    keep_mode(src, target);
+    Ok(())
 }
 
 /// A bundle, file by file into `target`, then whatever the bundle no longer
 /// has is removed from the copy. File by file rather than one directory
-/// rename, which some network backends refuse.
-fn copy_dir(src: &Path, target: &Path) -> io::Result<()> {
+/// rename, which some network backends refuse. Unchanged files are skipped
+/// by size and age, except when `force` replaces a copy edited elsewhere —
+/// an edit that kept the size would pass that test, so then only identical
+/// bytes are skipped.
+fn copy_dir(src: &Path, target: &Path, force: bool) -> io::Result<()> {
     fs::create_dir_all(target)?;
     let mut keep = std::collections::HashSet::new();
     for entry in fs::read_dir(src)? {
@@ -186,9 +311,10 @@ fn copy_dir(src: &Path, target: &Path) -> io::Result<()> {
         let from = entry.path();
         let to = target.join(entry.file_name());
         keep.insert(entry.file_name());
+        let unchanged = if force { same_bytes(&from, &to) } else { same_file_content(&from, &to) };
         if entry.file_type()?.is_dir() {
-            copy_dir(&from, &to)?;
-        } else if !same_file_content(&from, &to) {
+            copy_dir(&from, &to, force)?;
+        } else if !unchanged {
             copy_file(&from, &to)?;
         }
     }
@@ -213,36 +339,98 @@ fn same_file_content(src: &Path, copy: &Path) -> bool {
 }
 
 /// The local files a markdown document references inside its own folder,
-/// copied to the same relative paths under `folder`. Best effort: a missing
-/// image doesn't fail the document's backup.
-fn copy_assets(doc: &Path, folder: &Path) {
-    let Ok(text) = fs::read_to_string(doc) else { return };
-    let Some(base) = doc.parent() else { return };
+/// copied to the same relative paths under the backup folder. Best effort:
+/// a missing image doesn't fail the document's backup.
+///
+/// The backup folder is shared by every flagged document, so a path may
+/// already hold another document's file of the same name, or the user's
+/// own. Only a file this document's last copy wrote (`Job::assets`, stamp
+/// unchanged) is replaced; one with the same bytes is adopted; anything
+/// else is left alone and reported as a clash. References that resolve
+/// outside the document's folder (through a symlink) are never copied.
+fn copy_assets(job: &Job) -> (Vec<AssetCopy>, Vec<PathBuf>) {
+    let (mut copied, mut clashes) = (Vec::new(), Vec::new());
+    let Ok(text) = fs::read_to_string(&job.src) else { return (copied, clashes) };
+    let Some(base) = job.src.parent().and_then(|b| fs::canonicalize(b).ok()) else {
+        return (copied, clashes);
+    };
     for rel in asset_paths(&text) {
-        let from = base.join(&rel);
-        if !from.is_file() {
+        if lands_on_reserved(&rel, &job.reserved) {
             continue;
         }
-        let to = folder.join(&rel);
-        if same_file_content(&from, &to) {
+        let Ok(from) = fs::canonicalize(base.join(&rel)) else { continue };
+        if !from.starts_with(&base) || !from.is_file() || from.strip_prefix(&base).is_ok_and(has_hidden) {
             continue;
         }
-        if let Some(dir) = to.parent() {
-            let _ = fs::create_dir_all(dir);
+        let to = job.folder.join(&rel);
+        let ours = job.assets.iter().find(|a| a.path == rel).map(|a| a.stamp);
+        let write = match fs::metadata(&to) {
+            Err(_) => true,
+            Ok(meta) if meta.is_dir() => {
+                clashes.push(rel);
+                continue;
+            }
+            Ok(meta) => {
+                let now = meta.modified().ok().map(|m| stamp_of(m, meta.len()));
+                if now.is_some() && now == ours {
+                    !same_file_content(&from, &to)
+                } else if same_bytes(&from, &to) {
+                    false
+                } else {
+                    clashes.push(rel);
+                    continue;
+                }
+            }
+        };
+        if write {
+            if let Some(dir) = to.parent() {
+                let _ = fs::create_dir_all(dir);
+            }
+            if copy_file(&from, &to).is_err() {
+                continue;
+            }
         }
-        let _ = copy_file(&from, &to);
+        if let Ok(meta) = fs::metadata(&to)
+            && let Ok(mtime) = meta.modified()
+        {
+            copied.push(AssetCopy { path: rel, stamp: stamp_of(mtime, meta.len()) });
+        }
     }
+    (copied, clashes)
 }
 
-/// Relative paths of the local references that stay inside the document's
-/// folder — no absolute paths, no `..` — so a copy can't land outside the
-/// backup folder.
+/// A reference whose first component is a flagged document's copy (another
+/// document linked to by name, or a file inside a bundle's copy).
+fn lands_on_reserved(rel: &Path, reserved: &[PathBuf]) -> bool {
+    let Some(first) = rel.components().find_map(|c| match c {
+        Component::Normal(s) => Some(s.to_string_lossy().to_lowercase()),
+        _ => None,
+    }) else {
+        return false;
+    };
+    reserved.iter().any(|r| r.as_os_str().to_string_lossy().to_lowercase() == first)
+}
+
+/// A hidden file or folder anywhere on the path (`.ssh/…`, `.config/…`).
+fn has_hidden(rel: &Path) -> bool {
+    rel.components().any(|c| matches!(c, Component::Normal(s) if s.to_string_lossy().starts_with('.')))
+}
+
+/// Relative paths of the local references worth copying beside a document:
+/// inside its folder — no absolute paths, no `..` — so a copy can't land
+/// outside the backup folder; nothing hidden, since a document in the home
+/// folder could otherwise send `.ssh/id_ed25519` to a cloud folder; and no
+/// links to other markdown documents, which are documents, not attachments.
 pub fn asset_paths(markdown: &str) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     for dest in crate::bundle::local_asset_dests(markdown) {
         let rel = PathBuf::from(crate::bundle::decode_dest(&dest));
         let inside = rel.components().all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
-        if inside && rel.components().next().is_some() && !out.contains(&rel) {
+        let document = is_plain_markdown(&rel) || {
+            let ext = rel.extension().map(|e| e.to_string_lossy().to_lowercase());
+            matches!(ext.as_deref(), Some("textbundle" | "textpack"))
+        };
+        if inside && !document && !has_hidden(&rel) && rel.components().next().is_some() && !out.contains(&rel) {
             out.push(rel);
         }
     }
@@ -279,7 +467,8 @@ mod tests {
 
     #[test]
     fn only_references_inside_the_document_folder_are_assets() {
-        let md = "![a](assets/a.png) ![b](../b.png) ![c](/etc/c.png) [d](docs/d%20e.pdf) ![w](https://x/y.png)";
+        let md = "![a](assets/a.png) ![b](../b.png) ![c](/etc/c.png) [d](docs/d%20e.pdf) ![w](https://x/y.png) \
+                  [k](.ssh/id_ed25519) [h](x/.git/config) [n](other.md) [t](trip.textbundle/text.md)";
         assert_eq!(asset_paths(md), vec![PathBuf::from("assets/a.png"), PathBuf::from("docs/d e.pdf")]);
     }
 
@@ -288,6 +477,25 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn job(src: &Path, folder: &Path, name: &str, last: Option<Stamp>, force: bool) -> Job {
+        Job {
+            src: src.to_path_buf(),
+            folder: folder.to_path_buf(),
+            name: name.into(),
+            last,
+            assets: Vec::new(),
+            reserved: vec![name.into()],
+            force,
+        }
+    }
+
+    fn copied(outcome: io::Result<Outcome>) -> Copied {
+        match outcome.unwrap() {
+            Outcome::Copied(c) => c,
+            other => panic!("not copied: {other:?}"),
+        }
     }
 
     #[test]
@@ -300,23 +508,88 @@ mod tests {
         fs::write(docs.join("assets/a.png"), b"png").unwrap();
         let doc = docs.join("n.md");
         fs::write(&doc, "![a](assets/a.png)").unwrap();
+        fs::set_permissions(&doc, fs::Permissions::from_mode(0o600)).unwrap();
 
-        let Outcome::Copied(stamp) = copy(&doc, &backup, Path::new("n.md"), None, false).unwrap() else {
-            panic!("not copied")
-        };
+        let first = copied(copy(&job(&doc, &backup, "n.md", None, false)));
         assert_eq!(fs::read(backup.join("assets/a.png")).unwrap(), b"png");
+        assert_eq!(first.assets.len(), 1);
+        assert_eq!(fs::metadata(backup.join("n.md")).unwrap().permissions().mode() & 0o777, 0o600);
         fs::write(&doc, "![a](assets/a.png) more").unwrap();
-        assert!(matches!(copy(&doc, &backup, Path::new("n.md"), Some(stamp), false).unwrap(), Outcome::Copied(_)));
+        let stamp = copied(copy(&job(&doc, &backup, "n.md", Some(first.stamp), false))).stamp;
         assert_eq!(fs::read_to_string(backup.join("n.md")).unwrap(), "![a](assets/a.png) more");
 
         // Edited in the backup folder: not overwritten unless forced.
         fs::write(backup.join("n.md"), "theirs, longer").unwrap();
-        assert_eq!(copy(&doc, &backup, Path::new("n.md"), Some(stamp), false).unwrap(), Outcome::Changed);
+        assert_eq!(copy(&job(&doc, &backup, "n.md", Some(stamp), false)).unwrap(), Outcome::Changed);
         assert_eq!(fs::read_to_string(backup.join("n.md")).unwrap(), "theirs, longer");
-        assert!(matches!(copy(&doc, &backup, Path::new("n.md"), Some(stamp), true).unwrap(), Outcome::Copied(_)));
+        copied(copy(&job(&doc, &backup, "n.md", Some(stamp), true)));
         // A file of that name Bindle never wrote is not ours either.
         fs::write(backup.join("m.md"), "other").unwrap();
-        assert_eq!(copy(&doc, &backup, Path::new("m.md"), None, false).unwrap(), Outcome::Changed);
+        assert_eq!(copy(&job(&doc, &backup, "m.md", None, false)).unwrap(), Outcome::Changed);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_copy_with_the_same_content_is_ours_whatever_its_stamp() {
+        // Re-flagged, written by another instance or by the last try at
+        // quit: the stamp is stale or missing, the bytes are the same.
+        let dir = scratch("same");
+        let backup = dir.join("b");
+        fs::create_dir_all(&backup).unwrap();
+        let doc = dir.join("n.md");
+        fs::write(&doc, "text").unwrap();
+        fs::write(backup.join("n.md"), "text").unwrap();
+        copied(copy(&job(&doc, &backup, "n.md", None, false)));
+        copied(copy(&job(&doc, &backup, "n.md", Some((1, 2, 3)), false)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_reference_never_replaces_a_file_it_did_not_write() {
+        let dir = scratch("clash");
+        let (a, b, backup) = (dir.join("a"), dir.join("b"), dir.join("backup"));
+        for d in [&a, &b] {
+            fs::create_dir_all(d.join("img")).unwrap();
+        }
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(a.join("img/d.png"), b"from a").unwrap();
+        fs::write(b.join("img/d.png"), b"from b!").unwrap();
+        fs::write(a.join("n.md"), "![d](img/d.png)").unwrap();
+        fs::write(b.join("n.md"), "![d](img/d.png)").unwrap();
+
+        let ca = copied(copy(&job(&a.join("n.md"), &backup, "n.md", None, false)));
+        let cb = copied(copy(&job(&b.join("n.md"), &backup, "n (b).md", None, false)));
+        assert_eq!(fs::read(backup.join("img/d.png")).unwrap(), b"from a");
+        assert_eq!(cb.clashes, vec![PathBuf::from("img/d.png")]);
+        assert!(cb.assets.is_empty());
+
+        // A's own file, changed at the source, is replaced.
+        fs::write(a.join("img/d.png"), b"from a, v2").unwrap();
+        let mut again = job(&a.join("n.md"), &backup, "n.md", Some(ca.stamp), false);
+        again.assets = ca.assets;
+        let ca = copied(copy(&again));
+        assert!(ca.clashes.is_empty());
+        assert_eq!(fs::read(backup.join("img/d.png")).unwrap(), b"from a, v2");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn references_through_a_symlink_out_of_the_folder_or_onto_a_copy_stay_behind() {
+        let dir = scratch("escape");
+        let (docs, backup) = (dir.join("docs"), dir.join("backup"));
+        fs::create_dir_all(&docs).unwrap();
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(dir.join("secret"), "key").unwrap();
+        std::os::unix::fs::symlink(dir.join("secret"), docs.join("x.png")).unwrap();
+        fs::create_dir_all(docs.join("trip.textbundle")).unwrap();
+        fs::write(docs.join("trip.textbundle/info.json"), "{}").unwrap();
+        fs::write(docs.join("n.md"), "![x](x.png) [i](trip.textbundle/info.json)").unwrap();
+        let mut j = job(&docs.join("n.md"), &backup, "n.md", None, false);
+        j.reserved.push("trip.textbundle".into());
+        let c = copied(copy(&j));
+        assert!(c.assets.is_empty() && c.clashes.is_empty());
+        assert!(!backup.join("x.png").exists());
+        assert!(!backup.join("trip.textbundle").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -329,22 +602,23 @@ mod tests {
         fs::write(bundle.join("assets/old.png"), "o").unwrap();
         let backup = dir.join("b");
         fs::create_dir_all(&backup).unwrap();
-        let Outcome::Copied(stamp) = copy(&bundle, &backup, Path::new("t.textbundle"), None, false).unwrap() else {
-            panic!()
-        };
+        let stamp = copied(copy(&job(&bundle, &backup, "t.textbundle", None, false))).stamp;
         fs::remove_file(bundle.join("assets/old.png")).unwrap();
-        copy(&bundle, &backup, Path::new("t.textbundle"), Some(stamp), false).unwrap();
+        copied(copy(&job(&bundle, &backup, "t.textbundle", Some(stamp), false)));
         assert!(backup.join("t.textbundle/text.md").is_file());
         assert!(!backup.join("t.textbundle/assets/old.png").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn an_unavailable_folder_is_an_error() {
+    fn an_unavailable_folder_is_an_error_and_a_gone_document_is_not() {
         let dir = scratch("gone");
         let doc = dir.join("n.md");
         fs::write(&doc, "x").unwrap();
-        assert!(copy(&doc, &dir.join("missing"), Path::new("n.md"), None, false).is_err());
+        assert!(copy(&job(&doc, &dir.join("missing"), "n.md", None, false)).is_err());
+        let b = dir.join("b");
+        fs::create_dir_all(&b).unwrap();
+        assert_eq!(copy(&job(&dir.join("nope.md"), &b, "nope.md", None, false)).unwrap(), Outcome::SourceMissing);
         let _ = fs::remove_dir_all(&dir);
     }
 }
