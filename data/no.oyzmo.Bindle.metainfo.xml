@@ -46,6 +46,14 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.41.1" date="2026-11-25">
+      <description>
+        <ul>
+          <li>The pasted-image note also appears when the first save writes images pasted into an unsaved document</li>
+          <li>One-time notes stay dismissed across Bindle windows open at the same time</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.41.0" date="2026-11-25">
       <description>
         <ul>

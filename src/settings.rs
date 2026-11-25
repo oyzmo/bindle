@@ -145,6 +145,14 @@ fn merge_list<T>(ours: Vec<T>, disk: Vec<T>, base: &[PathBuf], key: impl Fn(&T) 
 }
 
 impl Settings {
+    /// One-time notes stay dismissed once any instance has shown them:
+    /// without this, a window started before the note appeared still holds
+    /// `true` and writes it back on its next save, and the note returns.
+    pub fn merge_notes(&mut self, disk: &Settings) {
+        self.show_attachment_note &= disk.show_attachment_note;
+        self.show_paste_note &= disk.show_paste_note;
+    }
+
     /// Fold in the list-valued fields another instance wrote to `disk` since
     /// this one last saved (`base`). Each instance holds its own launch-time
     /// copy of the history, pins and document state, and writing the whole
@@ -515,6 +523,19 @@ pub(crate) mod path_json {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_note_dismissed_anywhere_stays_dismissed() {
+        let mut ours = super::Settings::default();
+        let disk = super::Settings { show_paste_note: false, ..Default::default() };
+        ours.merge_notes(&disk);
+        assert!(!ours.show_paste_note);
+        assert!(ours.show_attachment_note);
+        // Ours dismissed, disk not (yet): stays dismissed too.
+        let mut ours = super::Settings { show_attachment_note: false, ..Default::default() };
+        ours.merge_notes(&super::Settings::default());
+        assert!(!ours.show_attachment_note);
+    }
+
     #[test]
     fn instances_keep_each_others_list_entries() {
         use std::path::PathBuf;

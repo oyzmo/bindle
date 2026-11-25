@@ -2592,7 +2592,7 @@ impl App {
             Ok(stored) => {
                 self.paste_image_reference(&format!("assets/{stored}"));
                 if matches!(source, DocSource::Plain(_)) {
-                    self.explain_pasted_image(&stored);
+                    self.explain_pasted_image(&[stored]);
                 }
             }
             Err(err) => self.toast(&format!("Could not store the image: {err}")),
@@ -2602,17 +2602,27 @@ impl App {
     /// One-time note after the first image pasted into a plain markdown
     /// file: it went into a file beside the document, which a copy of the
     /// .md alone leaves behind.
-    fn explain_pasted_image(self: &Rc<Self>, stored: &str) {
-        if !self.show_paste_note.get() {
+    /// Also shown when the first save of a document writes images that were
+    /// pasted while it had no file yet (`write_to`).
+    fn explain_pasted_image(self: &Rc<Self>, stored: &[String]) {
+        self.refresh_notes();
+        if !self.show_paste_note.get() || stored.is_empty() {
             return;
         }
+        let (title, what, them) = match stored {
+            [one] => ("Image Saved Beside the Document", format!("The image was saved as assets/{one}"), "it"),
+            many => (
+                "Images Saved Beside the Document",
+                format!("The {} pasted images were saved in the assets folder", many.len()),
+                "them",
+            ),
+        };
         let dialog = adw::AlertDialog::new(
-            Some("Image Saved Beside the Document"),
+            Some(title),
             Some(&format!(
-                "The image was saved as assets/{stored} in the document's folder, and the \
-                 document links to it. When you copy or move the document, take the assets \
-                 folder along — or use Save As → TextPack to keep the text and its images \
-                 in a single file."
+                "{what} in the document's folder, and the document links to {them}. When you \
+                 copy or move the document, take the assets folder along — or use Save As → \
+                 TextPack to keep the text and its images in a single file."
             )),
         );
         dialog.add_responses(&[("ok", "_OK")]);
@@ -4899,6 +4909,7 @@ impl App {
 
     /// One-time note about the read-only attachment model, then `then`.
     fn explain_attachments_then(self: &Rc<Self>, then: Box<dyn FnOnce()>) {
+        self.refresh_notes();
         if !self.show_attachment_note.get() {
             return then();
         }
@@ -5771,7 +5782,17 @@ impl App {
                 if self.doc_kind() != old_kind {
                     self.kind_changed();
                 }
+                // Not before a follow-up such as closing the window: the
+                // note would show over a window about to go away.
+                let note = then.is_none();
                 self.finish_save(path, then);
+                if note {
+                    let names: Vec<String> = written
+                        .iter()
+                        .filter_map(|f| f.file_name().map(|n| n.to_string_lossy().into_owned()))
+                        .collect();
+                    self.explain_pasted_image(&names);
+                }
             }
             Err(err) => {
                 // Nothing was saved: take back the images written for it, or
@@ -6994,16 +7015,35 @@ impl App {
         let base = self.list_base.replace(ListBase::of(&settings));
         // Another instance may have saved since: keep what it recorded. On
         // when this process runs non-unique or the setting says others may.
-        let shared = self.multiple_instances.get()
+        if self.shares_settings() {
+            let disk = Settings::load();
+            settings.merge_notes(&disk);
+            self.show_attachment_note.set(settings.show_attachment_note);
+            self.show_paste_note.set(settings.show_paste_note);
+            let tree = self.collections.borrow();
+            settings.merge_lists(disk, &base, |p| tree.contains_path(p));
+        }
+        settings.save();
+    }
+
+    /// Whether other instances may write settings.json too: this process
+    /// runs non-unique, or the setting says others may.
+    fn shares_settings(&self) -> bool {
+        self.multiple_instances.get()
             || self
                 .window
                 .application()
-                .is_some_and(|app| app.flags().contains(gio::ApplicationFlags::NON_UNIQUE));
-        if shared {
-            let tree = self.collections.borrow();
-            settings.merge_lists(Settings::load(), &base, |p| tree.contains_path(p));
+                .is_some_and(|app| app.flags().contains(gio::ApplicationFlags::NON_UNIQUE))
+    }
+
+    /// Before showing a one-time note: another instance may have shown it
+    /// since this one started, so take its dismissal from disk.
+    fn refresh_notes(&self) {
+        if self.shares_settings() {
+            let disk = Settings::load();
+            self.show_attachment_note.set(self.show_attachment_note.get() && disk.show_attachment_note);
+            self.show_paste_note.set(self.show_paste_note.get() && disk.show_paste_note);
         }
-        settings.save();
     }
 
     fn toast(&self, message: &str) {
