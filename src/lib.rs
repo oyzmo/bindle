@@ -1,6 +1,7 @@
 pub mod backup;
 pub mod bundle;
 pub mod changelog;
+pub mod cleanup;
 pub mod collections;
 pub mod doc;
 pub mod editor;

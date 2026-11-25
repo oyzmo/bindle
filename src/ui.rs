@@ -10,6 +10,7 @@ use gtk4::{gdk, gio, glib};
 
 use crate::backup;
 use crate::bundle;
+use crate::cleanup;
 use crate::collections::{self, FileEntry, Node, Place};
 use crate::doc::{self, DocKind};
 use crate::editor;
@@ -749,6 +750,7 @@ impl App {
         export_menu.append(Some("As P_DF…"), Some("win.export-pdf"));
         export_menu.append(Some("As _ODT…"), Some("win.export-odt"));
         file_section.append_submenu(Some("_Export"), &export_menu);
+        file_section.append(Some("Clean Up _Assets…"), Some("win.clean-assets"));
         file_section.append(Some("_Print…"), Some("win.print"));
         menu.append_section(None, &file_section);
 
@@ -1638,7 +1640,7 @@ impl App {
     }
 
     fn register_actions(self: &Rc<Self>) {
-        let actions: [(&str, Box<dyn Fn(&Rc<App>)>); 17] = [
+        let actions: [(&str, Box<dyn Fn(&Rc<App>)>); 18] = [
             ("new", Box::new(|s| s.new_file())),
             ("headings-raise", Box::new(|s| s.shift_headings(-1))),
             ("headings-lower", Box::new(|s| s.shift_headings(1))),
@@ -1653,6 +1655,7 @@ impl App {
             ("export-pdf", Box::new(|s| s.export_pdf_dialog())),
             ("print", Box::new(|s| s.print_dialog())),
             ("export-odt", Box::new(|s| s.export_odt_dialog())),
+            ("clean-assets", Box::new(|s| s.clean_assets())),
             ("insert", Box::new(|s| if !s.typing_elsewhere() { s.show_insert_popover() })),
             ("bold", Box::new(|s| if !s.typing_elsewhere() { s.insert_named("Bold") })),
             ("italic", Box::new(|s| if !s.typing_elsewhere() { s.insert_named("Italic") })),
@@ -2624,6 +2627,218 @@ impl App {
         self.show_paste_note.set(false);
         self.persist_settings();
         dialog.present(Some(&self.window));
+    }
+
+    // --- Clean Up Assets ---
+
+    /// Find files in the document's `assets/` that nothing refers to (see
+    /// `cleanup`) and offer to move the ones the user ticks to the Trash.
+    /// The scan runs on a worker thread: the folder may sit on a share.
+    fn clean_assets(self: &Rc<Self>) {
+        let source = self.source.borrow().clone();
+        let text = self.text().to_string();
+        let plain = matches!(source, DocSource::Plain(_));
+        let scan: Box<dyn FnOnce() -> Result<Vec<(cleanup::Candidate, Option<preview::Thumb>)>, cleanup::ScanError> + Send> =
+            match source.clone() {
+                DocSource::None => return self.toast("Save the document first"),
+                DocSource::Odt { .. } => return self.toast("An imported document has no assets folder"),
+                DocSource::Plain(doc) => Box::new(move || {
+                    let folder = doc.parent().map(Path::to_path_buf).unwrap_or_default();
+                    let found = cleanup::plain_unused(&doc, &text)?;
+                    Ok(with_thumbs(found, |rel| bundle::read_file_capped(&folder.join(rel), bundle::ASSET_MAX_BYTES)))
+                }),
+                DocSource::Bundle { dir, .. } => Box::new(move || {
+                    let found = cleanup::bundle_unused(&dir, &text);
+                    Ok(with_thumbs(found, |rel| bundle::read_file_capped(&dir.join(rel), bundle::ASSET_MAX_BYTES)))
+                }),
+                DocSource::Pack { path, info } => Box::new(move || {
+                    let found = cleanup::pack_unused(&info.entries, &info.prefix, &text);
+                    Ok(with_thumbs(found, |rel| bundle::read_asset(&path, &info, rel, bundle::ASSET_MAX_BYTES)))
+                }),
+            };
+        let seq = self.doc_gen.get();
+        let state = self.clone();
+        glib::spawn_future_local(async move {
+            let found = gio::spawn_blocking(scan).await;
+            if !state.still_open(seq) {
+                return;
+            }
+            match found {
+                Ok(Ok(found)) if found.is_empty() => state.toast(if plain {
+                    "No unused pasted images in the assets folder"
+                } else {
+                    "No unused files in the assets folder"
+                }),
+                Ok(Ok(found)) => state.clean_assets_dialog(found, plain),
+                Ok(Err(cleanup::ScanError::TooMany)) => {
+                    state.toast("Too many files in the document's folder to check safely")
+                }
+                Err(_) => state.toast("Could not check the assets folder"),
+            }
+        });
+    }
+
+    fn clean_assets_dialog(self: &Rc<Self>, found: Vec<(cleanup::Candidate, Option<preview::Thumb>)>, plain: bool) {
+        let body = if plain {
+            "Images pasted into this document that no file in its folder uses."
+        } else {
+            "Nothing in the document refers to these files."
+        };
+        let dialog = adw::AlertDialog::new(Some("Unused Assets"), Some(body));
+        let list = gtk4::ListBox::new();
+        list.add_css_class("boxed-list");
+        list.set_selection_mode(gtk4::SelectionMode::None);
+        let mut checks = Vec::new();
+        for (candidate, thumb) in &found {
+            let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
+            row.set_margin_top(6);
+            row.set_margin_bottom(6);
+            row.set_margin_start(8);
+            row.set_margin_end(8);
+            // A shared folder's files may belong to something Bindle can't
+            // see, so there nothing is ticked until the user says so.
+            let check = gtk4::CheckButton::new();
+            check.set_active(!plain);
+            row.append(&check);
+            let icon = match thumb {
+                Some(thumb) => gtk4::Image::from_paintable(Some(&thumb.texture())),
+                None => gtk4::Image::from_icon_name("text-x-generic-symbolic"),
+            };
+            icon.set_pixel_size(40);
+            row.append(&icon);
+            let name = candidate.rel.strip_prefix("assets/").unwrap_or(&candidate.rel);
+            let text = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+            text.set_valign(gtk4::Align::Center);
+            text.set_hexpand(true);
+            let label = gtk4::Label::new(Some(name));
+            label.set_xalign(0.0);
+            label.set_wrap(true);
+            label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+            label.set_tooltip_text(Some(&candidate.rel));
+            text.append(&label);
+            if let Some(size) = candidate.size {
+                let size = gtk4::Label::new(Some(&glib::format_size(size)));
+                size.set_xalign(0.0);
+                size.add_css_class("dim-label");
+                size.add_css_class("caption");
+                text.append(&size);
+            }
+            row.append(&text);
+            list.append(&row);
+            checks.push(check);
+        }
+        let scroller = gtk4::ScrolledWindow::new();
+        scroller.set_hscrollbar_policy(gtk4::PolicyType::Never);
+        scroller.set_propagate_natural_height(true);
+        scroller.set_max_content_height(320);
+        scroller.set_child(Some(&list));
+        dialog.set_extra_child(Some(&scroller));
+        dialog.add_responses(&[("cancel", "_Cancel"), ("trash", "Move to _Trash")]);
+        dialog.set_response_appearance("trash", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        let any = |checks: &[gtk4::CheckButton]| checks.iter().any(|c| c.is_active());
+        dialog.set_response_enabled("trash", any(&checks));
+        let checks = Rc::new(checks);
+        for check in checks.iter() {
+            let d = dialog.clone();
+            let all = checks.clone();
+            check.connect_toggled(move |_| d.set_response_enabled("trash", any(&all)));
+        }
+        let state = self.clone();
+        let seq = self.doc_gen.get();
+        dialog.choose(Some(&self.window), gio::Cancellable::NONE, move |response| {
+            if response.as_str() != "trash" || !state.still_open(seq) {
+                return;
+            }
+            let picked: Vec<String> = found
+                .iter()
+                .zip(checks.iter())
+                .filter(|(_, c)| c.is_active())
+                .map(|((candidate, _), _)| candidate.rel.clone())
+                .collect();
+            state.trash_assets(picked);
+        });
+    }
+
+    /// Move `rels` (relative to the document's container) to the Trash. A
+    /// pack's entries are written out under the cache folder first and
+    /// trashed from there, then the pack is rewritten without them, so they
+    /// can be restored like any other file.
+    fn trash_assets(self: &Rc<Self>, rels: Vec<String>) {
+        let source = self.source.borrow().clone();
+        match source {
+            DocSource::Plain(doc) => {
+                let folder = doc.parent().map(Path::to_path_buf).unwrap_or_default();
+                self.trash_files(rels.iter().map(|r| folder.join(r)).collect());
+            }
+            DocSource::Bundle { dir, .. } => self.trash_files(rels.iter().map(|r| dir.join(r)).collect()),
+            DocSource::Pack { path, info } => {
+                let stamp = glib::DateTime::now_local()
+                    .and_then(|now| now.format("%Y%m%d-%H%M%S"))
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                let out = glib::user_cache_dir().join("bindle").join("removed-assets").join(stamp);
+                let mut moved = Vec::new();
+                for rel in &rels {
+                    let result = (|| -> std::io::Result<()> {
+                        let bytes = bundle::read_asset(&path, &info, rel, u64::MAX)
+                            .ok_or_else(|| std::io::Error::other("could not read it from the pack"))?;
+                        let name = rel.rsplit('/').next().unwrap_or(rel);
+                        fs::create_dir_all(&out)?;
+                        let file = out.join(bundle::unique_name(name, |c| out.join(c).exists()));
+                        fs::write(&file, bytes)?;
+                        gio::File::for_path(&file).trash(gio::Cancellable::NONE).map_err(std::io::Error::other)
+                    })();
+                    match result {
+                        Ok(()) => moved.push(rel.clone()),
+                        Err(err) => self.toast(&format!("Could not move {rel} to the Trash: {err}")),
+                    }
+                }
+                let _ = fs::remove_dir(&out);
+                if moved.is_empty() {
+                    return;
+                }
+                // Our own rewrite must not raise the changed-on-disk banner,
+                // but one that was already due (another program wrote the
+                // pack) must stay due.
+                let ours = self.disk_stamp.get() == doc::disk_stamp(&path);
+                match bundle::remove_from_pack(&path, &info, &moved) {
+                    Ok(entries) => {
+                        if let DocSource::Pack { info, .. } = &mut *self.source.borrow_mut() {
+                            info.entries = std::sync::Arc::new(entries);
+                        }
+                        if ours {
+                            self.restamp();
+                        }
+                        self.forget_asset_reads();
+                        self.render_preview(true);
+                        self.toast(&moved_message(moved.len()));
+                    }
+                    Err(err) => self.toast(&format!("Could not rewrite the pack: {err}")),
+                }
+            }
+            DocSource::None | DocSource::Odt { .. } => {}
+        }
+    }
+
+    fn trash_files(self: &Rc<Self>, files: Vec<PathBuf>) {
+        let state = self.clone();
+        glib::spawn_future_local(async move {
+            let mut moved = 0;
+            for path in files {
+                match gio::File::for_path(&path).trash_future(glib::Priority::DEFAULT).await {
+                    Ok(()) => moved += 1,
+                    Err(err) => {
+                        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        state.toast(&format!("Could not move {name} to the Trash: {err}"));
+                    }
+                }
+            }
+            if moved > 0 {
+                state.toast(&moved_message(moved));
+            }
+        });
     }
 
     fn paste_image_reference(&self, dest: &str) {
@@ -6914,6 +7129,7 @@ impl App {
             ("bold", enabled),
             ("italic", enabled),
             ("word-wrap", kind.wrap_lines()),
+            ("clean-assets", kind.is_markdown()),
         ] {
             if let Some(action) = self.window.lookup_action(name) {
                 if let Ok(action) = action.downcast::<gio::SimpleAction>() {
@@ -7041,6 +7257,29 @@ impl App {
     fn toast(&self, message: &str) {
         self.toasts.add_toast(adw::Toast::new(message));
     }
+}
+
+/// Pair each candidate with a thumbnail when its bytes decode as an image.
+fn with_thumbs(
+    found: Vec<cleanup::Candidate>,
+    read: impl Fn(&str) -> Option<Vec<u8>>,
+) -> Vec<(cleanup::Candidate, Option<preview::Thumb>)> {
+    found
+        .into_iter()
+        .map(|candidate| {
+            let ext = candidate.rel.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+            let image = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "tif", "tiff"].contains(&ext.as_str());
+            let thumb = image
+                .then(|| read(&candidate.rel))
+                .flatten()
+                .and_then(|bytes| preview::thumbnail_from_bytes(&bytes));
+            (candidate, thumb)
+        })
+        .collect()
+}
+
+fn moved_message(n: usize) -> String {
+    if n == 1 { "Moved 1 file to the Trash".to_string() } else { format!("Moved {n} files to the Trash") }
 }
 
 /// A gutter's measured width of `digits` eights in a given font.

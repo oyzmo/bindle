@@ -211,6 +211,30 @@ pub fn save_pack(
     Ok(names)
 }
 
+/// Rewrite the pack at `path` without the entries `rels` (relative to the
+/// pack's prefix, e.g. `assets/x.png`); everything else, the text included,
+/// is raw-copied as it is on disk. Returns the entry names now in it.
+pub fn remove_from_pack(path: &Path, info: &PackInfo, rels: &[String]) -> io::Result<Vec<String>> {
+    let mut old = ZipArchive::new(File::open(path)?).map_err(io::Error::other)?;
+    let drop: Vec<String> = rels.iter().map(|r| format!("{}{r}", info.prefix)).collect();
+    let mut names: Vec<String> = Vec::new();
+    crate::doc::replace_or_in_place(path, |file| {
+        names.clear();
+        let mut writer = ZipWriter::new(file);
+        for i in 0..old.len() {
+            let entry = old.by_index_raw(i).map_err(io::Error::other)?;
+            if drop.iter().any(|d| d == entry.name()) {
+                continue;
+            }
+            names.push(entry.name().to_string());
+            writer.raw_copy_file(entry).map_err(io::Error::other)?;
+        }
+        writer.finish().map_err(io::Error::other)?;
+        Ok(())
+    })?;
+    Ok(names)
+}
+
 /// Write a fresh .textpack containing `text` and `assets` (file name,
 /// content). Returns how the pack is laid out, so a window that switches to
 /// editing it needs no read back.
@@ -720,6 +744,24 @@ mod tests {
         // Long names are capped.
         let long = format!("/d/{}.md", "a".repeat(100));
         assert_eq!(name(Some(&long)), format!("{}-20261125-080905.png", "a".repeat(40)));
+    }
+
+    #[test]
+    fn removing_from_a_pack_keeps_everything_else() {
+        let dir = scratch("remove-from-pack");
+        let pack = dir.join("doc.textpack");
+        let assets = vec![
+            ("a.png".to_string(), AssetSource::Bytes(b"aaa".to_vec())),
+            ("b.png".to_string(), AssetSource::Bytes(b"bbb".to_vec())),
+        ];
+        let info = export_pack(&pack, "# Hi ![](assets/a.png)", &assets).unwrap();
+        let names = remove_from_pack(&pack, &info, &["assets/b.png".to_string()]).unwrap();
+        assert!(!names.iter().any(|n| n.ends_with("assets/b.png")));
+        let (text, info, _) = open_pack(&pack).unwrap();
+        assert_eq!(text, "# Hi ![](assets/a.png)");
+        assert_eq!(read_asset(&pack, &info, "assets/a.png", 100).as_deref(), Some(&b"aaa"[..]));
+        assert_eq!(read_asset(&pack, &info, "assets/b.png", 100), None);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn scratch(name: &str) -> PathBuf {

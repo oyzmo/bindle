@@ -87,7 +87,7 @@ Enter continues bullet/task/numbered lists (numbers increment) and adds new tabl
 <details>
 <summary><b>Images</b></summary>
 
-The picker inserts document-relative paths, pasting an image from the clipboard saves it into the document's `assets/` folder, and right-click → Copy Image in the preview copies the original back out. Web images render after you press **Load** on the per-document banner (configurable: Ask / Always / Never), and thumbnails are cached so typing stays snappy.
+The picker inserts document-relative paths, pasting an image from the clipboard saves it into the document's `assets/` folder (**Clean Up Assets…** in the menu finds the ones you no longer use and moves them to the Trash), and right-click → Copy Image in the preview copies the original back out. Web images render after you press **Load** on the per-document banner (configurable: Ask / Always / Never), and thumbnails are cached so typing stays snappy.
 
 </details>
 <details>
@@ -110,7 +110,7 @@ Undo/redo (<kbd>Ctrl</kbd>+<kbd>Z</kbd>), <kbd>Ctrl</kbd>+<kbd>B</kbd>/<kbd>Ctrl
 Grab the latest `.flatpak` bundle from [GitHub Releases](https://github.com/oyzmo/bindle/releases/latest) or [oyzmo.no/apps](https://oyzmo.no/apps) and install it:
 
 ```sh
-flatpak install bindle-1.41.2.flatpak
+flatpak install bindle-1.42.0.flatpak
 ```
 
 or just double-click it in GNOME Software. Works on any Linux desktop with Flatpak set up; the GNOME runtime is fetched automatically if you don't have it.
@@ -134,8 +134,8 @@ flatpak-builder --user --install --force-clean build-dir no.oyzmo.Bindle.yml
 First download the source zip (`bindle-<version>-src.zip`) from [GitHub Releases](https://github.com/oyzmo/bindle/releases/latest) or [oyzmo.no/apps](https://oyzmo.no/apps) and unpack it:
 
 ```sh
-unzip bindle-1.41.2-src.zip
-cd bindle-1.41.2
+unzip bindle-1.42.0-src.zip
+cd bindle-1.42.0
 ```
 
 Then run the helper menu:
