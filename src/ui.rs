@@ -2937,7 +2937,31 @@ impl App {
                 if let Err(why) = state.target_unchanged(&target).await {
                     return state.toast(why);
                 }
-                state.trash_assets(&target, picked);
+                let picked = match target.source.clone() {
+                    // A plain file's assets/ is shared with its folder:
+                    // check it again now, since another document there (a
+                    // Save As copy, say) may have started using one since
+                    // the scan. Bundles and packs own their files.
+                    DocSource::Plain(doc) => {
+                        let text = target.text.clone();
+                        let rescan = gio::spawn_blocking(move || cleanup::plain_unused(&doc, &text)).await;
+                        let Ok(Ok(unused)) = rescan else {
+                            return state.toast("Clean Up stopped — could not check the folder again");
+                        };
+                        let (keep, gone): (Vec<String>, Vec<String>) =
+                            picked.into_iter().partition(|rel| unused.iter().any(|c| &c.rel == rel));
+                        match gone.len() {
+                            0 => {}
+                            1 => state.toast("Kept 1 image — another document uses it now"),
+                            n => state.toast(&format!("Kept {n} images — other documents use them now")),
+                        }
+                        keep
+                    }
+                    _ => picked,
+                };
+                if !picked.is_empty() {
+                    state.trash_assets(&target, picked);
+                }
             });
         });
     }
