@@ -46,6 +46,11 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.40.11" date="2026-11-25">
+      <description>
+        <p>Preview images: the zoom cursor and click work over the whole picture, not just its top-left corner</p>
+      </description>
+    </release>
     <release version="1.40.10" date="2026-11-25">
       <description>
         <p>README: features as expandable sections</p>

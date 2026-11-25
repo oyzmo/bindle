@@ -1413,12 +1413,12 @@ impl App {
                     state.toggle_fold(key);
                     return;
                 }
-                // A click on an image opens the full-size original.
-                if n_press == 1 {
-                    if let Some(dest) = state.preview_image_at(offset) {
-                        state.view_image(&dest);
-                        return;
-                    }
+            }
+            // A click on an image opens the full-size original.
+            if n_press == 1 && !shift {
+                if let Some(dest) = state.preview_image_hit(x, y) {
+                    state.view_image(&dest);
+                    return;
                 }
             }
             let state = state.clone();
@@ -1438,8 +1438,7 @@ impl App {
         rclick.set_button(gdk::BUTTON_SECONDARY);
         let state = self.clone();
         rclick.connect_pressed(move |_, _, x, y| {
-            let Some(offset) = state.preview_offset_at(x, y) else { return };
-            if let Some(dest) = state.preview_image_at(offset) {
+            if let Some(dest) = state.preview_image_hit(x, y) {
                 image_menu.remove_all();
                 let item = gio::MenuItem::new(Some("_View Image"), None);
                 item.set_action_and_target_value(Some("win.view-image"), Some(&dest.to_variant()));
@@ -1449,7 +1448,7 @@ impl App {
                 image_menu.append_item(&item);
                 image_popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
                 image_popover.popup();
-            } else if let Some(dest) = state.preview_link_at(offset) {
+            } else if let Some(dest) = state.preview_offset_at(x, y).and_then(|o| state.preview_link_at(o)) {
                 state.save_attachment_dialog(&dest);
             }
         });
@@ -1491,7 +1490,7 @@ impl App {
                 }));
                 return;
             }
-            if offset.and_then(|o| state.preview_image_at(o)).is_some() {
+            if state.preview_image_hit(x, y).is_some() {
                 state.preview.set_cursor_from_name(Some("zoom-in"));
                 state.set_preview_tip(Some("Click to enlarge"));
                 return;
@@ -3136,12 +3135,34 @@ impl App {
             .map(|link| link.dest.clone())
     }
 
-    /// The reference of the image thumbnail at a preview char offset, if any.
-    fn preview_image_at(&self, offset: i32) -> Option<String> {
+    /// The image drawn under a preview widget point. Hit by geometry, not
+    /// `iter_at_location`: GTK counts only part of an embedded paintable
+    /// (its top-left corner) as "over text", so the zoom cursor and the
+    /// click used to work there alone.
+    fn preview_image_hit(&self, x: f64, y: f64) -> Option<String> {
+        let (bx, by) = self
+            .preview
+            .window_to_buffer_coords(gtk4::TextWindowType::Widget, x as i32, y as i32);
+        let (line, top) = self.preview.line_at_y(by);
+        let (_, height) = self.preview.line_yrange(&line);
+        if by < top || by >= top + height {
+            return None;
+        }
+        let start = line.offset() - line.line_offset();
+        let mut end = line;
+        if !end.ends_line() {
+            end.forward_to_line_end();
+        }
+        let buffer = self.preview.buffer();
         // Rendered in document order, so sorted by `offset`.
         let images = self.preview_images.borrow();
-        let i = images.partition_point(|image| image.offset < offset);
-        images.get(i).filter(|image| image.offset == offset).map(|image| image.dest.clone())
+        let first = images.partition_point(|image| image.offset < start);
+        images[first..].iter().take_while(|image| image.offset < end.offset()).find_map(|image| {
+            let iter = buffer.iter_at_offset(image.offset);
+            let loc = self.preview.iter_location(&iter);
+            let width = iter.paintable().map_or(loc.width(), |p| p.intrinsic_width()).max(loc.width());
+            (bx >= loc.x() && bx < loc.x() + width).then(|| image.dest.clone())
+        })
     }
 
     /// The image the preview selection consists of: exactly one thumbnail,
@@ -6018,7 +6039,9 @@ impl App {
         // over text" — exactly the case wanted here — so the line comes from
         // the y coordinate instead, and must actually span it (below the
         // last line `line_at_y` still answers with that line).
-        if beside_only && self.preview.iter_at_location(bx, by).is_some() {
+        if beside_only
+            && (self.preview.iter_at_location(bx, by).is_some() || self.preview_image_hit(x, y).is_some())
+        {
             return None;
         }
         let (iter, top) = self.preview.line_at_y(by);
