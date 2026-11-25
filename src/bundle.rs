@@ -412,6 +412,33 @@ pub fn copy_into_assets(src: &Path, assets: &Path) -> io::Result<String> {
     Ok(name)
 }
 
+/// Name for an image pasted at `stamp` (e.g. `20261125-080905`) into the
+/// document `doc`. A plain markdown file's `assets/` folder is shared with
+/// every other document in its folder, so the image carries the document's
+/// name to show whose it is: `temp.md` → `temp-<stamp>.png`. Without a
+/// document (unsaved) it is `pasted-<stamp>.png`. The name is kept to
+/// letters, digits, `-`, `_` and `.` so the link needs no escaping.
+pub fn pasted_image_name(doc: Option<&Path>, stamp: &str) -> String {
+    let stem: String = doc
+        .and_then(|d| d.file_stem())
+        .map(|s| s.to_string_lossy())
+        .unwrap_or_default()
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '-' })
+        .collect();
+    // Collapse runs of '-' and trim them (and dots) off the ends.
+    let mut clean = String::new();
+    for c in stem.chars() {
+        if !(c == '-' && clean.ends_with('-')) {
+            clean.push(c);
+        }
+    }
+    let clean: String = clean.trim_matches(|c| c == '-' || c == '.').chars().take(40).collect();
+    let clean = clean.trim_end_matches(|c| c == '-' || c == '.');
+    let prefix = if clean.is_empty() { "pasted" } else { clean };
+    format!("{prefix}-{stamp}.png")
+}
+
 /// Write `bytes` as a new file named `name` (renumbered past existing ones)
 /// inside the `assets` directory, creating it if needed; returns the stored
 /// name. Nothing already there is ever overwritten.
@@ -677,6 +704,23 @@ pub fn rewrite_asset_dests(markdown: &str, renames: &[(String, String)]) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pasted_images_carry_the_document_name() {
+        let name = |doc: Option<&str>| pasted_image_name(doc.map(Path::new), "20261125-080905");
+        assert_eq!(name(Some("/home/u/Documents/temp.md")), "temp-20261125-080905.png");
+        assert_eq!(name(None), "pasted-20261125-080905.png");
+        // Spaces and link-hostile characters become single dashes; æøå stay.
+        assert_eq!(
+            name(Some("/d/20261103 - Referat (møte).md")),
+            "20261103-Referat-møte-20261125-080905.png"
+        );
+        // Nothing usable left ⇒ the generic prefix.
+        assert_eq!(name(Some("/d/???.md")), "pasted-20261125-080905.png");
+        // Long names are capped.
+        let long = format!("/d/{}.md", "a".repeat(100));
+        assert_eq!(name(Some(&long)), format!("{}-20261125-080905.png", "a".repeat(40)));
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir()

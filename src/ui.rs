@@ -323,6 +323,7 @@ pub struct App {
     /// merging with other instances' saves (`Settings::merge_lists`).
     list_base: RefCell<ListBase>,
     show_attachment_note: Cell<bool>,
+    show_paste_note: Cell<bool>,
     follow_cursor: Cell<bool>,
     keyword_highlight: Cell<bool>,
     /// Per-line highlight signatures as of the last `apply_highlight`, so the
@@ -1024,6 +1025,7 @@ impl App {
             multiple_instances: Cell::new(settings.multiple_instances),
             list_base: RefCell::new(ListBase::of(&settings)),
             show_attachment_note: Cell::new(settings.show_attachment_note),
+            show_paste_note: Cell::new(settings.show_paste_note),
             follow_cursor: Cell::new(settings.follow_cursor),
             keyword_highlight: Cell::new(settings.keyword_highlight),
             hl_sigs: Rc::new(RefCell::new(Vec::new())),
@@ -2555,12 +2557,19 @@ impl App {
     /// a plain file's or bundle's `assets/` directly; a pack, an imported
     /// .odt or an unsaved document stage them in memory until it is saved
     /// (Save As then writes them out, see `write_to`).
-    fn store_pasted_image(&self, png: &[u8]) {
-        let name = glib::DateTime::now_local()
-            .and_then(|now| now.format("pasted-%Y%m%d-%H%M%S.png"))
+    fn store_pasted_image(self: &Rc<Self>, png: &[u8]) {
+        let stamp = glib::DateTime::now_local()
+            .and_then(|now| now.format("%Y%m%d-%H%M%S"))
             .map(|s| s.to_string())
-            .unwrap_or_else(|_| "pasted.png".to_string());
+            .unwrap_or_else(|_| "image".to_string());
         let source = self.source.borrow().clone();
+        // Only a plain file's `assets/` is shared with other documents; a
+        // bundle's or pack's belongs to it alone.
+        let doc = match &source {
+            DocSource::Plain(doc) => Some(doc.as_path()),
+            _ => None,
+        };
+        let name = bundle::pasted_image_name(doc, &stamp);
         let assets_dir = match &source {
             DocSource::Bundle { dir, .. } => dir.join("assets"),
             DocSource::Plain(doc) => match doc.parent() {
@@ -2580,9 +2589,39 @@ impl App {
             }
         };
         match bundle::write_into_assets(&name, png, &assets_dir) {
-            Ok(stored) => self.paste_image_reference(&format!("assets/{stored}")),
+            Ok(stored) => {
+                self.paste_image_reference(&format!("assets/{stored}"));
+                if matches!(source, DocSource::Plain(_)) {
+                    self.explain_pasted_image(&stored);
+                }
+            }
             Err(err) => self.toast(&format!("Could not store the image: {err}")),
         }
+    }
+
+    /// One-time note after the first image pasted into a plain markdown
+    /// file: it went into a file beside the document, which a copy of the
+    /// .md alone leaves behind.
+    fn explain_pasted_image(self: &Rc<Self>, stored: &str) {
+        if !self.show_paste_note.get() {
+            return;
+        }
+        let dialog = adw::AlertDialog::new(
+            Some("Image Saved Beside the Document"),
+            Some(&format!(
+                "The image was saved as assets/{stored} in the document's folder, and the \
+                 document links to it. When you copy or move the document, take the assets \
+                 folder along — or use Save As → TextPack to keep the text and its images \
+                 in a single file."
+            )),
+        );
+        dialog.add_responses(&[("ok", "_OK")]);
+        dialog.set_default_response(Some("ok"));
+        dialog.set_close_response("ok");
+        // Shown once: the setting is cleared as it appears, not on a reply.
+        self.show_paste_note.set(false);
+        self.persist_settings();
+        dialog.present(Some(&self.window));
     }
 
     fn paste_image_reference(&self, dest: &str) {
@@ -5788,6 +5827,13 @@ impl App {
                 continue;
             }
             let name = key.strip_prefix("assets/").unwrap_or(&key);
+            // Pasted before the document had a name: it gets one now, since
+            // this `assets/` is shared with the other files in the folder.
+            let named = match name.strip_prefix("pasted-").and_then(|r| r.strip_suffix(".png")) {
+                Some(stamp) => bundle::pasted_image_name(Some(path), stamp),
+                None => name.to_string(),
+            };
+            let name = named.as_str();
             let stored = match bundle::write_into_assets(name, &bytes, &assets) {
                 Ok(stored) => stored,
                 Err(err) => {
@@ -5798,7 +5844,7 @@ impl App {
                 }
             };
             written.push(assets.join(&stored));
-            if stored != name {
+            if stored != key.strip_prefix("assets/").unwrap_or(&key) {
                 renames.push((key.clone(), stored));
             }
         }
@@ -6920,6 +6966,7 @@ impl App {
             open_last: self.open_last.get(),
             multiple_instances: self.multiple_instances.get(),
             show_attachment_note: self.show_attachment_note.get(),
+            show_paste_note: self.show_paste_note.get(),
             follow_cursor: self.follow_cursor.get(),
             keyword_highlight: self.keyword_highlight.get(),
             line_numbers: self.line_numbers.get(),

@@ -46,6 +46,9 @@ pub struct Settings {
     pub multiple_instances: bool,
     /// Explain the read-only pack-attachment model before the first open.
     pub show_attachment_note: bool,
+    /// Explain where a pasted image went, once, on the first paste into a
+    /// plain markdown file.
+    pub show_paste_note: bool,
     /// Preview scrolls to follow the editor cursor; false leaves it still.
     pub follow_cursor: bool,
     /// Keyword highlighting in the editor (markdown, JSON, YAML, TOML).
@@ -358,6 +361,7 @@ impl Default for Settings {
             open_last: true,
             multiple_instances: false,
             show_attachment_note: true,
+            show_paste_note: true,
             follow_cursor: true,
             keyword_highlight: true,
             line_numbers: false,

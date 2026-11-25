@@ -46,6 +46,14 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.41.0" date="2026-11-25">
+      <description>
+        <ul>
+          <li>Pasted images are named after their document</li>
+          <li>First image pasted into a plain file explains where it was saved</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.40.12" date="2026-11-25">
       <description>
         <ul>
