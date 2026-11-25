@@ -142,7 +142,10 @@ pub struct App {
     /// The last "Saved …" toast, dismissed when the next save shows its own.
     save_toast: RefCell<Option<adw::Toast>>,
     /// The "no longer used · Clean Up…" suggestion, replaced by the next.
-    cleanup_toast: RefCell<Option<adw::Toast>>,
+    cleanup_toast: RefCell<Option<(adw::Toast, Option<PathBuf>)>>,
+    /// Bumped by every save: a suggestion scan from an earlier save that
+    /// lands after a newer one is dropped (its target is stale).
+    cleanup_seq: Cell<u64>,
     /// File names the document linked to at its last load or save; a save
     /// that drops some suggests Clean Up Assets (`suggest_cleanup`).
     saved_refs: RefCell<HashSet<String>>,
@@ -949,6 +952,7 @@ impl App {
             toasts,
             save_toast: RefCell::new(None),
             cleanup_toast: RefCell::new(None),
+            cleanup_seq: Cell::new(0),
             saved_refs: RefCell::new(HashSet::new()),
             suggest_cleanup: Cell::new(settings.suggest_cleanup),
             title,
@@ -1910,7 +1914,7 @@ impl App {
             action.set_state(&enabled.to_variant());
             state.suggest_cleanup.set(enabled);
             if !enabled {
-                if let Some(old) = state.cleanup_toast.take() {
+                if let Some((old, _)) = state.cleanup_toast.take() {
                     old.dismiss();
                 }
             }
@@ -2687,7 +2691,23 @@ impl App {
         match source {
             DocSource::None => Err("Save the document first"),
             DocSource::Odt { .. } => Err("An imported document has no assets folder"),
-            source => Ok(CleanupTarget { source, text: self.text().to_string(), stamp: self.disk_stamp.get() }),
+            source => Ok(CleanupTarget {
+                source,
+                text: self.text().to_string(),
+                stamp: self.disk_stamp.get(),
+                doc_gen: self.doc_gen.get(),
+            }),
+        }
+    }
+
+    /// File names the document links to, for the save-time suggestion; empty
+    /// for non-markdown and past `HIGHLIGHT_MAX_BYTES`, where the parse on
+    /// every save would cost more than the suggestion is worth.
+    fn asset_refs(&self, text: &str) -> HashSet<String> {
+        if self.doc_kind().is_markdown() && text.len() <= HIGHLIGHT_MAX_BYTES {
+            cleanup::referenced_names(text)
+        } else {
+            HashSet::new()
         }
     }
 
@@ -2697,24 +2717,31 @@ impl App {
     }
 
     /// Whether `target` is still the document as it was saved, so its scan
-    /// result may be acted on. In the window: not edited or re-saved since
-    /// (a Save As elsewhere counts as moving on, and is then checked like
-    /// any closed document). Not in the window: its file on disk is
-    /// untouched, stat'ed on a worker thread since it may sit on a share.
+    /// result may be acted on. Not in the window: its file on disk is
+    /// untouched (stat'ed on a worker thread, it may sit on a share) — unless
+    /// the window still holds the same loaded document under another path,
+    /// i.e. a Save As since, whose new file the scan never saw. In the
+    /// window (also when it was reopened during that stat): not edited or
+    /// re-saved since.
     async fn target_unchanged(&self, target: &CleanupTarget) -> Result<(), &'static str> {
-        if self.shows_target(target) {
-            if self.modified.get() {
-                return Err("Clean Up stopped — save the document first");
+        if !self.shows_target(target) {
+            if self.doc_gen.get() == target.doc_gen {
+                return Err("Clean Up stopped — the document was saved elsewhere");
             }
-            if self.disk_stamp.get() != target.stamp {
-                return Err("Clean Up stopped — the document changed");
+            let Some(file) = target.source.text_file() else { return Err("Clean Up stopped") };
+            let now = gio::spawn_blocking(move || doc::disk_stamp(&file)).await.ok().flatten();
+            if now.is_none() || now != target.stamp {
+                return Err("Clean Up stopped — the document changed on disk");
             }
-            return Ok(());
+            if !self.shows_target(target) {
+                return Ok(());
+            }
         }
-        let Some(file) = target.source.text_file() else { return Err("Clean Up stopped") };
-        let now = gio::spawn_blocking(move || doc::disk_stamp(&file)).await.ok().flatten();
-        if now.is_none() || now != target.stamp {
-            return Err("Clean Up stopped — the document changed on disk");
+        if self.modified.get() {
+            return Err("Clean Up stopped — save the document first");
+        }
+        if self.disk_stamp.get() != target.stamp {
+            return Err("Clean Up stopped — the document changed");
         }
         Ok(())
     }
@@ -2753,9 +2780,14 @@ impl App {
     /// window has moved on to another document (save, then open).
     fn suggest_cleanup(self: &Rc<Self>, target: CleanupTarget, dropped: HashSet<String>) {
         let scan = cleanup_scan(&target, false);
+        let seq = self.cleanup_seq.get();
         let state = self.clone();
         glib::spawn_future_local(async move {
             let Ok(Ok(found)) = gio::spawn_blocking(scan).await else { return };
+            // Switched off, or a newer save made this target stale.
+            if !state.suggest_cleanup.get() || state.cleanup_seq.get() != seq {
+                return;
+            }
             let unused: HashSet<String> = found
                 .iter()
                 .map(|(c, _)| c.rel.rsplit('/').next().unwrap_or(&c.rel).to_string())
@@ -2764,7 +2796,7 @@ impl App {
             if unused.is_empty() {
                 return;
             }
-            let what = match (unused.len(), matches!(target.source, DocSource::Plain(_))) {
+            let what = match (unused.len(), unused.iter().all(|n| cleanup::is_image_name(n))) {
                 (1, true) => "1 image".to_string(),
                 (1, false) => "1 file".to_string(),
                 (n, true) => format!("{n} images"),
@@ -2776,10 +2808,11 @@ impl App {
                 .and_then(Path::file_name)
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            if let Some(old) = state.cleanup_toast.take() {
+            if let Some((old, _)) = state.cleanup_toast.take() {
                 old.dismiss();
             }
             let toast = adw::Toast::new(&format!("{what} no longer used in {name}"));
+            let container = target.source.container().map(Path::to_path_buf);
             toast.set_use_markup(false);
             toast.set_button_label(Some("Clean Up…"));
             let weak = Rc::downgrade(&state);
@@ -2789,7 +2822,7 @@ impl App {
                 }
             });
             state.toasts.add_toast(toast.clone());
-            state.cleanup_toast.replace(Some(toast));
+            state.cleanup_toast.replace(Some((toast, container)));
         });
     }
 
@@ -5594,7 +5627,7 @@ impl App {
         self.loading.set(false);
         *self.source.borrow_mut() = source;
         self.staged_assets.borrow_mut().clear();
-        *self.saved_refs.borrow_mut() = cleanup::referenced_names(text);
+        *self.saved_refs.borrow_mut() = self.asset_refs(text);
         self.forget_asset_reads();
         self.restore_position();
         {
@@ -6058,9 +6091,20 @@ impl App {
         self.update_title();
         let name = shown.file_name().map(|n| n.to_string_lossy().to_string());
         self.toast_saved(&name.unwrap_or_default());
+        // A newer save of the same document makes its pending offer stale;
+        // another document's offer stays.
+        self.cleanup_seq.set(self.cleanup_seq.get().wrapping_add(1));
+        let saved = self.source.borrow().container().map(Path::to_path_buf);
+        let stale = matches!(&*self.cleanup_toast.borrow(), Some((_, c)) if *c == saved);
+        if stale {
+            if let Some((old, _)) = self.cleanup_toast.take() {
+                old.dismiss();
+            }
+        }
         let text = self.text();
-        let dropped = cleanup::dropped(&self.saved_refs.borrow(), &text);
-        *self.saved_refs.borrow_mut() = cleanup::referenced_names(&text);
+        let now = self.asset_refs(&text);
+        let dropped = cleanup::dropped(&self.saved_refs.borrow(), &now, &text);
+        *self.saved_refs.borrow_mut() = now;
         // Captured before `then`, which may open another document: the
         // suggestion keeps pointing at this one.
         if !dropped.is_empty() && self.suggest_cleanup.get() && self.doc_kind().is_markdown() {
@@ -7461,6 +7505,9 @@ struct CleanupTarget {
     source: DocSource,
     text: String,
     stamp: Option<doc::DiskStamp>,
+    /// `doc_gen` at capture: unchanged while the window has loaded nothing
+    /// since, which is how a Save As (rebinding, not loading) is told apart.
+    doc_gen: u64,
 }
 
 /// The scan for `target`, to run on a worker thread; thumbnails only when
@@ -7500,9 +7547,7 @@ fn with_thumbs(
     found
         .into_iter()
         .map(|candidate| {
-            let ext = candidate.rel.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-            let image = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "tif", "tiff"].contains(&ext.as_str());
-            let thumb = image
+            let thumb = cleanup::is_image_name(&candidate.rel)
                 .then(|| read(&candidate.rel))
                 .flatten()
                 .and_then(|bytes| preview::thumbnail_from_bytes(&bytes));

@@ -77,11 +77,18 @@ pub fn referenced_names(text: &str) -> HashSet<String> {
 
 /// Of the file names the document linked to at its last load or save
 /// (`before`), those `text` no longer mentions anywhere — what a save just
-/// left unused. Same conservative test as the scan: a name still written
-/// anywhere in the text (code block, raw HTML) counts as used.
-pub fn dropped(before: &HashSet<String>, text: &str) -> HashSet<String> {
-    let mentions = Mentions::new(vec![text.to_string()]);
+/// left unused. `now` is `referenced_names(text)`, passed in so a save
+/// parses the document once. Same conservative test as the scan: a name
+/// still written anywhere in the text (code block, raw HTML) counts as used.
+pub fn dropped(before: &HashSet<String>, now: &HashSet<String>, text: &str) -> HashSet<String> {
+    let mentions = Mentions { texts: vec![text.to_string()], linked: now.clone() };
     before.iter().filter(|name| !mentions.mention(name)).cloned().collect()
+}
+
+/// Whether a file name looks like an image (by extension).
+pub fn is_image_name(name: &str) -> bool {
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "tif", "tiff"].contains(&ext.as_str())
 }
 
 fn percent_encode(name: &str) -> String {
@@ -310,11 +317,12 @@ mod tests {
         let set = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<HashSet<_>>();
         assert_eq!(before, set(&["a.png", "b c.png", "d.pdf"]));
         // Removed link, removed encoded link; d.pdf survives in a code span.
-        let text = "![a](assets/a.png) `files/d.pdf`";
-        assert_eq!(dropped(&before, text), set(&["b c.png"]));
+        let check = |text: &str| dropped(&before, &referenced_names(text), text);
+        assert_eq!(check("![a](assets/a.png) `files/d.pdf`"), set(&["b c.png"]));
         // Nothing removed, nothing dropped.
-        assert!(dropped(&before, "![a](assets/a.png) ![b](assets/b%20c.png) [d](files/d.pdf)").is_empty());
-        assert_eq!(dropped(&before, ""), before);
+        assert!(check("![a](assets/a.png) ![b](assets/b%20c.png) [d](files/d.pdf)").is_empty());
+        assert_eq!(check(""), before);
+        assert!(is_image_name("x.PNG") && !is_image_name("d.pdf"));
     }
 
     #[test]
