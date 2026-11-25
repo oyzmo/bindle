@@ -2679,12 +2679,27 @@ impl App {
     }
 
     fn clean_assets_dialog(self: &Rc<Self>, found: Vec<(cleanup::Candidate, Option<preview::Thumb>)>, plain: bool) {
-        let body = if plain {
-            "Images pasted into this document that no file in its folder uses."
+        let pack = matches!(*self.source.borrow(), DocSource::Pack { .. });
+        let (title, body) = if plain {
+            (
+                "Remove Unused Images?",
+                "These pasted images are not used by this document or by any other file in its \
+                 folder.\n\nTicked images go to the Trash, so you can get them back.",
+            )
+        } else if pack {
+            (
+                "Remove Unused Files?",
+                "The document no longer uses these files, but the pack still carries them.\n\n\
+                 Ticked files are taken out and put in the Trash, so you can get them back.",
+            )
         } else {
-            "Nothing in the document refers to these files."
+            (
+                "Remove Unused Files?",
+                "The document no longer uses these files in its assets folder.\n\n\
+                 Ticked files go to the Trash, so you can get them back.",
+            )
         };
-        let dialog = adw::AlertDialog::new(Some("Unused Assets"), Some(body));
+        let dialog = adw::AlertDialog::new(Some(title), Some(body));
         let list = gtk4::ListBox::new();
         list.add_css_class("boxed-list");
         list.set_selection_mode(gtk4::SelectionMode::None);

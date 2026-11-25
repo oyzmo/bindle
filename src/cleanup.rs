@@ -11,8 +11,9 @@
 //!   the text doesn't mention is listed.
 //! - **Plain file**: `assets/` is shared by every document in the folder and
 //!   whatever else lives there, so only images *pasted into this document*
-//!   (named `<doc-stem>-<stamp>.png` by `bundle::pasted_image_name`) are
-//!   considered, and only when no text file in the folder mentions them.
+//!   (named `<doc-stem>-<stamp>.png` by `bundle::pasted_image_name`) and
+//!   Bindle's generic `pasted-<stamp>.png` are considered, and only when no
+//!   text file in the folder mentions them.
 
 use std::collections::HashSet;
 use std::fs;
@@ -103,6 +104,20 @@ pub fn pasted_by(doc: &Path, name: &str) -> bool {
     else {
         return false;
     };
+    is_stamp(rest)
+}
+
+/// Whether `name` is an image Bindle pasted under the generic name —
+/// `pasted-<stamp>.png`, from before pasted images were named after their
+/// document, or a paste into a document whose name left no usable stem.
+/// Only Bindle makes these, but they can belong to any document in the
+/// folder, so `plain_unused` lists them only when no file there uses them.
+pub fn generic_paste(name: &str) -> bool {
+    name.strip_prefix("pasted-").and_then(|r| r.strip_suffix(".png")).is_some_and(is_stamp)
+}
+
+/// `YYYYMMDD-HHMMSS`, optionally numbered (`-2`).
+fn is_stamp(rest: &str) -> bool {
     let b = rest.as_bytes();
     if b.len() < 15 {
         return false;
@@ -153,7 +168,7 @@ pub fn plain_unused(doc: &Path, text: &str) -> Result<Vec<Candidate>, ScanError>
         for entry in dir.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             let Ok(meta) = entry.metadata() else { continue };
-            if meta.is_file() && pasted_by(doc, &name) {
+            if meta.is_file() && (pasted_by(doc, &name) || generic_paste(&name)) {
                 own.push((format!("assets/{name}"), meta.len()));
             }
         }
@@ -269,6 +284,9 @@ mod tests {
         assert!(!pasted_by(doc, "temp-20261125-20261125-082145.png"));
         // A stem that leaves nothing owns nothing.
         assert!(!pasted_by(Path::new("/d/???.md"), "pasted-20261125-082145.png"));
+        assert!(generic_paste("pasted-20261125-082145.png"));
+        assert!(generic_paste("pasted-20261125-082145-3.png"));
+        assert!(!generic_paste("pasted-holiday.png"));
     }
 
     #[test]
@@ -282,16 +300,21 @@ mod tests {
             "temp-20261125-000003.png", // a sibling document mentions it
             "temp-20261125-000004.png", // a document in a subfolder does
             "temp-20261125-000005.png", // nobody
+            "pasted-20261125-000006.png", // generic paste, nobody
+            "pasted-20261125-000007.png", // generic paste, a sibling uses it
             "logo.png",                 // not ours
         ] {
             fs::write(dir.join("assets").join(name), b"x").unwrap();
         }
-        fs::write(dir.join("other.md"), "![](assets/temp-20261125-000003.png)").unwrap();
+        fs::write(dir.join("other.md"), "![](assets/temp-20261125-000003.png) ![](assets/pasted-20261125-000007.png)").unwrap();
         fs::create_dir_all(dir.join("sub")).unwrap();
         fs::write(dir.join("sub/page.html"), "<img src=\"../assets/temp-20261125-000004.png\">").unwrap();
         let found = plain_unused(&doc, "![](assets/temp-20261125-000002.png)").unwrap();
         let rels: Vec<_> = found.iter().map(|c| c.rel.as_str()).collect();
-        assert_eq!(rels, ["assets/temp-20261125-000001.png", "assets/temp-20261125-000005.png"]);
+        assert_eq!(
+            rels,
+            ["assets/pasted-20261125-000006.png", "assets/temp-20261125-000001.png", "assets/temp-20261125-000005.png"]
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
