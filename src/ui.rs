@@ -2609,21 +2609,13 @@ impl App {
         if !self.show_paste_note.get() || stored.is_empty() {
             return;
         }
-        let (title, what, them) = match stored {
-            [one] => ("Image Saved Beside the Document", format!("The image was saved as assets/{one}"), "it"),
-            many => (
-                "Images Saved Beside the Document",
-                format!("The {} pasted images were saved in the assets folder", many.len()),
-                "them",
-            ),
+        let title = match stored {
+            [_] => "Image Saved in the Assets Folder",
+            _ => "Images Saved in the Assets Folder",
         };
         let dialog = adw::AlertDialog::new(
             Some(title),
-            Some(&format!(
-                "{what} in the document's folder, and the document links to {them}. When you \
-                 copy or move the document, take the assets folder along — or use Save As → \
-                 TextPack to keep the text and its images in a single file."
-            )),
+            Some("Keep the assets folder with the document when you move it, or save as TextPack to keep everything in one file."),
         );
         dialog.add_responses(&[("ok", "_OK")]);
         dialog.set_default_response(Some("ok"));

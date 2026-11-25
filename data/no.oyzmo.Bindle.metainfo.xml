@@ -46,6 +46,11 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.41.2" date="2026-11-25">
+      <description>
+        <p>Shorter note after pasting an image</p>
+      </description>
+    </release>
     <release version="1.41.1" date="2026-11-25">
       <description>
         <ul>
