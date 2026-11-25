@@ -46,9 +46,12 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
-    <release version="1.43.0" date="2026-11-25">
+    <release version="1.43.1" date="2026-11-25">
       <description>
-        <p>After a save that removes images, Bindle offers to clean up the ones no longer used (Menu → Suggest Clean Up on Save)</p>
+        <ul>
+          <li>After a save that removes images, Bindle offers to clean up the ones no longer used (Menu → Suggest Clean Up on Save)</li>
+          <li>The clean-up offer also comes when saving from the Save / Discard question before opening another file</li>
+        </ul>
       </description>
     </release>
     <release version="1.42.6" date="2026-11-25">
