@@ -2683,8 +2683,8 @@ impl App {
         let (title, body) = if plain {
             (
                 "Remove Unused Images?",
-                "These pasted images are not used by this document or by any other file in its \
-                 folder.\n\nTicked images go to the Trash, so you can get them back.",
+                "These pasted images are not used by this document or by any other document in \
+                 its folder.\n\nTicked images go to the Trash, so you can get them back.",
             )
         } else if pack {
             (
