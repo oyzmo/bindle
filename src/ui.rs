@@ -1380,8 +1380,25 @@ impl App {
         // line selection — picks it from anywhere on the line.
         let click = gtk4::GestureClick::new();
         click.set_button(gdk::BUTTON_PRIMARY);
+        // An image opens on *release* of a still click, so a press on it can
+        // still start a drag-selection (e.g. to select it for Ctrl+C).
+        let image_press: Rc<Cell<Option<(f64, f64)>>> = Rc::new(Cell::new(None));
+        let state = self.clone();
+        let pending = image_press.clone();
+        click.connect_released(move |_, n_press, x, y| {
+            let Some((px, py)) = pending.take() else { return };
+            if n_press != 1 || (x - px).hypot(y - py) > 4.0 {
+                return;
+            }
+            if let Some((_, dest)) = state.preview_image_hit(x, y) {
+                state.view_image(&dest);
+            }
+        });
+        let pending = image_press.clone();
+        click.connect_stopped(move |_| pending.set(None));
         let state = self.clone();
         click.connect_pressed(move |gesture, n_press, x, y| {
+            image_press.set(None);
             let shift = gesture.current_event_state().contains(gdk::ModifierType::SHIFT_MASK);
             let beside = state.preview_line_beside(x, y);
             let lines = match n_press {
@@ -1394,15 +1411,18 @@ impl App {
                 glib::idle_add_local_once(move || state.pick_from_preview(lines, shift));
                 return;
             }
-            // Glyphs and links act only when hit, not as the nearest character.
-            if let Some(offset) = state.preview_offset_at(x, y).filter(|_| beside.is_none()) {
-                // Ctrl+click on a link opens it with the system default app.
-                if gesture.current_event_state().contains(gdk::ModifierType::CONTROL_MASK) {
-                    if let Some(dest) = state.preview_link_at(offset) {
-                        state.open_link(&dest);
-                        return;
-                    }
+            let image = state.preview_image_hit(x, y);
+            // Ctrl+click on a link opens it with the system default app — also
+            // anywhere on a linked image, not just where GTK counts it as text.
+            if gesture.current_event_state().contains(gdk::ModifierType::CONTROL_MASK) && beside.is_none() {
+                let offset = image.as_ref().map(|(o, _)| *o).or_else(|| state.preview_offset_at(x, y));
+                if let Some(dest) = offset.and_then(|o| state.preview_link_at(o)) {
+                    state.open_link(&dest);
+                    return;
                 }
+            }
+            // Glyphs act only when hit, not as the nearest character.
+            if let Some(offset) = state.preview_offset_at(x, y).filter(|_| beside.is_none()) {
                 // A click on a task list checkbox ticks it in the source.
                 if let Some(checkbox) = state.preview_checkbox_at(offset) {
                     state.toggle_task(&checkbox);
@@ -1414,12 +1434,10 @@ impl App {
                     return;
                 }
             }
-            // A click on an image opens the full-size original.
-            if n_press == 1 && !shift {
-                if let Some(dest) = state.preview_image_hit(x, y) {
-                    state.view_image(&dest);
-                    return;
-                }
+            // A click on an image opens the full-size original (on release).
+            if image.is_some() && n_press == 1 && !shift {
+                image_press.set(Some((x, y)));
+                return;
             }
             let state = state.clone();
             glib::idle_add_local_once(move || state.sync_editor_to_preview(x, y));
@@ -1438,7 +1456,7 @@ impl App {
         rclick.set_button(gdk::BUTTON_SECONDARY);
         let state = self.clone();
         rclick.connect_pressed(move |_, _, x, y| {
-            if let Some(dest) = state.preview_image_hit(x, y) {
+            if let Some((_, dest)) = state.preview_image_hit(x, y) {
                 image_menu.remove_all();
                 let item = gio::MenuItem::new(Some("_View Image"), None);
                 item.set_action_and_target_value(Some("win.view-image"), Some(&dest.to_variant()));
@@ -1468,7 +1486,18 @@ impl App {
         let motion = gtk4::EventControllerMotion::new();
         let state = self.clone();
         motion.connect_motion(move |_, x, y| {
-            if let Some((start, end)) = state.preview_line_at(x, y, true) {
+            // Each hit is computed once per motion event.
+            let image = state.preview_image_hit(x, y);
+            let offset = state.preview_offset_at(x, y);
+            let beside = if image.is_none() && offset.is_none() {
+                let (_, by) = state
+                    .preview
+                    .window_to_buffer_coords(gtk4::TextWindowType::Widget, x as i32, y as i32);
+                state.preview_line_span(by)
+            } else {
+                None
+            };
+            if let Some((start, end)) = beside {
                 if state.preview_source_lines(start, end).is_some() {
                     // Shaded only where the preview is the main view: in the
                     // side panel the shade just flickers along under the
@@ -1480,7 +1509,6 @@ impl App {
                 }
             }
             state.set_line_hover(None);
-            let offset = state.preview_offset_at(x, y);
             if let Some(checkbox) = offset.and_then(|o| state.preview_checkbox_at(o)) {
                 state.preview.set_cursor_from_name(Some("pointer"));
                 state.set_preview_tip(Some(if checkbox.checked {
@@ -1490,9 +1518,13 @@ impl App {
                 }));
                 return;
             }
-            if state.preview_image_hit(x, y).is_some() {
+            if let Some((image_offset, _)) = image {
                 state.preview.set_cursor_from_name(Some("zoom-in"));
-                state.set_preview_tip(Some("Click to enlarge"));
+                let tip = match state.preview_link_at(image_offset) {
+                    Some(dest) => format!("Click to enlarge, Ctrl+click to open {dest}"),
+                    None => "Click to enlarge".to_string(),
+                };
+                state.set_preview_tip(Some(&tip));
                 return;
             }
             let link = offset.and_then(|o| state.preview_link_at(o));
@@ -3135,11 +3167,13 @@ impl App {
             .map(|link| link.dest.clone())
     }
 
-    /// The image drawn under a preview widget point. Hit by geometry, not
-    /// `iter_at_location`: GTK counts only part of an embedded paintable
-    /// (its top-left corner) as "over text", so the zoom cursor and the
-    /// click used to work there alone.
-    fn preview_image_hit(&self, x: f64, y: f64) -> Option<String> {
+    /// The image drawn under a preview widget point, as (char offset, dest).
+    /// Hit by geometry, not `iter_at_location`: GTK counts only part of an
+    /// embedded paintable (its top-left corner) as "over text", so the zoom
+    /// cursor and the click used to work there alone. Tested against each
+    /// image's own rectangle — a buffer line can wrap onto several rows, and
+    /// its y range includes the paragraph spacing.
+    fn preview_image_hit(&self, x: f64, y: f64) -> Option<(i32, String)> {
         let (bx, by) = self
             .preview
             .window_to_buffer_coords(gtk4::TextWindowType::Widget, x as i32, y as i32);
@@ -3160,8 +3194,10 @@ impl App {
         images[first..].iter().take_while(|image| image.offset < end.offset()).find_map(|image| {
             let iter = buffer.iter_at_offset(image.offset);
             let loc = self.preview.iter_location(&iter);
-            let width = iter.paintable().map_or(loc.width(), |p| p.intrinsic_width()).max(loc.width());
-            (bx >= loc.x() && bx < loc.x() + width).then(|| image.dest.clone())
+            let (w, h) = iter.paintable().map_or((0, 0), |p| (p.intrinsic_width(), p.intrinsic_height()));
+            let (width, height) = (w.max(loc.width()), h.max(loc.height()));
+            let inside = bx >= loc.x() && bx < loc.x() + width && by >= loc.y() && by < loc.y() + height;
+            inside.then(|| (image.offset, image.dest.clone()))
         })
     }
 
@@ -6044,6 +6080,12 @@ impl App {
         {
             return None;
         }
+        self.preview_line_span(by)
+    }
+
+    /// The char range (newline excluded) of the preview line spanning buffer
+    /// y coordinate `by`, if any.
+    fn preview_line_span(&self, by: i32) -> Option<(i32, i32)> {
         let (iter, top) = self.preview.line_at_y(by);
         let (_, height) = self.preview.line_yrange(&iter);
         if by < top || by >= top + height {
