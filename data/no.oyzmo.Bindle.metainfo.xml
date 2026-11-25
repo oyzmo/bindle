@@ -46,7 +46,7 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
-    <release version="1.42.3" date="2026-11-25">
+    <release version="1.42.4" date="2026-11-25">
       <description>
         <ul>
           <li>Clean Up Assets… finds files in the assets folder that nothing uses any more and moves the ones you pick to the Trash</li>
@@ -56,6 +56,7 @@
           <li>Ctrl+click anywhere on a linked image opens the link</li>
           <li>README: features as expandable sections, with the screenshot from data/screenshots</li>
           <li>bindle.sh: option 17 updates the GitHub page without a release</li>
+          <li>Clean Up Assets asks you to save first and stops if the document changes while it checks</li>
         </ul>
       </description>
     </release>

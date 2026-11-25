@@ -176,8 +176,8 @@ pub fn plain_unused(doc: &Path, text: &str) -> Result<Vec<Candidate>, ScanError>
     if own.is_empty() {
         return Ok(Vec::new());
     }
-    // The document's own file on disk is skipped: its text is `text`, as
-    // edited — a reference deleted but not yet saved counts as gone.
+    // The document's own file on disk is skipped in favour of `text` (the
+    // app only scans a saved document, so the two agree).
     let mut texts = vec![text.to_string()];
     let mut seen = 0;
     gather_texts(folder, doc, SCAN_DEPTH, &mut seen, &mut texts)?;

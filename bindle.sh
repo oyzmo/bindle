@@ -124,6 +124,12 @@ make_distribution() {
     ls -lh "$dist" | tail -n +2 | sed 's/^/  /'
     if [ "$failed" = 0 ]; then
         ok "Distribution ready in $dist"
+        # Marks the version as released, so the next bump.sh starts a new
+        # changelog entry instead of renaming this one (dist/ may be cleared).
+        if ! git -C "$SCRIPT_DIR" rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            git -C "$SCRIPT_DIR" tag -a "v$version" -m "Bindle $version" \
+                && ok "Tagged v$version." || err "Could not tag v$version — bump.sh will treat it as unreleased."
+        fi
     else
         err "Distribution incomplete (see above)."
         return 1
@@ -237,7 +243,7 @@ full_release() {
     bold "Full release of Bindle $(current_version)"
     make_distribution || { err "Stopped: the distribution failed."; return 1; }
     bold "Backing up to the NAS…"
-    git -C "$SCRIPT_DIR" push -q nas master || err "NAS push failed — continuing."
+    git -C "$SCRIPT_DIR" push -q --follow-tags nas master || err "NAS push failed — continuing."
     publish_flatpak || err "flatpak.oyzmo.no was not updated."
     if github_scripts; then
         release_github || err "The GitHub release failed (see above)."

@@ -9,7 +9,7 @@
 #
 # The version moves on every bump, so a local build always says exactly what
 # it is. The changelog has one entry per *release*: while the current version
-# has not been distributed (no dist/bindle-<version>.flatpak), its entry is
+# has not been released, its entry is
 # renamed to the new version and the notes are appended, so the About box's
 # "What's New" shows everything since the last release under one version.
 # NEW=1 starts a fresh entry anyway.
@@ -40,8 +40,11 @@ case $part in patch|minor|major) ;; *) usage ;; esac
 
 old="$(sed -n 's/^version = "\(.*\)"/\1/p' "$CARGO" | head -1)"
 
-# Released once the distribution step has built its bundle.
+# Released once the distribution step has built it: that step tags the
+# version (v<version>, kept in git, so clearing dist/ doesn't forget it); the
+# bundle in dist/ counts too, for releases from before the tag.
 merge=1
+git -C "$SCRIPT_DIR" rev-parse -q --verify "refs/tags/v$old" >/dev/null 2>&1 && merge=0
 [ -e "$SCRIPT_DIR/dist/bindle-$old.flatpak" ] && merge=0
 [ "${NEW:-0}" = 1 ] && merge=0
 

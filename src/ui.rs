@@ -2636,7 +2636,14 @@ impl App {
     /// `cleanup`) and offer to move the ones the user ticks to the Trash.
     /// The scan runs on a worker thread: the folder may sit on a share.
     fn clean_assets(self: &Rc<Self>) {
+        // Unsaved edits would make the buffer and the file disagree about
+        // what is used: trashing by the buffer breaks the saved file if the
+        // edits are dropped, and a pack is rewritten with its saved text.
+        if self.modified.get() {
+            return self.toast("Save the document first");
+        }
         let source = self.source.borrow().clone();
+        let container = source.container().map(Path::to_path_buf);
         let text = self.text().to_string();
         let plain = matches!(source, DocSource::Plain(_));
         let scan: Box<dyn FnOnce() -> Result<Vec<(cleanup::Candidate, Option<preview::Thumb>)>, cleanup::ScanError> + Send> =
@@ -2661,8 +2668,8 @@ impl App {
         let state = self.clone();
         glib::spawn_future_local(async move {
             let found = gio::spawn_blocking(scan).await;
-            if !state.still_open(seq) {
-                return;
+            if let Err(why) = state.cleanup_target_unchanged(seq, &container) {
+                return state.toast(why);
             }
             match found {
                 Ok(Ok(found)) if found.is_empty() => state.toast(if plain {
@@ -2670,7 +2677,7 @@ impl App {
                 } else {
                     "No unused files in the assets folder"
                 }),
-                Ok(Ok(found)) => state.clean_assets_dialog(found, plain),
+                Ok(Ok(found)) => state.clean_assets_dialog(found, plain, container),
                 Ok(Err(cleanup::ScanError::TooMany)) => {
                     state.toast("Too many files in the document's folder to check safely")
                 }
@@ -2679,7 +2686,28 @@ impl App {
         });
     }
 
-    fn clean_assets_dialog(self: &Rc<Self>, found: Vec<(cleanup::Candidate, Option<preview::Thumb>)>, plain: bool) {
+    /// Whether the document a cleanup scanned is still the one in the window,
+    /// saved, at the same place. `doc_gen` alone misses a Save As, which
+    /// rebinds the window without loading anything: the scanned names would
+    /// then be trashed in another folder.
+    fn cleanup_target_unchanged(&self, seq: u64, container: &Option<PathBuf>) -> Result<(), &'static str> {
+        if self.doc_gen.get() != seq {
+            Err("Clean Up stopped — another document was opened")
+        } else if self.source.borrow().container() != container.as_deref() {
+            Err("Clean Up stopped — the document was saved elsewhere")
+        } else if self.modified.get() {
+            Err("Clean Up stopped — save the document first")
+        } else {
+            Ok(())
+        }
+    }
+
+    fn clean_assets_dialog(
+        self: &Rc<Self>,
+        found: Vec<(cleanup::Candidate, Option<preview::Thumb>)>,
+        plain: bool,
+        container: Option<PathBuf>,
+    ) {
         let pack = matches!(*self.source.borrow(), DocSource::Pack { .. });
         let (title, body) = if plain {
             (
@@ -2764,8 +2792,11 @@ impl App {
         let state = self.clone();
         let seq = self.doc_gen.get();
         dialog.choose(Some(&self.window), gio::Cancellable::NONE, move |response| {
-            if response.as_str() != "trash" || !state.still_open(seq) {
+            if response.as_str() != "trash" {
                 return;
+            }
+            if let Err(why) = state.cleanup_target_unchanged(seq, &container) {
+                return state.toast(why);
             }
             let picked: Vec<String> = found
                 .iter()
