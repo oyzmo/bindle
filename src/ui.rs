@@ -141,6 +141,12 @@ pub struct App {
     toasts: adw::ToastOverlay,
     /// The last "Saved …" toast, dismissed when the next save shows its own.
     save_toast: RefCell<Option<adw::Toast>>,
+    /// The "no longer used · Clean Up…" suggestion, replaced by the next.
+    cleanup_toast: RefCell<Option<adw::Toast>>,
+    /// File names the document linked to at its last load or save; a save
+    /// that drops some suggests Clean Up Assets (`suggest_cleanup`).
+    saved_refs: RefCell<HashSet<String>>,
+    suggest_cleanup: Cell<bool>,
     title: adw::WindowTitle,
     buffer: gtk4::TextBuffer,
     editor: gtk4::TextView,
@@ -769,6 +775,7 @@ impl App {
         headings_section.append(Some("Raise All _Headings (−#)"), Some("win.headings-raise"));
         headings_section.append(Some("Lower All H_eadings (+#)"), Some("win.headings-lower"));
         headings_section.append(Some("Clean Up _Assets…"), Some("win.clean-assets"));
+        headings_section.append(Some("_Suggest Clean Up on Save"), Some("win.suggest-cleanup"));
         menu.append_section(None, &headings_section);
 
         let view_section = gio::Menu::new();
@@ -941,6 +948,9 @@ impl App {
             window,
             toasts,
             save_toast: RefCell::new(None),
+            cleanup_toast: RefCell::new(None),
+            saved_refs: RefCell::new(HashSet::new()),
+            suggest_cleanup: Cell::new(settings.suggest_cleanup),
             title,
             buffer,
             editor,
@@ -1890,6 +1900,25 @@ impl App {
         self.window.add_action(&action);
 
         let action = gio::SimpleAction::new_stateful(
+            "suggest-cleanup",
+            None,
+            &self.suggest_cleanup.get().to_variant(),
+        );
+        let state = self.clone();
+        action.connect_activate(move |action, _| {
+            let enabled = !state.suggest_cleanup.get();
+            action.set_state(&enabled.to_variant());
+            state.suggest_cleanup.set(enabled);
+            if !enabled {
+                if let Some(old) = state.cleanup_toast.take() {
+                    old.dismiss();
+                }
+            }
+            state.persist_settings();
+        });
+        self.window.add_action(&action);
+
+        let action = gio::SimpleAction::new_stateful(
             "preview-tooltips",
             None,
             &self.preview_tooltips.get().to_variant(),
@@ -2639,34 +2668,53 @@ impl App {
     /// `cleanup`) and offer to move the ones the user ticks to the Trash.
     /// The scan runs on a worker thread: the folder may sit on a share.
     fn clean_assets(self: &Rc<Self>) {
+        self.clean_assets_with(HashSet::new());
+    }
+
+    /// The scan for the current document, run on a worker thread by the
+    /// caller; thumbnails only when `thumbs` (the dialog shows them, the
+    /// save-time check doesn't need them). `Err` is a toast for the user.
+    fn cleanup_scan(&self, thumbs: bool) -> Result<CleanupScan, &'static str> {
+        let source = self.source.borrow().clone();
+        let text = self.text().to_string();
+        let thumbs = move |found: Vec<cleanup::Candidate>, read: &dyn Fn(&str) -> Option<Vec<u8>>| {
+            if thumbs { with_thumbs(found, read) } else { found.into_iter().map(|c| (c, None)).collect() }
+        };
+        Ok(match source {
+            DocSource::None => return Err("Save the document first"),
+            DocSource::Odt { .. } => return Err("An imported document has no assets folder"),
+            DocSource::Plain(doc) => Box::new(move || {
+                let folder = doc.parent().map(Path::to_path_buf).unwrap_or_default();
+                let found = cleanup::plain_unused(&doc, &text)?;
+                Ok(thumbs(found, &|rel| bundle::read_file_capped(&folder.join(rel), bundle::ASSET_MAX_BYTES)))
+            }),
+            DocSource::Bundle { dir, .. } => Box::new(move || {
+                let found = cleanup::bundle_unused(&dir, &text);
+                Ok(thumbs(found, &|rel| bundle::read_file_capped(&dir.join(rel), bundle::ASSET_MAX_BYTES)))
+            }),
+            DocSource::Pack { path, info } => Box::new(move || {
+                let found = cleanup::pack_unused(&info.entries, &info.prefix, &text);
+                Ok(thumbs(found, &|rel| bundle::read_asset(&path, &info, rel, bundle::ASSET_MAX_BYTES)))
+            }),
+        })
+    }
+
+    /// Clean Up Assets, with the files named in `preselect` (file names)
+    /// ticked instead of the usual defaults — what the save-time suggestion
+    /// found.
+    fn clean_assets_with(self: &Rc<Self>, preselect: HashSet<String>) {
         // Unsaved edits would make the buffer and the file disagree about
         // what is used: trashing by the buffer breaks the saved file if the
         // edits are dropped, and a pack is rewritten with its saved text.
         if self.modified.get() {
             return self.toast("Save the document first");
         }
-        let source = self.source.borrow().clone();
-        let container = source.container().map(Path::to_path_buf);
-        let text = self.text().to_string();
-        let plain = matches!(source, DocSource::Plain(_));
-        let scan: Box<dyn FnOnce() -> Result<Vec<(cleanup::Candidate, Option<preview::Thumb>)>, cleanup::ScanError> + Send> =
-            match source.clone() {
-                DocSource::None => return self.toast("Save the document first"),
-                DocSource::Odt { .. } => return self.toast("An imported document has no assets folder"),
-                DocSource::Plain(doc) => Box::new(move || {
-                    let folder = doc.parent().map(Path::to_path_buf).unwrap_or_default();
-                    let found = cleanup::plain_unused(&doc, &text)?;
-                    Ok(with_thumbs(found, |rel| bundle::read_file_capped(&folder.join(rel), bundle::ASSET_MAX_BYTES)))
-                }),
-                DocSource::Bundle { dir, .. } => Box::new(move || {
-                    let found = cleanup::bundle_unused(&dir, &text);
-                    Ok(with_thumbs(found, |rel| bundle::read_file_capped(&dir.join(rel), bundle::ASSET_MAX_BYTES)))
-                }),
-                DocSource::Pack { path, info } => Box::new(move || {
-                    let found = cleanup::pack_unused(&info.entries, &info.prefix, &text);
-                    Ok(with_thumbs(found, |rel| bundle::read_asset(&path, &info, rel, bundle::ASSET_MAX_BYTES)))
-                }),
-            };
+        let container = self.source.borrow().container().map(Path::to_path_buf);
+        let plain = matches!(*self.source.borrow(), DocSource::Plain(_));
+        let scan = match self.cleanup_scan(true) {
+            Ok(scan) => scan,
+            Err(why) => return self.toast(why),
+        };
         let seq = self.doc_gen.get();
         let state = self.clone();
         glib::spawn_future_local(async move {
@@ -2680,7 +2728,7 @@ impl App {
                 } else {
                     "No unused files in the assets folder"
                 }),
-                Ok(Ok(found)) => state.clean_assets_dialog(found, plain, container),
+                Ok(Ok(found)) => state.clean_assets_dialog(found, plain, container, &preselect),
                 Ok(Err(cleanup::ScanError::TooMany)) => {
                     state.toast("Too many files in the document's folder to check safely")
                 }
@@ -2705,11 +2753,56 @@ impl App {
         }
     }
 
+    /// After a save that dropped links to `dropped` (file names): if the
+    /// scan agrees some of them are now unused, offer Clean Up Assets with
+    /// those ticked. Only a toast — the dialog is what trashes anything.
+    fn suggest_cleanup(self: &Rc<Self>, dropped: HashSet<String>) {
+        let Ok(scan) = self.cleanup_scan(false) else { return };
+        let container = self.source.borrow().container().map(Path::to_path_buf);
+        let plain = matches!(*self.source.borrow(), DocSource::Plain(_));
+        let seq = self.doc_gen.get();
+        let state = self.clone();
+        glib::spawn_future_local(async move {
+            let Ok(Ok(found)) = gio::spawn_blocking(scan).await else { return };
+            if state.cleanup_target_unchanged(seq, &container).is_err() {
+                return;
+            }
+            let unused: HashSet<String> = found
+                .iter()
+                .map(|(c, _)| c.rel.rsplit('/').next().unwrap_or(&c.rel).to_string())
+                .filter(|name| dropped.contains(name))
+                .collect();
+            if unused.is_empty() {
+                return;
+            }
+            let what = match (unused.len(), plain) {
+                (1, true) => "1 image".to_string(),
+                (1, false) => "1 file".to_string(),
+                (n, true) => format!("{n} images"),
+                (n, false) => format!("{n} files"),
+            };
+            if let Some(old) = state.cleanup_toast.take() {
+                old.dismiss();
+            }
+            let toast = adw::Toast::new(&format!("{what} no longer used"));
+            toast.set_button_label(Some("Clean Up…"));
+            let weak = Rc::downgrade(&state);
+            toast.connect_button_clicked(move |_| {
+                if let Some(state) = weak.upgrade() {
+                    state.clean_assets_with(unused.clone());
+                }
+            });
+            state.toasts.add_toast(toast.clone());
+            state.cleanup_toast.replace(Some(toast));
+        });
+    }
+
     fn clean_assets_dialog(
         self: &Rc<Self>,
         found: Vec<(cleanup::Candidate, Option<preview::Thumb>)>,
         plain: bool,
         container: Option<PathBuf>,
+        preselect: &HashSet<String>,
     ) {
         let pack = matches!(*self.source.borrow(), DocSource::Pack { .. });
         let (title, body) = if plain {
@@ -2743,9 +2836,11 @@ impl App {
             row.set_margin_start(8);
             row.set_margin_end(8);
             // A shared folder's files may belong to something Bindle can't
-            // see, so there nothing is ticked until the user says so.
+            // see, so there nothing is ticked until the user says so. From
+            // the save-time suggestion, exactly the files that save dropped.
             let check = gtk4::CheckButton::new();
-            check.set_active(!plain);
+            let file_name = candidate.rel.rsplit('/').next().unwrap_or(&candidate.rel);
+            check.set_active(if preselect.is_empty() { !plain } else { preselect.contains(file_name) });
             row.append(&check);
             let icon = match thumb {
                 Some(thumb) => gtk4::Image::from_paintable(Some(&thumb.texture())),
@@ -5490,6 +5585,10 @@ impl App {
         self.loading.set(false);
         *self.source.borrow_mut() = source;
         self.staged_assets.borrow_mut().clear();
+        *self.saved_refs.borrow_mut() = cleanup::referenced_names(text);
+        if let Some(old) = self.cleanup_toast.take() {
+            old.dismiss();
+        }
         self.forget_asset_reads();
         self.restore_position();
         {
@@ -5953,8 +6052,15 @@ impl App {
         self.update_title();
         let name = shown.file_name().map(|n| n.to_string_lossy().to_string());
         self.toast_saved(&name.unwrap_or_default());
+        let text = self.text();
+        let dropped = cleanup::dropped(&self.saved_refs.borrow(), &text);
+        *self.saved_refs.borrow_mut() = cleanup::referenced_names(&text);
         if let Some(then) = then {
+            // Saving on the way to closing or opening something else: the
+            // suggestion would point at a document about to go.
             then();
+        } else if !dropped.is_empty() && self.suggest_cleanup.get() && self.doc_kind().is_markdown() {
+            self.suggest_cleanup(dropped);
         }
     }
 
@@ -7195,6 +7301,7 @@ impl App {
             ("italic", enabled),
             ("word-wrap", kind.wrap_lines()),
             ("clean-assets", kind.is_markdown()),
+            ("suggest-cleanup", kind.is_markdown()),
         ] {
             if let Some(action) = self.window.lookup_action(name) {
                 if let Ok(action) = action.downcast::<gio::SimpleAction>() {
@@ -7267,6 +7374,7 @@ impl App {
             preview_line_numbers: self.preview_line_numbers.get(),
             preview_viewport: self.preview_viewport.get(),
             preview_tooltips: self.preview_tooltips.get(),
+            suggest_cleanup: self.suggest_cleanup.get(),
             word_wrap: self.word_wrap.get(),
             editor_font: self.editor_font.get().as_str().to_string(),
             preview_font: self.preview_font.get().as_str().to_string(),
@@ -7336,10 +7444,14 @@ impl App {
     }
 }
 
+/// A Clean Up Assets scan, ready for `gio::spawn_blocking`.
+type CleanupScan =
+    Box<dyn FnOnce() -> Result<Vec<(cleanup::Candidate, Option<preview::Thumb>)>, cleanup::ScanError> + Send>;
+
 /// Pair each candidate with a thumbnail when its bytes decode as an image.
 fn with_thumbs(
     found: Vec<cleanup::Candidate>,
-    read: impl Fn(&str) -> Option<Vec<u8>>,
+    read: &dyn Fn(&str) -> Option<Vec<u8>>,
 ) -> Vec<(cleanup::Candidate, Option<preview::Thumb>)> {
     found
         .into_iter()

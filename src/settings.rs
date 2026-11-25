@@ -61,6 +61,8 @@ pub struct Settings {
     pub preview_viewport: bool,
     /// Hover hints in the preview (links, checkboxes, images, line picks).
     pub preview_tooltips: bool,
+    /// After a save that dropped links to asset files, offer Clean Up Assets.
+    pub suggest_cleanup: bool,
     /// Long lines wrap in the editor (NFO/DIZ art never does).
     pub word_wrap: bool,
     /// Editor font size: "small", "normal", "large" or "xlarge".
@@ -376,6 +378,7 @@ impl Default for Settings {
             preview_line_numbers: false,
             preview_viewport: true,
             preview_tooltips: true,
+            suggest_cleanup: true,
             word_wrap: true,
             editor_font: "normal".to_string(),
             preview_font: "normal".to_string(),

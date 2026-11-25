@@ -50,14 +50,7 @@ pub struct Mentions {
 
 impl Mentions {
     pub fn new(texts: Vec<String>) -> Self {
-        let linked = texts
-            .iter()
-            .flat_map(|t| bundle::local_asset_dests(t))
-            .filter_map(|d| {
-                let d = bundle::decode_dest(&d);
-                Path::new(&d).file_name().map(|n| n.to_string_lossy().into_owned())
-            })
-            .collect();
+        let linked = texts.iter().flat_map(|t| referenced_names(t)).collect();
         Mentions { texts, linked }
     }
 
@@ -69,6 +62,26 @@ impl Mentions {
         let encoded = percent_encode(name);
         self.texts.iter().any(|t| t.contains(name) || t.contains(&encoded))
     }
+}
+
+/// File names of the local files `text` links to.
+pub fn referenced_names(text: &str) -> HashSet<String> {
+    bundle::local_asset_dests(text)
+        .into_iter()
+        .filter_map(|d| {
+            let d = bundle::decode_dest(&d);
+            Path::new(&d).file_name().map(|n| n.to_string_lossy().into_owned())
+        })
+        .collect()
+}
+
+/// Of the file names the document linked to at its last load or save
+/// (`before`), those `text` no longer mentions anywhere — what a save just
+/// left unused. Same conservative test as the scan: a name still written
+/// anywhere in the text (code block, raw HTML) counts as used.
+pub fn dropped(before: &HashSet<String>, text: &str) -> HashSet<String> {
+    let mentions = Mentions::new(vec![text.to_string()]);
+    before.iter().filter(|name| !mentions.mention(name)).cloned().collect()
 }
 
 fn percent_encode(name: &str) -> String {
@@ -287,6 +300,21 @@ mod tests {
         assert!(generic_paste("pasted-20261125-082145.png"));
         assert!(generic_paste("pasted-20261125-082145-3.png"));
         assert!(!generic_paste("pasted-holiday.png"));
+    }
+
+    #[test]
+    fn dropped_names_only_what_the_text_lost() {
+        let before = referenced_names(
+            "![a](assets/a.png) ![b](assets/b%20c.png) [doc](files/d.pdf) ![w](https://x.org/w.png)",
+        );
+        let set = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<HashSet<_>>();
+        assert_eq!(before, set(&["a.png", "b c.png", "d.pdf"]));
+        // Removed link, removed encoded link; d.pdf survives in a code span.
+        let text = "![a](assets/a.png) `files/d.pdf`";
+        assert_eq!(dropped(&before, text), set(&["b c.png"]));
+        // Nothing removed, nothing dropped.
+        assert!(dropped(&before, "![a](assets/a.png) ![b](assets/b%20c.png) [d](files/d.pdf)").is_empty());
+        assert_eq!(dropped(&before, ""), before);
     }
 
     #[test]
