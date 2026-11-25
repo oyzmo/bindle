@@ -750,7 +750,6 @@ impl App {
         export_menu.append(Some("As P_DF…"), Some("win.export-pdf"));
         export_menu.append(Some("As _ODT…"), Some("win.export-odt"));
         file_section.append_submenu(Some("_Export"), &export_menu);
-        file_section.append(Some("Clean Up _Assets…"), Some("win.clean-assets"));
         file_section.append(Some("_Print…"), Some("win.print"));
         menu.append_section(None, &file_section);
 
@@ -761,11 +760,13 @@ impl App {
         backup_section.append(Some("Back Up on Sa_ve"), Some("win.backup-on-save"));
         menu.append_section(None, &backup_section);
 
-        // Rarely used, so menu items rather than header buttons. Greyed out
-        // (not hidden) when the shift is impossible or the file isn't markdown.
+        // Rarely used tools for the current document, so menu items rather
+        // than header buttons. Greyed out (not hidden) when they can't apply:
+        // the shift is impossible or the file isn't markdown.
         let headings_section = gio::Menu::new();
         headings_section.append(Some("Raise All _Headings (−#)"), Some("win.headings-raise"));
         headings_section.append(Some("Lower All H_eadings (+#)"), Some("win.headings-lower"));
+        headings_section.append(Some("Clean Up _Assets…"), Some("win.clean-assets"));
         menu.append_section(None, &headings_section);
 
         let view_section = gio::Menu::new();
