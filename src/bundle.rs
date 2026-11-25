@@ -158,7 +158,9 @@ pub fn read_asset(path: &Path, info: &PackInfo, rel: &str, max: u64) -> Option<V
         return None;
     }
     let mut buf = Vec::with_capacity((entry.size() as usize).min(1 << 20));
-    (&mut entry).take(max + 1).read_to_end(&mut buf).ok()?;
+    // Saturating: `u64::MAX` means uncapped, and `max + 1` would wrap to 0
+    // in release builds and read the entry as empty.
+    (&mut entry).take(max.saturating_add(1)).read_to_end(&mut buf).ok()?;
     if buf.len() as u64 > max {
         return None;
     }
@@ -761,6 +763,8 @@ mod tests {
         assert_eq!(text, "# Hi ![](assets/a.png)");
         assert_eq!(read_asset(&pack, &info, "assets/a.png", 100).as_deref(), Some(&b"aaa"[..]));
         assert_eq!(read_asset(&pack, &info, "assets/b.png", 100), None);
+        // Uncapped (Clean Up's trash copy) must read every byte.
+        assert_eq!(read_asset(&pack, &info, "assets/a.png", u64::MAX).as_deref(), Some(&b"aaa"[..]));
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -46,13 +46,14 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
-    <release version="1.43.3" date="2026-11-25">
+    <release version="1.43.4" date="2026-11-25">
       <description>
         <ul>
           <li>After a save that removes images, Bindle offers to clean up the ones no longer used (Menu → Suggest Clean Up on Save)</li>
           <li>The clean-up offer also comes when saving from the Save / Discard question before opening another file</li>
           <li>Clean-up offer: safer when the document is saved elsewhere or changed meanwhile</li>
           <li>Clean Up checks the folder again just before trashing, and keeps images another document has started using</li>
+          <li>Clean Up no longer empties a TextPack's file in the Trash (it saved a 0-byte copy), and stops when another program changed the open document</li>
         </ul>
       </description>
     </release>

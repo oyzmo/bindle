@@ -2717,25 +2717,25 @@ impl App {
     }
 
     /// Whether `target` is still the document as it was saved, so its scan
-    /// result may be acted on. Not in the window: its file on disk is
-    /// untouched (stat'ed on a worker thread, it may sit on a share) — unless
-    /// the window still holds the same loaded document under another path,
-    /// i.e. a Save As since, whose new file the scan never saw. In the
-    /// window (also when it was reopened during that stat): not edited or
-    /// re-saved since.
+    /// result may be acted on: its file on disk is untouched (stat'ed on a
+    /// worker thread, it may sit on a share) — and the window doesn't hold
+    /// the same loaded document under another path (a Save As since, whose
+    /// new file the scan never saw). In the window (also when it was
+    /// reopened during that stat): not edited or re-saved since.
     async fn target_unchanged(&self, target: &CleanupTarget) -> Result<(), &'static str> {
+        if !self.shows_target(target) && self.doc_gen.get() == target.doc_gen {
+            return Err("Clean Up stopped — the document was saved elsewhere");
+        }
+        // The disk, even for the open document: another program may have
+        // rewritten it (linking a file again) without Bindle noticing yet,
+        // and the window's own stamp is from before that.
+        let Some(file) = target.source.text_file() else { return Err("Clean Up stopped") };
+        let now = gio::spawn_blocking(move || doc::disk_stamp(&file)).await.ok().flatten();
+        if now.is_none() || now != target.stamp {
+            return Err("Clean Up stopped — the document changed on disk");
+        }
         if !self.shows_target(target) {
-            if self.doc_gen.get() == target.doc_gen {
-                return Err("Clean Up stopped — the document was saved elsewhere");
-            }
-            let Some(file) = target.source.text_file() else { return Err("Clean Up stopped") };
-            let now = gio::spawn_blocking(move || doc::disk_stamp(&file)).await.ok().flatten();
-            if now.is_none() || now != target.stamp {
-                return Err("Clean Up stopped — the document changed on disk");
-            }
-            if !self.shows_target(target) {
-                return Ok(());
-            }
+            return Ok(());
         }
         if self.modified.get() {
             return Err("Clean Up stopped — save the document first");
