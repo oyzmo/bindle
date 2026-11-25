@@ -2860,6 +2860,7 @@ impl App {
                         }
                         self.forget_asset_reads();
                         self.render_preview(true);
+                        self.forget_undo();
                         self.toast(&moved_message(moved.len()));
                     }
                     Err(err) => self.toast(&format!("Could not rewrite the pack: {err}")),
@@ -2871,6 +2872,7 @@ impl App {
 
     fn trash_files(self: &Rc<Self>, files: Vec<PathBuf>) {
         let state = self.clone();
+        let seq = self.doc_gen.get();
         glib::spawn_future_local(async move {
             let mut moved = 0;
             for path in files {
@@ -2883,9 +2885,22 @@ impl App {
                 }
             }
             if moved > 0 {
+                // Another document's load has cleared the history already.
+                if state.doc_gen.get() == seq {
+                    state.forget_undo();
+                }
                 state.toast(&moved_message(moved));
             }
         });
+    }
+
+    /// Drop the editor's undo history after Clean Up trashed files: undoing
+    /// past it could bring back a reference to a file that is now in the
+    /// Trash (or gone from the pack). Toggling undo clears GTK's history and
+    /// changes no text, so the modified state is untouched.
+    fn forget_undo(&self) {
+        self.buffer.set_enable_undo(false);
+        self.buffer.set_enable_undo(true);
     }
 
     fn paste_image_reference(&self, dest: &str) {
