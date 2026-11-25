@@ -139,6 +139,8 @@ enum AssetRead {
 pub struct App {
     window: adw::ApplicationWindow,
     toasts: adw::ToastOverlay,
+    /// The last "Saved …" toast, dismissed when the next save shows its own.
+    save_toast: RefCell<Option<adw::Toast>>,
     title: adw::WindowTitle,
     buffer: gtk4::TextBuffer,
     editor: gtk4::TextView,
@@ -938,6 +940,7 @@ impl App {
         let state = Rc::new(App {
             window,
             toasts,
+            save_toast: RefCell::new(None),
             title,
             buffer,
             editor,
@@ -5235,7 +5238,7 @@ impl App {
                     })
                     .await;
                     match written {
-                        Ok(Ok(())) => state.toast(&format!("Saved {name}")),
+                        Ok(Ok(())) => state.toast_saved(&name),
                         Ok(Err(err)) => state.toast(&format!("Could not save: {err}")),
                         Err(_) => state.toast("Could not save"),
                     }
@@ -5949,7 +5952,7 @@ impl App {
         self.modified.set(false);
         self.update_title();
         let name = shown.file_name().map(|n| n.to_string_lossy().to_string());
-        self.toast(&format!("Saved {}", name.unwrap_or_default()));
+        self.toast_saved(&name.unwrap_or_default());
         if let Some(then) = then {
             then();
         }
@@ -7318,6 +7321,18 @@ impl App {
 
     fn toast(&self, message: &str) {
         self.toasts.add_toast(adw::Toast::new(message));
+    }
+
+    /// A brief "Saved …" confirmation. It replaces the previous one rather
+    /// than queueing behind it, so repeated saves don't stack up toasts.
+    fn toast_saved(&self, name: &str) {
+        if let Some(old) = self.save_toast.take() {
+            old.dismiss();
+        }
+        let toast = adw::Toast::new(&format!("Saved {name}"));
+        toast.set_timeout(2);
+        self.toasts.add_toast(toast.clone());
+        self.save_toast.replace(Some(toast));
     }
 }
 
